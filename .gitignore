@@ -112,3 +112,8 @@ $RECYCLE.BIN/
 *.swp
 ~$*
 *~
+
+# Local environment files
+.agents/
+.local/
+skills-lock.json
