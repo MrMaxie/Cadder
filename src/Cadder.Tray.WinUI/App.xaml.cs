@@ -10,6 +10,7 @@ public partial class App : Application
   private static DaemonSingletonAcquisition? s_singletonAcquisition;
   private readonly DaemonLifecycleHost _daemonHost;
   private readonly CadderIpcEndpoint _endpoint;
+  private TrayPopupWindow? _trayPopup;
   private DaemonTrayPresence? _trayPresence;
   private MainWindow? _window;
 
@@ -84,6 +85,7 @@ public partial class App : Application
     }
     finally
     {
+      _trayPopup?.Dismiss();
       _trayPresence?.Dispose();
       Exit();
     }
@@ -97,11 +99,72 @@ public partial class App : Application
     return response.Snapshot;
   }
 
+  public async ValueTask<bool> SetDomainEnabledAsync(
+      string registrationId,
+      string shimSessionNonce,
+      string domainKey,
+      bool enabled,
+      CancellationToken cancellationToken = default)
+  {
+    var list = await _endpoint.ListAsync(
+        new ListEntrypointsRequest($"tray-list-{Guid.NewGuid():N}"),
+        cancellationToken);
+    if (!list.Accepted)
+    {
+      return false;
+    }
+
+    var registration = list.Registrations.FirstOrDefault(candidate =>
+        string.Equals(candidate.RegistrationId, registrationId, StringComparison.Ordinal)
+        && string.Equals(candidate.EntrypointInstance.ShimSessionNonce, shimSessionNonce, StringComparison.Ordinal));
+    if (registration is null)
+    {
+      return false;
+    }
+
+    var matched = false;
+    var domains = registration.RegisteredDomains
+        .Select(domain =>
+        {
+          var candidateKey = domain.Name.Canonical ?? domain.Name.Raw;
+          if (!string.Equals(candidateKey, domainKey, StringComparison.OrdinalIgnoreCase))
+          {
+            return domain;
+          }
+
+          matched = true;
+          return domain with
+          {
+            ActivationState = enabled ? ActivationState.Active : ActivationState.Inactive
+          };
+        })
+        .ToArray();
+    if (!matched)
+    {
+      return false;
+    }
+
+    var response = await _endpoint.UpdateAsync(
+        new UpdateEntrypointRequest(
+            $"tray-domain-toggle-{Guid.NewGuid():N}",
+            registration.RegistrationId,
+            registration.EntrypointInstance.ShimSessionNonce,
+            null,
+            null,
+            domains,
+            null,
+            null),
+        cancellationToken);
+
+    return response.Accepted;
+  }
+
   protected override async void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
   {
     await _daemonHost.StartAsync();
     _window = new MainWindow();
     _trayPresence ??= new DaemonTrayPresence(_window);
+    _trayPresence.Activated += OnTrayIconActivated;
     _window.Activate();
   }
 
@@ -113,9 +176,25 @@ public partial class App : Application
     ActivateMainWindow();
   }
 
-  private void ActivateMainWindow()
+  internal void ActivateMainWindow()
   {
     _window?.DispatcherQueue.TryEnqueue(() => _window.ShowAndActivate());
+  }
+
+  private void OnTrayIconActivated(object? sender, TrayIconActivatedEventArgs args)
+  {
+    _window?.DispatcherQueue.TryEnqueue(async () =>
+    {
+      if (_trayPopup?.IsOpen == true)
+      {
+        _trayPopup.Dismiss();
+        _trayPopup = null;
+        return;
+      }
+
+      _trayPopup ??= new TrayPopupWindow(this);
+      await _trayPopup.ShowAtCursorAsync();
+    });
   }
 
   private static string[] ExtractActivationArguments(AppActivationArguments args)

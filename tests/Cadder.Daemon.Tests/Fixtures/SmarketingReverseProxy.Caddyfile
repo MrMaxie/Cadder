@@ -1,0 +1,19 @@
+{
+  auto_https off
+}
+
+api.smarketing.localhost {
+  respond "api"
+}
+
+app.smarketing.localhost {
+  respond "app"
+}
+
+mailbox.smarketing.localhost {
+  respond "mailbox"
+}
+
+storage.smarketing.localhost {
+  respond "storage"
+}

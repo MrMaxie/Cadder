@@ -30,7 +30,8 @@ $projects = @(
     "src\Cadder.CaddyShim\Cadder.CaddyShim.csproj",
     "src\Cadder.Tray.WinUI\Cadder.Tray.WinUI.csproj",
     "tests\Cadder.Contracts.Tests\Cadder.Contracts.Tests.csproj",
-    "tests\Cadder.Daemon.Tests\Cadder.Daemon.Tests.csproj"
+    "tests\Cadder.Daemon.Tests\Cadder.Daemon.Tests.csproj",
+    "tests\Cadder.Tray.WinUI.Tests\Cadder.Tray.WinUI.Tests.csproj"
 )
 
 function Assert-SolutionProjectListMatchesBuildScript {

@@ -13,5 +13,8 @@
   <Folder Name="/tests/">
     <Project Path="tests/Cadder.Contracts.Tests/Cadder.Contracts.Tests.csproj" />
     <Project Path="tests/Cadder.Daemon.Tests/Cadder.Daemon.Tests.csproj" />
+    <Project Path="tests/Cadder.Tray.WinUI.Tests/Cadder.Tray.WinUI.Tests.csproj">
+      <Platform Solution="*|x64" Project="x64" />
+    </Project>
   </Folder>
 </Solution>

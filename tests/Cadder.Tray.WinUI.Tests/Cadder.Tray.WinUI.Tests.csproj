@@ -1,10 +1,13 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net10.0-windows10.0.22621.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.22621.0</TargetPlatformMinVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
   </PropertyGroup>
 
   <ItemGroup>
@@ -19,13 +22,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="Fixtures\*.Caddyfile" CopyToOutputDirectory="PreserveNewest" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\..\src\Cadder.Contracts\Cadder.Contracts.csproj" />
-    <ProjectReference Include="..\..\src\Cadder.CaddyShim\Cadder.CaddyShim.csproj" />
-    <ProjectReference Include="..\..\src\Cadder.Daemon\Cadder.Daemon.csproj" />
+    <ProjectReference Include="..\..\src\Cadder.Tray.WinUI\Cadder.Tray.WinUI.csproj" />
   </ItemGroup>
 
 </Project>

@@ -48,18 +48,14 @@ public sealed class CaddyfileConfigAdapterTests
   }
 
   [Fact]
-  public async Task ProcessAdapter_WithSmarketingReverseProxy_UsesCaddyAdaptAndExtractsExpectedDomains()
+  public async Task ProcessAdapter_WithLocalSmarketingStyleReverseProxy_UsesCaddyAdaptAndExtractsExpectedDomains()
   {
     if (GetCommandPath("caddy-real") is null)
     {
       return;
     }
 
-    var sourcePath = "D:\\Projects\\Selleo\\smarketing\\apps\\reverse-proxy\\Caddyfile";
-    if (!File.Exists(sourcePath))
-    {
-      return;
-    }
+    var sourcePath = Path.Combine(AppContext.BaseDirectory, "Fixtures", "SmarketingReverseProxy.Caddyfile");
 
     var adapter = new ProcessCaddyfileConfigAdapter("caddy-real");
     var inspector = new CaddyJsonConfigInspector();
