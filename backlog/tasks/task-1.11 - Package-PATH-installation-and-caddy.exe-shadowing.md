@@ -4,6 +4,7 @@ title: Package PATH installation and caddy.exe shadowing
 status: To Do
 assignee: []
 created_date: '2026-06-09 11:44'
+updated_date: '2026-06-09 16:31'
 labels: []
 dependencies:
   - TASK-1.2
@@ -30,3 +31,13 @@ Package Cadder so a user can place it on PATH and intentionally shadow caddy.exe
 - [ ] #4 Uninstall or disable instructions remove the PATH shadowing without deleting user Caddy configs.
 - [ ] #5 The installer or packaging script validates that caddy.exe run from the smarketing reverse-proxy folder reaches Cadder rather than a random binary.
 <!-- AC:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+author: @agent
+created: 2026-06-09 16:31
+---
+Future packaging context from user approval of TASK-1.5: the user's real global Caddy command is `caddy-real`/`caddy-real.exe`. Cadder's PATH-facing shim should be installed globally with Scoop using a command shape like `scoop shim add caddy "path_to_cadder_caddy.exe"`, while keeping the real Caddy command configurable and distinguishable from the shim.
+---
+<!-- COMMENTS:END -->

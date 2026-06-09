@@ -1,11 +1,11 @@
 ---
 id: TASK-1.5
 title: Compose and reload Caddy config from registrations
-status: In Progress
+status: Done
 assignee:
   - '@agent'
 created_date: '2026-06-09 11:42'
-updated_date: '2026-06-09 16:49'
+updated_date: '2026-06-09 16:56'
 labels: []
 dependencies:
   - TASK-1.4
@@ -128,4 +128,16 @@ Plan approved by user and recorded before implementation. Additional user-provid
 Implementation direction updated after user feedback: do not hand-parse Caddyfile syntax as the source of truth. Use the real Caddy adapter command shape caddy adapt --config <Caddyfile> --adapter caddyfile to convert each source Caddyfile into structured JSON, then extract host matchers and compose/filter the effective runtime JSON from that adapted representation. Keep TASK-1.6 real runtime ownership separate; TASK-1.5 may use a narrow adapter-command boundary with caddy-real as the current local default when available.
 
 Implemented TASK-1.5 using Caddy's own adapter path instead of hand-parsing Caddyfiles. Added daemon-side ProcessCaddyfileConfigAdapter for caddy-real adapt --config <path> --adapter caddyfile, JSON host extraction, deterministic JSON composition, per-domain host filtering, conflict diagnostics, last-known-good config state, and process-based real Caddy validate/reload calls. Wired the coordinator into IPC registration/update/toggle/unregister flows and WinUI daemon startup. Updated architecture documentation. Validation run: dotnet test tests/Cadder.Daemon.Tests/Cadder.Daemon.Tests.csproj -p:Platform=x64 -p:RuntimeIdentifier=win-x64, dotnet test tests/Cadder.Contracts.Tests/Cadder.Contracts.Tests.csproj -p:Platform=x64 -p:RuntimeIdentifier=win-x64, dotnet test Cadder.slnx -p:Platform=x64 -p:RuntimeIdentifier=win-x64, ./build.ps1, and dotnet format Cadder.slnx --verify-no-changes all passed.
+
+Closeout validation on 2026-06-09: all acceptance criteria were already checked and re-verified against the implemented daemon config pipeline. Fresh checks passed: `dotnet test tests/Cadder.Daemon.Tests/Cadder.Daemon.Tests.csproj -p:Platform=x64 -p:RuntimeIdentifier=win-x64` (49/49), `dotnet test tests/Cadder.Contracts.Tests/Cadder.Contracts.Tests.csproj -p:Platform=x64 -p:RuntimeIdentifier=win-x64` (6/6), `dotnet test Cadder.slnx -p:Platform=x64 -p:RuntimeIdentifier=win-x64` (55/55), `./build.ps1` (0 warnings, 0 errors), and `dotnet format Cadder.slnx --verify-no-changes`. No task-specific Definition of Done items are defined for this task.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Implemented the daemon-side Caddy config composition pipeline for active registrations. Cadder now adapts registered Caddyfiles through the real Caddy adapter command path, extracts host domains with source registration context, detects active-domain conflicts before reload, composes deterministic effective JSON while preserving grouped source routes, supports per-domain disabling without dropping the rest of an instance, and preserves last-known-good runtime state when adaptation, validation, composition, or reload fails.
+
+The implementation also wires config apply state into IPC/tray snapshots, adds process-backed real Caddy validate/reload boundaries without owning or restarting unrelated shim processes, covers the referenced smarketing reverse-proxy domains from one registration, and updates architecture documentation with the TASK-1.5 behavior and boundaries left for TASK-1.6/TASK-1.11.
+
+Validation run on 2026-06-09: `dotnet test tests/Cadder.Daemon.Tests/Cadder.Daemon.Tests.csproj -p:Platform=x64 -p:RuntimeIdentifier=win-x64` passed 49/49; `dotnet test tests/Cadder.Contracts.Tests/Cadder.Contracts.Tests.csproj -p:Platform=x64 -p:RuntimeIdentifier=win-x64` passed 6/6; `dotnet test Cadder.slnx -p:Platform=x64 -p:RuntimeIdentifier=win-x64` passed 55/55; `./build.ps1` passed with 0 warnings and 0 errors; `dotnet format Cadder.slnx --verify-no-changes` passed. No additional risks were found during closeout; full runtime ownership and PATH/shim packaging remain intentionally scoped to TASK-1.6 and TASK-1.11.
+<!-- SECTION:FINAL_SUMMARY:END -->
