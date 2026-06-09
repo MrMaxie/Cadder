@@ -51,6 +51,26 @@ public sealed class ShimEntrypointTests
   }
 
   [Fact]
+  public async Task RunAsync_RunCommand_SendsHeartbeatDuringShimLifetime()
+  {
+    var connection = new RecordingDaemonConnection();
+    var dependencies = CreateDependencies(
+        new SucceedingConnector(connection),
+        new RecordingDaemonLauncher(),
+        new WaitForHeartbeatLifetimeWaiter(connection),
+        new StringWriter(),
+        new StringWriter(),
+        TimeSpan.FromMilliseconds(1));
+
+    var exitCode = await ShimEntrypoint.RunAsync(["run"], dependencies);
+
+    Assert.Equal(0, exitCode);
+    Assert.NotEmpty(connection.HeartbeatRequests);
+    Assert.Equal(connection.RegisterRequest?.Registration.RegistrationId, connection.HeartbeatRequests[0].RegistrationId);
+    Assert.Equal("nonce-1", connection.HeartbeatRequests[0].ShimSessionNonce);
+  }
+
+  [Fact]
   public async Task RunAsync_WhenUnregisterFailsAfterLifetime_ReturnsSuccess()
   {
     var connection = new RecordingDaemonConnection { ThrowOnUnregister = true };
@@ -91,7 +111,8 @@ public sealed class ShimEntrypointTests
       IDaemonProcessLauncher launcher,
       IShimLifetimeWaiter lifetimeWaiter,
       TextWriter output,
-      TextWriter error)
+      TextWriter error,
+      TimeSpan? heartbeatInterval = null)
   {
     return new ShimRuntimeDependencies
     {
@@ -104,7 +125,8 @@ public sealed class ShimEntrypointTests
       Error = error,
       NonceFactory = () => "nonce-1",
       DaemonReadyTimeout = TimeSpan.FromSeconds(1),
-      DaemonReadyPollInterval = TimeSpan.FromMilliseconds(1)
+      DaemonReadyPollInterval = TimeSpan.FromMilliseconds(1),
+      HeartbeatInterval = heartbeatInterval ?? TimeSpan.FromSeconds(30)
     };
   }
 
@@ -124,6 +146,14 @@ public sealed class ShimEntrypointTests
     public ValueTask WaitAsync(CancellationToken cancellationToken = default)
     {
       return ValueTask.CompletedTask;
+    }
+  }
+
+  private sealed class WaitForHeartbeatLifetimeWaiter(RecordingDaemonConnection connection) : IShimLifetimeWaiter
+  {
+    public async ValueTask WaitAsync(CancellationToken cancellationToken = default)
+    {
+      await connection.FirstHeartbeat.Task.WaitAsync(cancellationToken);
     }
   }
 
@@ -169,6 +199,10 @@ public sealed class ShimEntrypointTests
 
     public UnregisterEntrypointRequest? UnregisterRequest { get; private set; }
 
+    public List<HeartbeatEntrypointRequest> HeartbeatRequests { get; } = [];
+
+    public TaskCompletionSource FirstHeartbeat { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     public bool ThrowOnUnregister { get; init; }
 
     public ValueTask<RegisterEntrypointResponse> RegisterAsync(
@@ -197,6 +231,19 @@ public sealed class ShimEntrypointTests
           request.RequestId,
           true,
           "Unregistered."));
+    }
+
+    public ValueTask<HeartbeatEntrypointResponse> HeartbeatAsync(
+        HeartbeatEntrypointRequest request,
+        CancellationToken cancellationToken = default)
+    {
+      HeartbeatRequests.Add(request);
+      FirstHeartbeat.TrySetResult();
+      return ValueTask.FromResult(new HeartbeatEntrypointResponse(
+          request.RequestId,
+          true,
+          "Heartbeat accepted.",
+          RegisterRequest?.Registration));
     }
 
     public ValueTask DisposeAsync()

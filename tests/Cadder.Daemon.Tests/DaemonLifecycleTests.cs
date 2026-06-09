@@ -152,6 +152,32 @@ public sealed class DaemonLifecycleTests
   }
 
   [Fact]
+  public async Task FailedOwnerWatcherStartStopsIpcAndReturnsLifecycleToCreated()
+  {
+    var coordinator = new NamedMutexDaemonSingletonCoordinator(CreateMutexName());
+    var acquisition = coordinator.TryAcquire();
+    Assert.NotNull(acquisition.Lease);
+
+    var ipc = new RecordingIpcServer();
+    var ownerWatcher = new FailsStartOwnerWatcher();
+    var host = new DaemonLifecycleHost(
+        acquisition.Lease,
+        ipc,
+        new RecordingRegistrationStore(),
+        new RecordingRuntime(),
+        ownerWatcher: ownerWatcher);
+
+    await Assert.ThrowsAsync<InvalidOperationException>(async () => await host.StartAsync());
+
+    Assert.True(ipc.Started);
+    Assert.True(ipc.Stopped);
+    Assert.True(ownerWatcher.StopCalled);
+    Assert.Equal(DaemonLifecycleState.Created, host.Snapshot.State);
+
+    acquisition.Lease.Dispose();
+  }
+
+  [Fact]
   public async Task ForwardedLaunchIntentIsRecordedByPrimaryDaemon()
   {
     var coordinator = new NamedMutexDaemonSingletonCoordinator(CreateMutexName());
@@ -247,6 +273,22 @@ public sealed class DaemonLifecycleTests
     {
       await onStop();
       Stopped = true;
+    }
+  }
+
+  private sealed class FailsStartOwnerWatcher : IRegistrationOwnerWatcher
+  {
+    public bool StopCalled { get; private set; }
+
+    public ValueTask StartAsync(CancellationToken cancellationToken = default)
+    {
+      throw new InvalidOperationException("Injected watcher start failure.");
+    }
+
+    public ValueTask StopAsync(CancellationToken cancellationToken = default)
+    {
+      StopCalled = true;
+      return ValueTask.CompletedTask;
     }
   }
 

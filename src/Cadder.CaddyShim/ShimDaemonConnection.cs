@@ -13,6 +13,10 @@ public interface ICadderDaemonConnection : IAsyncDisposable
   ValueTask<UnregisterEntrypointResponse> UnregisterAsync(
       UnregisterEntrypointRequest request,
       CancellationToken cancellationToken = default);
+
+  ValueTask<HeartbeatEntrypointResponse> HeartbeatAsync(
+      HeartbeatEntrypointRequest request,
+      CancellationToken cancellationToken = default);
 }
 
 public interface ICadderDaemonConnector
@@ -97,6 +101,23 @@ public sealed class NamedPipeCadderDaemonConnection : ICadderDaemonConnection
 
     var response = await ReadResponseAsync<UnregisterEntrypointResponse>(
         CadderIpcMessageTypes.UnregisterEntrypointResponse,
+        cancellationToken).ConfigureAwait(false);
+
+    return response;
+  }
+
+  public async ValueTask<HeartbeatEntrypointResponse> HeartbeatAsync(
+      HeartbeatEntrypointRequest request,
+      CancellationToken cancellationToken = default)
+  {
+    await CadderIpcProtocol.WriteAsync(
+        _writer,
+        CadderIpcMessageTypes.HeartbeatEntrypointRequest,
+        request,
+        cancellationToken).ConfigureAwait(false);
+
+    var response = await ReadResponseAsync<HeartbeatEntrypointResponse>(
+        CadderIpcMessageTypes.HeartbeatEntrypointResponse,
         cancellationToken).ConfigureAwait(false);
 
     return response;

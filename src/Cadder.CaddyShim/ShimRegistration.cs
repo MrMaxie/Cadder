@@ -72,6 +72,8 @@ public static class ShimRegistrationFactory
             shimSessionNonce,
             processIdentity.ExecutablePath),
         logStream,
-        new ShimRunMetadata(command.Adapter, command.RawArguments));
+        new ShimRunMetadata(command.Adapter, command.RawArguments, string.Join(' ', command.RawArguments)),
+        startedAtUtc,
+        startedAtUtc);
   }
 }

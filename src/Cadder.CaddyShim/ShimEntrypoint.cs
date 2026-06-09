@@ -93,19 +93,54 @@ public static class ShimEntrypoint
         return 1;
       }
 
+      var registeredId = registerResponse.RegistrationId ?? registration.RegistrationId;
+      using var heartbeatStop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+      var heartbeatTask = RunHeartbeatLoopAsync(
+          connection,
+          registeredId,
+          registration.EntrypointInstance.ShimSessionNonce,
+          dependencies.HeartbeatInterval,
+          heartbeatStop.Token);
+
       try
       {
-        await dependencies.LifetimeWaiter.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var lifetimeTask = dependencies.LifetimeWaiter.WaitAsync(cancellationToken).AsTask();
+        var completedTask = await Task.WhenAny(lifetimeTask, heartbeatTask).ConfigureAwait(false);
+        if (completedTask == heartbeatTask)
+        {
+          await heartbeatTask.ConfigureAwait(false);
+        }
+
+        await lifetimeTask.ConfigureAwait(false);
         return 0;
+      }
+      catch (Exception ex) when (ex is IOException or InvalidOperationException)
+      {
+        await dependencies.Error
+            .WriteLineAsync($"Cadder daemon heartbeat failed: {ex.Message}")
+            .ConfigureAwait(false);
+        return 1;
       }
       finally
       {
+        await heartbeatStop.CancelAsync().ConfigureAwait(false);
+        try
+        {
+          await heartbeatTask.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (heartbeatStop.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException)
+        {
+        }
+
         try
         {
           await connection.UnregisterAsync(
               new UnregisterEntrypointRequest(
                   Guid.NewGuid().ToString("N"),
-                  registerResponse.RegistrationId ?? registration.RegistrationId,
+                  registeredId,
                   registration.EntrypointInstance.ShimSessionNonce),
               CancellationToken.None).ConfigureAwait(false);
         }
@@ -115,6 +150,31 @@ public static class ShimEntrypoint
               .WriteLineAsync($"Cadder daemon unregister failed after session end: {ex.Message}")
               .ConfigureAwait(false);
         }
+      }
+    }
+  }
+
+  private static async Task RunHeartbeatLoopAsync(
+      ICadderDaemonConnection connection,
+      string registrationId,
+      string shimSessionNonce,
+      TimeSpan heartbeatInterval,
+      CancellationToken cancellationToken)
+  {
+    while (true)
+    {
+      await Task.Delay(heartbeatInterval, cancellationToken).ConfigureAwait(false);
+
+      var response = await connection.HeartbeatAsync(
+          new HeartbeatEntrypointRequest(
+              Guid.NewGuid().ToString("N"),
+              registrationId,
+              shimSessionNonce),
+          cancellationToken).ConfigureAwait(false);
+
+      if (!response.Accepted)
+      {
+        throw new InvalidOperationException(response.Message ?? "The daemon rejected the shim heartbeat.");
       }
     }
   }

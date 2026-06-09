@@ -57,4 +57,6 @@ public sealed class ShimRuntimeDependencies
   public TimeSpan DaemonReadyTimeout { get; init; } = TimeSpan.FromSeconds(10);
 
   public TimeSpan DaemonReadyPollInterval { get; init; } = TimeSpan.FromMilliseconds(200);
+
+  public TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(5);
 }

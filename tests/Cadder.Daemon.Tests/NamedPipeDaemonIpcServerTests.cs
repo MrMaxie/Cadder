@@ -136,19 +136,147 @@ public sealed class NamedPipeDaemonIpcServerTests
 
       var firstResponse = await firstConnection.RegisterAsync(new RegisterEntrypointRequest(
           "request-1",
-          CreateRegistration("same-nonce")));
+          CreateRegistration("nonce-1")));
       var secondResponse = await secondConnection.RegisterAsync(new RegisterEntrypointRequest(
           "request-2",
-          CreateRegistration("same-nonce")));
+          CreateRegistration("nonce-2")));
 
-      Assert.NotEqual(firstResponse.RegistrationId, secondResponse.RegistrationId);
+      Assert.Equal("shim-nonce-1", firstResponse.RegistrationId);
+      Assert.Equal("shim-nonce-2", secondResponse.RegistrationId);
       Assert.Equal(2, (await store.ListAsync()).Count);
 
       await secondConnection.DisposeAsync();
       await WaitUntilAsync(async () => (await store.ListAsync()).Count == 1);
+      Assert.Equal("shim-nonce-1", (await store.ListAsync())[0].RegistrationId);
 
       await firstConnection.DisposeAsync();
       await WaitUntilAsync(async () => (await store.ListAsync()).Count == 0);
+    }
+    finally
+    {
+      await server.StopAsync();
+    }
+  }
+
+  [Fact]
+  public async Task ClientMessages_CoverRegistrationApi()
+  {
+    var pipeName = $"Cadder.Tests.{Guid.NewGuid():N}";
+    var store = new InMemoryRegistrationStore();
+    var endpoint = new CadderIpcEndpoint(store, new NoopRealCaddyRuntimeAdapter());
+    var server = new NamedPipeDaemonIpcServer(endpoint, pipeName);
+
+    await server.StartAsync();
+    try
+    {
+      await using var pipe = await ConnectRawPipeAsync(pipeName);
+      using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
+      await using var writer = new StreamWriter(pipe, Encoding.UTF8, leaveOpen: true);
+
+      var register = await SendMessageAsync<RegisterEntrypointRequest, RegisterEntrypointResponse>(
+          writer,
+          reader,
+          CadderIpcMessageTypes.RegisterEntrypointRequest,
+          CadderIpcMessageTypes.RegisterEntrypointResponse,
+          new RegisterEntrypointRequest("register-1", CreateRegistration("nonce-1")));
+      Assert.True(register.Accepted);
+
+      var update = await SendMessageAsync<UpdateEntrypointRequest, UpdateEntrypointResponse>(
+          writer,
+          reader,
+          CadderIpcMessageTypes.UpdateEntrypointRequest,
+          CadderIpcMessageTypes.UpdateEntrypointResponse,
+          new UpdateEntrypointRequest(
+              "update-1",
+              "shim-nonce-1",
+              "nonce-1",
+              null,
+              new SourcePath("Caddyfile.alt", "D:\\Projects\\Sample\\Caddyfile.alt"),
+              [],
+              ActivationState.Registered,
+              null));
+      Assert.True(update.Accepted);
+      Assert.Equal("Caddyfile.alt", update.Registration?.SourceConfigPath.Raw);
+
+      var list = await SendMessageAsync<ListEntrypointsRequest, ListEntrypointsResponse>(
+          writer,
+          reader,
+          CadderIpcMessageTypes.ListEntrypointsRequest,
+          CadderIpcMessageTypes.ListEntrypointsResponse,
+          new ListEntrypointsRequest("list-1"));
+      Assert.Single(list.Registrations);
+
+      var toggle = await SendMessageAsync<ToggleEntrypointRequest, ToggleEntrypointResponse>(
+          writer,
+          reader,
+          CadderIpcMessageTypes.ToggleEntrypointRequest,
+          CadderIpcMessageTypes.ToggleEntrypointResponse,
+          new ToggleEntrypointRequest("toggle-1", "shim-nonce-1", "nonce-1", false));
+      Assert.Equal(ActivationState.Inactive, toggle.Registration?.ActivationState);
+
+      var heartbeat = await SendMessageAsync<HeartbeatEntrypointRequest, HeartbeatEntrypointResponse>(
+          writer,
+          reader,
+          CadderIpcMessageTypes.HeartbeatEntrypointRequest,
+          CadderIpcMessageTypes.HeartbeatEntrypointResponse,
+          new HeartbeatEntrypointRequest("heartbeat-1", "shim-nonce-1", "nonce-1"));
+      Assert.True(heartbeat.Accepted);
+
+      var unregister = await SendMessageAsync<UnregisterEntrypointRequest, UnregisterEntrypointResponse>(
+          writer,
+          reader,
+          CadderIpcMessageTypes.UnregisterEntrypointRequest,
+          CadderIpcMessageTypes.UnregisterEntrypointResponse,
+          new UnregisterEntrypointRequest("unregister-1", "shim-nonce-1", "nonce-1"));
+      Assert.True(unregister.Accepted);
+      Assert.Empty(await store.ListAsync());
+    }
+    finally
+    {
+      await server.StopAsync();
+    }
+  }
+
+  [Fact]
+  public async Task SubscribeGuiStateRequest_StreamsInitialSnapshotAndChanges()
+  {
+    var pipeName = $"Cadder.Tests.{Guid.NewGuid():N}";
+    var store = new InMemoryRegistrationStore();
+    var endpoint = new CadderIpcEndpoint(store, new NoopRealCaddyRuntimeAdapter());
+    var server = new NamedPipeDaemonIpcServer(endpoint, pipeName);
+
+    await server.StartAsync();
+    try
+    {
+      await using var subscriptionPipe = await ConnectRawPipeAsync(pipeName);
+      using var subscriptionReader = new StreamReader(subscriptionPipe, Encoding.UTF8, leaveOpen: true);
+      await using var subscriptionWriter = new StreamWriter(subscriptionPipe, Encoding.UTF8, leaveOpen: true);
+
+      await WriteMessageAsync(
+          subscriptionWriter,
+          CadderIpcMessageTypes.SubscribeGuiStateRequest,
+          new SubscribeGuiStateRequest("subscribe-1"));
+
+      var initial = await ReadMessageAsync<GuiStateChangedEvent>(
+          subscriptionReader,
+          CadderIpcMessageTypes.GuiStateChangedEvent);
+      Assert.Equal(GuiStateChangeKind.Snapshot, initial.ChangeKind);
+      Assert.Empty(initial.Snapshot.Registrations);
+
+      await using var connection = await new NamedPipeCadderDaemonConnector(
+          pipeName,
+          TimeSpan.FromSeconds(2)).ConnectAsync();
+      var register = await connection.RegisterAsync(new RegisterEntrypointRequest(
+          "register-1",
+          CreateRegistration("nonce-1")));
+      Assert.True(register.Accepted);
+
+      var changed = await ReadMessageAsync<GuiStateChangedEvent>(
+          subscriptionReader,
+          CadderIpcMessageTypes.GuiStateChangedEvent);
+      Assert.Equal(GuiStateChangeKind.RegistrationsChanged, changed.ChangeKind);
+      Assert.Equal("shim-nonce-1", changed.RegistrationId);
+      Assert.Single(changed.Snapshot.Registrations);
     }
     finally
     {
@@ -188,14 +316,50 @@ public sealed class NamedPipeDaemonIpcServerTests
       TextWriter writer,
       EntrypointRegistration registration)
   {
+    await WriteMessageAsync(
+        writer,
+        CadderIpcMessageTypes.RegisterEntrypointRequest,
+        new RegisterEntrypointRequest("request-1", registration));
+  }
+
+  private static async Task<TResponse> SendMessageAsync<TRequest, TResponse>(
+      TextWriter writer,
+      TextReader reader,
+      string requestType,
+      string responseType,
+      TRequest request)
+  {
+    await WriteMessageAsync(writer, requestType, request);
+    return await ReadMessageAsync<TResponse>(reader, responseType);
+  }
+
+  private static async Task WriteMessageAsync<TRequest>(
+      TextWriter writer,
+      string type,
+      TRequest request)
+  {
     await writer.WriteLineAsync(JsonSerializer.Serialize(
         new
         {
-          type = CadderIpcMessageTypes.RegisterEntrypointRequest,
-          payload = new RegisterEntrypointRequest("request-1", registration)
+          type,
+          payload = request
         },
         CadderIpcJson.SerializerOptions));
     await writer.FlushAsync();
+  }
+
+  private static async Task<TResponse> ReadMessageAsync<TResponse>(
+      TextReader reader,
+      string expectedType)
+  {
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+    var line = await reader.ReadLineAsync(timeout.Token);
+    Assert.NotNull(line);
+
+    var message = JsonSerializer.Deserialize<CadderIpcMessage>(line, CadderIpcJson.SerializerOptions);
+    Assert.NotNull(message);
+    Assert.Equal(expectedType, message.Type);
+    return CadderIpcProtocol.ReadPayload<TResponse>(message);
   }
 
   private static async Task WaitUntilAsync(Func<Task<bool>> condition)

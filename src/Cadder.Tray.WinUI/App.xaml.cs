@@ -22,23 +22,37 @@ public partial class App : Application
 
     DaemonLifecycleHost? daemonHost = null;
     var registrationStore = new InMemoryRegistrationStore();
+    var realCaddyRuntime = new NoopRealCaddyRuntimeAdapter();
+    var guiStateProjector = new GuiStateProjector();
+    var guiStateBroadcaster = new InMemoryGuiStateChangeBroadcaster();
+    Func<int, CancellationToken, ValueTask> registrationCountChanged = async (registrationCount, cancellationToken) =>
+    {
+      if (daemonHost is not null)
+      {
+        await daemonHost.UpdateRegistrationCountAsync(registrationCount, cancellationToken);
+      }
+    };
     var endpoint = new CadderIpcEndpoint(
         registrationStore,
-        new NoopRealCaddyRuntimeAdapter(),
-        async (registrationCount, cancellationToken) =>
-        {
-          if (daemonHost is not null)
-          {
-            await daemonHost.UpdateRegistrationCountAsync(registrationCount, cancellationToken);
-          }
-        });
+        realCaddyRuntime,
+        guiStateBroadcaster,
+        guiStateProjector,
+        registrationCountChanged);
     var ipcServer = new NamedPipeDaemonIpcServer(endpoint);
+    var ownerWatcher = new RegistrationOwnerWatcher(
+        registrationStore,
+        new SystemOwnerProcessProbe(),
+        realCaddyRuntime,
+        guiStateProjector,
+        guiStateBroadcaster,
+        registrationCountChanged);
 
     daemonHost = new DaemonLifecycleHost(
         acquisition.Lease,
         ipcServer,
         registrationStore,
-        new NoopCadderOwnedRuntime());
+        new NoopCadderOwnedRuntime(),
+        ownerWatcher: ownerWatcher);
     _daemonHost = daemonHost;
 
     InitializeComponent();

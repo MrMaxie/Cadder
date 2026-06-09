@@ -19,6 +19,13 @@ public enum RealCaddyRuntimeStatus
   Unhealthy = 4
 }
 
+public enum GuiStateChangeKind
+{
+  Snapshot = 0,
+  RegistrationsChanged = 1,
+  RuntimeChanged = 2
+}
+
 public sealed record SourcePath(
     string Raw,
     string? Canonical);
@@ -57,11 +64,14 @@ public sealed record EntrypointRegistration(
     ActivationState ActivationState,
     OwnerProcessIdentity OwnerProcess,
     LogStreamIdentity LogStream,
-    ShimRunMetadata? ShimRun = null);
+    ShimRunMetadata? ShimRun = null,
+    DateTimeOffset CreatedAtUtc = default,
+    DateTimeOffset LastHeartbeatUtc = default);
 
 public sealed record ShimRunMetadata(
     string? Adapter,
-    string[] RawArguments);
+    string[] RawArguments,
+    string CommandLine = "");
 
 public sealed record RealCaddyBinaryIdentity(
     string? ResolvedPath,

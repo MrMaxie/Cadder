@@ -16,6 +16,8 @@ public sealed class ContractShapeTests
     Assert.Single(registration.RegisteredDomains);
     Assert.Equal(ActivationState.Active, registration.RegisteredDomains[0].ActivationState);
     Assert.Equal("domain-example.com", registration.RegisteredDomains[0].LogStream.StreamId);
+    Assert.Equal(DateTimeOffset.Parse("2026-06-09T10:00:01Z"), registration.CreatedAtUtc);
+    Assert.Equal(DateTimeOffset.Parse("2026-06-09T10:00:02Z"), registration.LastHeartbeatUtc);
 
     var json = JsonSerializer.Serialize(registration, new JsonSerializerOptions(JsonSerializerDefaults.Web));
 
@@ -27,6 +29,8 @@ public sealed class ContractShapeTests
     Assert.Contains("ownerProcess", json, StringComparison.Ordinal);
     Assert.Contains("logStream", json, StringComparison.Ordinal);
     Assert.Contains("shimRun", json, StringComparison.Ordinal);
+    Assert.Contains("createdAtUtc", json, StringComparison.Ordinal);
+    Assert.Contains("lastHeartbeatUtc", json, StringComparison.Ordinal);
   }
 
   [Fact]
@@ -59,6 +63,34 @@ public sealed class ContractShapeTests
     Assert.NotNull(shimRun);
     Assert.Equal("caddyfile", shimRun.Adapter);
     Assert.Equal(["run", "--config", "Caddyfile", "--adapter", "caddyfile"], shimRun.RawArguments);
+    Assert.Equal("run --config Caddyfile --adapter caddyfile", shimRun.CommandLine);
+  }
+
+  [Fact]
+  public void IpcContractsCoverTaskRegistrationApi()
+  {
+    Assert.Equal("update-entrypoint-request", CadderIpcMessageTypes.UpdateEntrypointRequest);
+    Assert.Equal("list-entrypoints-request", CadderIpcMessageTypes.ListEntrypointsRequest);
+    Assert.Equal("toggle-entrypoint-request", CadderIpcMessageTypes.ToggleEntrypointRequest);
+    Assert.Equal("heartbeat-entrypoint-request", CadderIpcMessageTypes.HeartbeatEntrypointRequest);
+    Assert.Equal("subscribe-gui-state-request", CadderIpcMessageTypes.SubscribeGuiStateRequest);
+    Assert.Equal("gui-state-changed-event", CadderIpcMessageTypes.GuiStateChangedEvent);
+
+    var update = new UpdateEntrypointRequest(
+        "request-1",
+        "registration-1",
+        "nonce-1",
+        null,
+        new SourcePath("Caddyfile.alt", "C:\\work\\site\\Caddyfile.alt"),
+        [],
+        ActivationState.Inactive,
+        null);
+    var json = JsonSerializer.Serialize(update, CadderIpcJson.SerializerOptions);
+
+    Assert.Contains("registrationId", json, StringComparison.Ordinal);
+    Assert.Contains("shimSessionNonce", json, StringComparison.Ordinal);
+    Assert.Contains("sourceConfigPath", json, StringComparison.Ordinal);
+    Assert.Contains("activationState", json, StringComparison.Ordinal);
   }
 
   private static class Samples
@@ -81,7 +113,12 @@ public sealed class ContractShapeTests
           ActivationState.Active,
           new OwnerProcessIdentity(4242, DateTimeOffset.Parse("2026-06-09T09:59:59Z"), "nonce-1", "C:\\tools\\caddy.exe"),
           logStream,
-          new ShimRunMetadata("caddyfile", ["run", "--config", "Caddyfile", "--adapter", "caddyfile"]));
+          new ShimRunMetadata(
+              "caddyfile",
+              ["run", "--config", "Caddyfile", "--adapter", "caddyfile"],
+              "run --config Caddyfile --adapter caddyfile"),
+          DateTimeOffset.Parse("2026-06-09T10:00:01Z"),
+          DateTimeOffset.Parse("2026-06-09T10:00:02Z"));
     }
   }
 }

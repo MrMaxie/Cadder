@@ -10,8 +10,18 @@ public static class CadderIpcMessageTypes
   public const string RegisterEntrypointResponse = "register-entrypoint-response";
   public const string UnregisterEntrypointRequest = "unregister-entrypoint-request";
   public const string UnregisterEntrypointResponse = "unregister-entrypoint-response";
+  public const string UpdateEntrypointRequest = "update-entrypoint-request";
+  public const string UpdateEntrypointResponse = "update-entrypoint-response";
+  public const string ListEntrypointsRequest = "list-entrypoints-request";
+  public const string ListEntrypointsResponse = "list-entrypoints-response";
+  public const string ToggleEntrypointRequest = "toggle-entrypoint-request";
+  public const string ToggleEntrypointResponse = "toggle-entrypoint-response";
+  public const string HeartbeatEntrypointRequest = "heartbeat-entrypoint-request";
+  public const string HeartbeatEntrypointResponse = "heartbeat-entrypoint-response";
   public const string QueryGuiStateRequest = "query-gui-state-request";
   public const string QueryGuiStateResponse = "query-gui-state-response";
+  public const string SubscribeGuiStateRequest = "subscribe-gui-state-request";
+  public const string GuiStateChangedEvent = "gui-state-changed-event";
 }
 
 public sealed record CadderIpcMessage(

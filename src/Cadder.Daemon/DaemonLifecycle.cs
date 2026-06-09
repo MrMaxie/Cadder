@@ -45,6 +45,7 @@ public sealed class DaemonLifecycleHost
   private readonly IDaemonIpcServer _ipcServer;
   private readonly ITransientRegistrationStore _registrationStore;
   private readonly ICadderOwnedRuntime _runtime;
+  private readonly IRegistrationOwnerWatcher _ownerWatcher;
   private readonly TimeProvider _timeProvider;
   private readonly SemaphoreSlim _gate = new(1, 1);
   private readonly ConcurrentQueue<DaemonLaunchIntent> _forwardedLaunchIntents = new();
@@ -58,12 +59,14 @@ public sealed class DaemonLifecycleHost
       IDaemonIpcServer ipcServer,
       ITransientRegistrationStore registrationStore,
       ICadderOwnedRuntime runtime,
-      TimeProvider? timeProvider = null)
+      TimeProvider? timeProvider = null,
+      IRegistrationOwnerWatcher? ownerWatcher = null)
   {
     _singletonLease = singletonLease ?? throw new ArgumentNullException(nameof(singletonLease));
     _ipcServer = ipcServer ?? throw new ArgumentNullException(nameof(ipcServer));
     _registrationStore = registrationStore ?? throw new ArgumentNullException(nameof(registrationStore));
     _runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
+    _ownerWatcher = ownerWatcher ?? new NoopRegistrationOwnerWatcher();
     _timeProvider = timeProvider ?? TimeProvider.System;
     _lastChangedAtUtc = _timeProvider.GetUtcNow();
   }
@@ -86,12 +89,18 @@ public sealed class DaemonLifecycleHost
 
       ThrowIfStopped();
       SetState(DaemonLifecycleState.Starting);
+      var ipcStarted = false;
+      var ownerWatcherStartAttempted = false;
       try
       {
         await _ipcServer.StartAsync(cancellationToken).ConfigureAwait(false);
+        ipcStarted = true;
+        ownerWatcherStartAttempted = true;
+        await _ownerWatcher.StartAsync(cancellationToken).ConfigureAwait(false);
       }
       catch
       {
+        await RollBackStartAsync(ipcStarted, ownerWatcherStartAttempted).ConfigureAwait(false);
         SetState(DaemonLifecycleState.Created);
         throw;
       }
@@ -159,6 +168,9 @@ public sealed class DaemonLifecycleHost
     }
 
     await RunShutdownStepAsync(
+        () => _ownerWatcher.StopAsync(cancellationToken),
+        errors).ConfigureAwait(false);
+    await RunShutdownStepAsync(
         () => _ipcServer.StopAsync(cancellationToken),
         errors).ConfigureAwait(false);
     await RunShutdownStepAsync(
@@ -199,6 +211,33 @@ public sealed class DaemonLifecycleHost
     }
   }
 
+  private async ValueTask RollBackStartAsync(
+      bool ipcStarted,
+      bool ownerWatcherStartAttempted)
+  {
+    if (ownerWatcherStartAttempted)
+    {
+      try
+      {
+        await _ownerWatcher.StopAsync(CancellationToken.None).ConfigureAwait(false);
+      }
+      catch
+      {
+      }
+    }
+
+    if (ipcStarted)
+    {
+      try
+      {
+        await _ipcServer.StopAsync(CancellationToken.None).ConfigureAwait(false);
+      }
+      catch
+      {
+      }
+    }
+  }
+
   private void ThrowIfStopped()
   {
     if (_state == DaemonLifecycleState.Stopped)
@@ -226,6 +265,19 @@ public sealed class DaemonLifecycleHost
 }
 
 public sealed class NoopDaemonIpcServer : IDaemonIpcServer
+{
+  public ValueTask StartAsync(CancellationToken cancellationToken = default)
+  {
+    return ValueTask.CompletedTask;
+  }
+
+  public ValueTask StopAsync(CancellationToken cancellationToken = default)
+  {
+    return ValueTask.CompletedTask;
+  }
+}
+
+public sealed class NoopRegistrationOwnerWatcher : IRegistrationOwnerWatcher
 {
   public ValueTask StartAsync(CancellationToken cancellationToken = default)
   {

@@ -100,8 +100,6 @@ public sealed class NamedPipeDaemonIpcServer : IDaemonIpcServer
 
     try
     {
-      var connectionId = Guid.NewGuid().ToString("N");
-
       await using (pipe.ConfigureAwait(false))
       using (var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true))
       await using (var writer = new StreamWriter(pipe, Encoding.UTF8, leaveOpen: true))
@@ -137,7 +135,6 @@ public sealed class NamedPipeDaemonIpcServer : IDaemonIpcServer
                 message,
                 writer,
                 ownedRegistrations,
-                connectionId,
                 serverStoppingToken).ConfigureAwait(false);
           }
           catch (IOException)
@@ -165,21 +162,19 @@ public sealed class NamedPipeDaemonIpcServer : IDaemonIpcServer
       CadderIpcMessage message,
       TextWriter writer,
       HashSet<EntrypointRegistration> ownedRegistrations,
-      string connectionId,
       CancellationToken cancellationToken)
   {
     switch (message.Type)
     {
       case CadderIpcMessageTypes.RegisterEntrypointRequest:
         var registerRequest = CadderIpcProtocol.ReadPayload<RegisterEntrypointRequest>(message);
-        var serverOwnedRegistration = CreateServerOwnedRegistration(registerRequest.Registration, connectionId);
         var registerResponse = await _endpoint.RegisterAsync(
-            registerRequest with { Registration = serverOwnedRegistration },
+            registerRequest,
             cancellationToken)
             .ConfigureAwait(false);
         if (registerResponse.Accepted)
         {
-          ownedRegistrations.Add(serverOwnedRegistration);
+          ownedRegistrations.Add(registerRequest.Registration);
         }
 
         await CadderIpcProtocol.WriteAsync(
@@ -205,6 +200,50 @@ public sealed class NamedPipeDaemonIpcServer : IDaemonIpcServer
             cancellationToken).ConfigureAwait(false);
         break;
 
+      case CadderIpcMessageTypes.UpdateEntrypointRequest:
+        var updateRequest = CadderIpcProtocol.ReadPayload<UpdateEntrypointRequest>(message);
+        var updateResponse = await _endpoint.UpdateAsync(updateRequest, cancellationToken)
+            .ConfigureAwait(false);
+        await CadderIpcProtocol.WriteAsync(
+            writer,
+            CadderIpcMessageTypes.UpdateEntrypointResponse,
+            updateResponse,
+            cancellationToken).ConfigureAwait(false);
+        break;
+
+      case CadderIpcMessageTypes.ListEntrypointsRequest:
+        var listRequest = CadderIpcProtocol.ReadPayload<ListEntrypointsRequest>(message);
+        var listResponse = await _endpoint.ListAsync(listRequest, cancellationToken)
+            .ConfigureAwait(false);
+        await CadderIpcProtocol.WriteAsync(
+            writer,
+            CadderIpcMessageTypes.ListEntrypointsResponse,
+            listResponse,
+            cancellationToken).ConfigureAwait(false);
+        break;
+
+      case CadderIpcMessageTypes.ToggleEntrypointRequest:
+        var toggleRequest = CadderIpcProtocol.ReadPayload<ToggleEntrypointRequest>(message);
+        var toggleResponse = await _endpoint.ToggleAsync(toggleRequest, cancellationToken)
+            .ConfigureAwait(false);
+        await CadderIpcProtocol.WriteAsync(
+            writer,
+            CadderIpcMessageTypes.ToggleEntrypointResponse,
+            toggleResponse,
+            cancellationToken).ConfigureAwait(false);
+        break;
+
+      case CadderIpcMessageTypes.HeartbeatEntrypointRequest:
+        var heartbeatRequest = CadderIpcProtocol.ReadPayload<HeartbeatEntrypointRequest>(message);
+        var heartbeatResponse = await _endpoint.HeartbeatAsync(heartbeatRequest, cancellationToken)
+            .ConfigureAwait(false);
+        await CadderIpcProtocol.WriteAsync(
+            writer,
+            CadderIpcMessageTypes.HeartbeatEntrypointResponse,
+            heartbeatResponse,
+            cancellationToken).ConfigureAwait(false);
+        break;
+
       case CadderIpcMessageTypes.QueryGuiStateRequest:
         var queryRequest = CadderIpcProtocol.ReadPayload<QueryGuiStateRequest>(message);
         var queryResponse = await _endpoint.QueryStateAsync(queryRequest, cancellationToken)
@@ -216,19 +255,23 @@ public sealed class NamedPipeDaemonIpcServer : IDaemonIpcServer
             cancellationToken).ConfigureAwait(false);
         break;
 
+      case CadderIpcMessageTypes.SubscribeGuiStateRequest:
+        var subscribeRequest = CadderIpcProtocol.ReadPayload<SubscribeGuiStateRequest>(message);
+        await foreach (var change in _endpoint
+            .SubscribeGuiStateAsync(subscribeRequest, cancellationToken)
+            .ConfigureAwait(false))
+        {
+          await CadderIpcProtocol.WriteAsync(
+              writer,
+              CadderIpcMessageTypes.GuiStateChangedEvent,
+              change,
+              cancellationToken).ConfigureAwait(false);
+        }
+        break;
+
       default:
         throw new InvalidOperationException($"Unsupported IPC message type '{message.Type}'.");
     }
-  }
-
-  private static EntrypointRegistration CreateServerOwnedRegistration(
-      EntrypointRegistration registration,
-      string connectionId)
-  {
-    return registration with
-    {
-      RegistrationId = $"{registration.RegistrationId}-{connectionId}"
-    };
   }
 
   private async ValueTask RemoveOwnedRegistrationsAsync(
