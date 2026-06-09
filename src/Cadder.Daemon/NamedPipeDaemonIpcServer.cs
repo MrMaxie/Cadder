@@ -255,6 +255,17 @@ public sealed class NamedPipeDaemonIpcServer : IDaemonIpcServer
             cancellationToken).ConfigureAwait(false);
         break;
 
+      case CadderIpcMessageTypes.QueryCaddyLogsRequest:
+        var queryLogsRequest = CadderIpcProtocol.ReadPayload<QueryCaddyLogsRequest>(message);
+        var queryLogsResponse = await _endpoint.QueryCaddyLogsAsync(queryLogsRequest, cancellationToken)
+            .ConfigureAwait(false);
+        await CadderIpcProtocol.WriteAsync(
+            writer,
+            CadderIpcMessageTypes.QueryCaddyLogsResponse,
+            queryLogsResponse,
+            cancellationToken).ConfigureAwait(false);
+        break;
+
       case CadderIpcMessageTypes.SubscribeGuiStateRequest:
         var subscribeRequest = CadderIpcProtocol.ReadPayload<SubscribeGuiStateRequest>(message);
         await foreach (var change in _endpoint

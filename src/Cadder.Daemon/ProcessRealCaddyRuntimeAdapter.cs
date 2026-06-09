@@ -10,6 +10,9 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
   private const string DefaultAdminEndpoint = "http://127.0.0.1:2019";
   private readonly RealCaddyExecutableResolver _resolver;
   private readonly IManagedProcessFactory _processFactory;
+  private readonly ICaddyLogSink _logSink;
+  private readonly ICaddyLogRedactor _redactor;
+  private readonly TimeProvider _timeProvider;
   private readonly string _adminEndpoint;
   private readonly TimeSpan _startupObservationDelay;
   private readonly SemaphoreSlim _gate = new(1, 1);
@@ -20,13 +23,17 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
       Diagnostics: []);
   private IManagedProcess? _ownedProcess;
   private string? _ownedConfigPath;
+  private OwnedRuntimeLogSession? _ownedLogSession;
 
   public ProcessRealCaddyRuntimeAdapter(
       string? runtimeCommand = null,
       string? adminEndpoint = null,
       RealCaddyExecutableResolver? resolver = null,
       IManagedProcessFactory? processFactory = null,
-      TimeSpan? startupObservationDelay = null)
+      TimeSpan? startupObservationDelay = null,
+      ICaddyLogSink? logSink = null,
+      ICaddyLogRedactor? redactor = null,
+      TimeProvider? timeProvider = null)
   {
     _resolver = resolver ?? new RealCaddyExecutableResolver(runtimeCommand);
     _adminEndpoint = string.IsNullOrWhiteSpace(adminEndpoint)
@@ -34,6 +41,9 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
         : adminEndpoint;
     _processFactory = processFactory ?? new SystemManagedProcessFactory();
     _startupObservationDelay = startupObservationDelay ?? TimeSpan.FromMilliseconds(750);
+    _redactor = redactor ?? new CaddyLogRedactor();
+    _logSink = logSink ?? new InMemoryCaddyLogStore(redactor: _redactor);
+    _timeProvider = timeProvider ?? TimeProvider.System;
   }
 
   public async ValueTask<RealCaddyRuntimeState> InspectAsync(CancellationToken cancellationToken = default)
@@ -55,9 +65,10 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
             _state.Version,
             null,
             "runtime-exited",
-            $"Cadder-owned Caddy runtime exited with code {_ownedProcess.ExitCode}.",
+            _redactor.Redact($"Cadder-owned Caddy runtime exited with code {_ownedProcess.ExitCode}."),
             "inspect");
-        DisposeOwnedProcess();
+        WriteRuntimeControlLog(CaddyLogSeverity.Error, "inspect", _state.Diagnostics?[0].Message ?? "Runtime exited.");
+        await DisposeOwnedProcessAsync(cancellationToken).ConfigureAwait(false);
         return _state;
       }
 
@@ -73,7 +84,7 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
             RealCaddyRuntimeStatus.NotResolved,
             null,
             null,
-            Diagnostics: resolution.Diagnostics);
+            Diagnostics: RedactDiagnostics(resolution.Diagnostics));
         return _state;
       }
 
@@ -114,7 +125,7 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
         return _state;
       }
 
-      DisposeOwnedProcess();
+      await DisposeOwnedProcessAsync(cancellationToken).ConfigureAwait(false);
       var resolution = _resolver.Resolve();
       if (!resolution.Succeeded)
       {
@@ -122,7 +133,7 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
             RealCaddyRuntimeStatus.NotResolved,
             null,
             null,
-            Diagnostics: resolution.Diagnostics);
+            Diagnostics: RedactDiagnostics(resolution.Diagnostics));
         return _state;
       }
 
@@ -141,7 +152,7 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
       var startInfo = CreateStartInfo(
           resolution.CommandPath,
           ["run", "--config", _ownedConfigPath],
-          redirectOutput: false);
+          redirectOutput: true);
       try
       {
         _ownedProcess = _processFactory.Start(startInfo);
@@ -154,8 +165,9 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
             version.StandardOutput.Trim(),
             null,
             "runtime-start-failed",
-            $"Could not start '{resolution.CommandPath}': {ex.Message}",
+            _redactor.Redact($"Could not start '{resolution.CommandPath}': {ex.Message}"),
             "run");
+        WriteRuntimeControlLog(CaddyLogSeverity.Error, "run", _state.Diagnostics?[0].Message ?? "Runtime start failed.");
         DeleteOwnedConfig();
         return _state;
       }
@@ -168,11 +180,15 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
             version.StandardOutput.Trim(),
             null,
             "runtime-start-failed",
-            $"Could not start '{resolution.CommandPath}'.",
+            _redactor.Redact($"Could not start '{resolution.CommandPath}'."),
             "run");
+        WriteRuntimeControlLog(CaddyLogSeverity.Error, "run", _state.Diagnostics?[0].Message ?? "Runtime start failed.");
         DeleteOwnedConfig();
         return _state;
       }
+
+      _ownedLogSession = StartOwnedLogSession(_ownedProcess);
+      WriteRuntimeControlLog(CaddyLogSeverity.Info, "run", $"Started Cadder-owned Caddy runtime session '{_ownedLogSession.SessionId}'.");
 
       await Task.Delay(_startupObservationDelay, cancellationToken).ConfigureAwait(false);
       if (_ownedProcess.HasExited)
@@ -183,9 +199,10 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
             version.StandardOutput.Trim(),
             null,
             "runtime-exited-during-start",
-            $"Cadder-owned Caddy runtime exited during startup with code {_ownedProcess.ExitCode}.",
+            _redactor.Redact($"Cadder-owned Caddy runtime exited during startup with code {_ownedProcess.ExitCode}."),
             "run");
-        DisposeOwnedProcess();
+        WriteRuntimeControlLog(CaddyLogSeverity.Error, "run", _state.Diagnostics?[0].Message ?? "Runtime exited during startup.");
+        await DisposeOwnedProcessAsync(cancellationToken).ConfigureAwait(false);
         return _state;
       }
 
@@ -239,8 +256,10 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
       {
         try
         {
+          WriteRuntimeControlLog(CaddyLogSeverity.Info, "stop", "Stopping Cadder-owned Caddy runtime.");
           process.Kill(entireProcessTree: true);
           await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+          await DrainOwnedLogSessionAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
         {
@@ -250,14 +269,15 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
               _state.Version,
               null,
               "runtime-stop-failed",
-              $"Could not stop Cadder-owned Caddy runtime: {ex.Message}",
+              _redactor.Redact($"Could not stop Cadder-owned Caddy runtime: {ex.Message}"),
               "stop");
-          DisposeOwnedProcess();
+          WriteRuntimeControlLog(CaddyLogSeverity.Error, "stop", _state.Diagnostics?[0].Message ?? "Runtime stop failed.");
+          await DisposeOwnedProcessAsync(cancellationToken).ConfigureAwait(false);
           return;
         }
       }
 
-      DisposeOwnedProcess();
+      await DisposeOwnedProcessAsync(cancellationToken).ConfigureAwait(false);
       _state = new RealCaddyRuntimeState(
           RealCaddyRuntimeStatus.Idle,
           _state.Binary,
@@ -291,14 +311,16 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
             [.. resolution.Diagnostics.Select(diagnostic => new CaddyConfigDiagnostic(diagnostic.Code, diagnostic.Message, null, []))]);
       }
 
-      var result = await RunCommandAsync(resolution.CommandPath, argumentsFactory(tempPath), cancellationToken).ConfigureAwait(false);
+      var arguments = argumentsFactory(tempPath);
+      var operation = arguments[0];
+      var result = await RunCommandAsync(resolution.CommandPath, arguments, operation, cancellationToken).ConfigureAwait(false);
       if (result.Succeeded)
       {
         return CaddyRuntimeOperationResult.Success(result.StandardOutput.Trim());
       }
 
-      var message = NormalizeMessage(result.StandardError, result.StandardOutput);
-      await SetUnhealthyAsync(resolution.Binary, failureCode, message, argumentsFactory(tempPath)[0], cancellationToken)
+      var message = _redactor.Redact(NormalizeMessage(result.StandardError, result.StandardOutput));
+      await SetUnhealthyAsync(resolution.Binary, failureCode, message, operation, cancellationToken)
           .ConfigureAwait(false);
       return CaddyRuntimeOperationResult.Failure(
           message,
@@ -369,12 +391,13 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
       RealCaddyExecutableResolution resolution,
       CancellationToken cancellationToken)
   {
-    return RunCommandAsync(resolution.CommandPath, ["version"], cancellationToken);
+    return RunCommandAsync(resolution.CommandPath, ["version"], "version", cancellationToken);
   }
 
   private async ValueTask<CommandResult> RunCommandAsync(
       string commandPath,
       string[] arguments,
+      string operation,
       CancellationToken cancellationToken)
   {
     var startInfo = CreateStartInfo(commandPath, arguments, redirectOutput: true);
@@ -392,13 +415,128 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
       await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
       var stdout = await stdoutTask.ConfigureAwait(false);
       var stderr = await stderrTask.ConfigureAwait(false);
+      WriteCommandOutputLogs(operation, process.ExitCode == 0, stdout, stderr);
 
       return new CommandResult(process.ExitCode == 0, stdout, stderr);
     }
     catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
     {
-      return CommandResult.Failure($"Could not run '{commandPath}': {ex.Message}");
+      var message = _redactor.Redact($"Could not run '{commandPath}': {ex.Message}");
+      WriteRuntimeControlLog(CaddyLogSeverity.Error, operation, message);
+      return CommandResult.Failure(message);
     }
+  }
+
+  private OwnedRuntimeLogSession StartOwnedLogSession(IManagedProcess process)
+  {
+    var sessionId = $"runtime-{Guid.NewGuid():N}";
+    var stopping = new CancellationTokenSource();
+    return new OwnedRuntimeLogSession(
+        sessionId,
+        stopping,
+        DrainRuntimeOutputAsync(process.StandardOutput, "stdout", sessionId, stopping.Token),
+        DrainRuntimeOutputAsync(process.StandardError, "stderr", sessionId, stopping.Token));
+  }
+
+  private async Task DrainRuntimeOutputAsync(
+      StreamReader reader,
+      string channel,
+      string sessionId,
+      CancellationToken cancellationToken)
+  {
+    try
+    {
+      while (!cancellationToken.IsCancellationRequested)
+      {
+        var line = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
+        if (line is null)
+        {
+          return;
+        }
+
+        _logSink.TryWrite(CaddyRuntimeLogParser.ParseRuntimeLine(
+            line,
+            channel,
+            sessionId,
+            _timeProvider.GetUtcNow()));
+      }
+    }
+    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+    {
+    }
+    catch (ObjectDisposedException)
+    {
+    }
+  }
+
+  private async ValueTask DrainOwnedLogSessionAsync(CancellationToken cancellationToken)
+  {
+    if (_ownedLogSession is null)
+    {
+      return;
+    }
+
+    try
+    {
+      await Task.WhenAll(_ownedLogSession.StandardOutputTask, _ownedLogSession.StandardErrorTask)
+          .WaitAsync(TimeSpan.FromSeconds(2), cancellationToken)
+          .ConfigureAwait(false);
+    }
+    catch (TimeoutException)
+    {
+      _logSink.TryWrite(new CaddyLogWriteRequest(
+          CaddyRuntimeLogParser.RuntimeControlStream,
+          CaddyLogSeverity.Warn,
+          CaddyLogAttributionKind.RuntimeControl,
+          CaddyLogEntryKind.IngestionOverflow,
+          "Runtime output readers did not drain before the stop timeout.",
+          _timeProvider.GetUtcNow(),
+          Operation: "stop"));
+      await _ownedLogSession.Cancellation.CancelAsync().ConfigureAwait(false);
+    }
+  }
+
+  private async ValueTask DisposeOwnedProcessAsync(CancellationToken cancellationToken)
+  {
+    await DrainOwnedLogSessionAsync(cancellationToken).ConfigureAwait(false);
+    _ownedLogSession?.Cancellation.Dispose();
+    _ownedLogSession = null;
+    DisposeOwnedProcess();
+  }
+
+  private void WriteCommandOutputLogs(string operation, bool succeeded, string stdout, string stderr)
+  {
+    foreach (var line in SplitOutput(stdout))
+    {
+      WriteRuntimeControlLog(CaddyLogSeverity.Info, operation, line);
+    }
+
+    foreach (var line in SplitOutput(stderr))
+    {
+      WriteRuntimeControlLog(succeeded ? CaddyLogSeverity.Warn : CaddyLogSeverity.Error, operation, line);
+    }
+
+    if (string.IsNullOrWhiteSpace(stdout) && string.IsNullOrWhiteSpace(stderr))
+    {
+      WriteRuntimeControlLog(
+          succeeded ? CaddyLogSeverity.Info : CaddyLogSeverity.Error,
+          operation,
+          succeeded ? "Runtime control command completed without process output." : "Runtime control command failed without process output.");
+    }
+  }
+
+  private void WriteRuntimeControlLog(CaddyLogSeverity severity, string operation, string message)
+  {
+    _logSink.TryWrite(CaddyRuntimeLogParser.RuntimeControl(
+        severity,
+        operation,
+        _redactor.Redact(message),
+        _timeProvider.GetUtcNow()));
+  }
+
+  private static IEnumerable<string> SplitOutput(string output)
+  {
+    return output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
   }
 
   private ProcessStartInfo CreateStartInfo(
@@ -490,9 +628,9 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
     }
   }
 
-  private static CaddyRuntimeDiagnostic Diagnostic(string code, string message, string operation)
+  private CaddyRuntimeDiagnostic Diagnostic(string code, string message, string operation)
   {
-    return new CaddyRuntimeDiagnostic(code, message, operation);
+    return new CaddyRuntimeDiagnostic(code, _redactor.Redact(message), operation);
   }
 
   private static string NormalizeMessage(string stderr, string stdout)
@@ -500,6 +638,11 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
     var message = string.IsNullOrWhiteSpace(stderr) ? stdout : stderr;
     message = message.Trim();
     return message.Length == 0 ? "<no process output>" : message;
+  }
+
+  private CaddyRuntimeDiagnostic[] RedactDiagnostics(CaddyRuntimeDiagnostic[] diagnostics)
+  {
+    return [.. diagnostics.Select(_redactor.Redact)];
   }
 
   private sealed record CommandResult(
@@ -512,6 +655,12 @@ public sealed class ProcessRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter, I
       return new CommandResult(false, string.Empty, message);
     }
   }
+
+  private sealed record OwnedRuntimeLogSession(
+      string SessionId,
+      CancellationTokenSource Cancellation,
+      Task StandardOutputTask,
+      Task StandardErrorTask);
 }
 
 public sealed class RealCaddyExecutableResolver

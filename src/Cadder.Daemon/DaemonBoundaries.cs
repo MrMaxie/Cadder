@@ -65,6 +65,27 @@ public interface IRealCaddyRuntimeAdapter
   ValueTask<RealCaddyRuntimeState> EnterIdleAsync(CancellationToken cancellationToken = default);
 }
 
+public interface ICaddyLogSink
+{
+  bool TryWrite(CaddyLogWriteRequest request);
+}
+
+public interface ICaddyLogStore : ICaddyLogSink
+{
+  CaddyLogQueryResult Query(CaddyLogQuery query);
+}
+
+public interface ICaddyLogRedactor
+{
+  string Redact(string value);
+
+  CaddyRuntimeDiagnostic Redact(CaddyRuntimeDiagnostic diagnostic);
+
+  CaddyConfigDiagnostic Redact(CaddyConfigDiagnostic diagnostic);
+
+  ShimRunMetadata Redact(ShimRunMetadata shimRun);
+}
+
 public interface ICaddyConfigCoordinator
 {
   CaddyConfigState CurrentState { get; }
@@ -110,6 +131,10 @@ public interface ICadderIpcEndpoint
 
   ValueTask<QueryGuiStateResponse> QueryStateAsync(
       QueryGuiStateRequest request,
+      CancellationToken cancellationToken = default);
+
+  ValueTask<QueryCaddyLogsResponse> QueryCaddyLogsAsync(
+      QueryCaddyLogsRequest request,
       CancellationToken cancellationToken = default);
 
   IAsyncEnumerable<GuiStateChangedEvent> SubscribeGuiStateAsync(
@@ -190,17 +215,75 @@ public sealed record CaddyRuntimeOperationResult(
   }
 }
 
+public sealed record CaddyLogWriteRequest(
+    LogStreamIdentity Stream,
+    CaddyLogSeverity Severity,
+    CaddyLogAttributionKind AttributionKind,
+    CaddyLogEntryKind EntryKind,
+    string RawMessage,
+    DateTimeOffset? TimestampUtc = null,
+    string? DomainKey = null,
+    string? SourceRegistrationId = null,
+    string? SourceInstanceId = null,
+    string? Operation = null);
+
+public sealed record CaddyLogQuery(
+    LogStreamIdentity Stream,
+    int Limit,
+    long? AfterSequence,
+    CaddyLogSeverity? MinimumSeverity,
+    DateTimeOffset? SinceUtc,
+    DateTimeOffset? UntilUtc);
+
+public sealed record CaddyLogQueryResult(
+    CaddyLogEntry[] Entries,
+    long? NextSequence,
+    bool HasGap,
+    bool HasMoreBefore,
+    bool TruncatedByRetention);
+
 public sealed class GuiStateProjector : IGuiStateProjector
 {
+  private readonly ICaddyLogRedactor _redactor;
+
+  public GuiStateProjector(ICaddyLogRedactor? redactor = null)
+  {
+    _redactor = redactor ?? new CaddyLogRedactor();
+  }
+
   public GuiStateSnapshot Project(DaemonStateSnapshot snapshot)
   {
     ArgumentNullException.ThrowIfNull(snapshot);
 
     return new GuiStateSnapshot(
         snapshot.CapturedAtUtc,
-        snapshot.Registrations.ToArray(),
-        snapshot.RealCaddyRuntime,
-        snapshot.CaddyConfig);
+        [.. snapshot.Registrations.Select(RedactRegistration)],
+        RedactRuntimeState(snapshot.RealCaddyRuntime),
+        RedactConfigState(snapshot.CaddyConfig));
+  }
+
+  private EntrypointRegistration RedactRegistration(EntrypointRegistration registration)
+  {
+    return registration.ShimRun is null
+        ? registration
+        : registration with { ShimRun = _redactor.Redact(registration.ShimRun) };
+  }
+
+  private RealCaddyRuntimeState RedactRuntimeState(RealCaddyRuntimeState state)
+  {
+    return state with
+    {
+      Diagnostics = state.Diagnostics is null
+          ? null
+          : [.. state.Diagnostics.Select(_redactor.Redact)]
+    };
+  }
+
+  private CaddyConfigState? RedactConfigState(CaddyConfigState? state)
+  {
+    return state is null
+        ? null
+        : state with { Diagnostics = [.. state.Diagnostics.Select(_redactor.Redact)] };
   }
 }
 

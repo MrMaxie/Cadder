@@ -9,6 +9,7 @@ public partial class App : Application
 {
   private static DaemonSingletonAcquisition? s_singletonAcquisition;
   private readonly DaemonLifecycleHost _daemonHost;
+  private readonly BoundedCaddyLogSink _caddyLogSink;
   private readonly CadderIpcEndpoint _endpoint;
   private TrayPopupWindow? _trayPopup;
   private DaemonTrayPresence? _trayPresence;
@@ -25,9 +26,16 @@ public partial class App : Application
 
     DaemonLifecycleHost? daemonHost = null;
     var registrationStore = new InMemoryRegistrationStore();
-    var realCaddyRuntime = new ProcessRealCaddyRuntimeAdapter();
-    var caddyConfigCoordinator = new CaddyConfigCoordinator(realCaddyRuntime);
-    var guiStateProjector = new GuiStateProjector();
+    var logRedactor = new CaddyLogRedactor();
+    var caddyLogStore = new InMemoryCaddyLogStore(redactor: logRedactor);
+    _caddyLogSink = new BoundedCaddyLogSink(caddyLogStore);
+    var realCaddyRuntime = new ProcessRealCaddyRuntimeAdapter(
+        logSink: _caddyLogSink,
+        redactor: logRedactor);
+    var caddyConfigCoordinator = new CaddyConfigCoordinator(
+        realCaddyRuntime,
+        redactor: logRedactor);
+    var guiStateProjector = new GuiStateProjector(logRedactor);
     var guiStateBroadcaster = new InMemoryGuiStateChangeBroadcaster();
     Func<int, CancellationToken, ValueTask> registrationCountChanged = async (registrationCount, cancellationToken) =>
     {
@@ -40,6 +48,7 @@ public partial class App : Application
         registrationStore,
         realCaddyRuntime,
         caddyConfigCoordinator,
+        caddyLogStore,
         guiStateBroadcaster,
         guiStateProjector,
         registrationCountChanged);
@@ -87,6 +96,7 @@ public partial class App : Application
     {
       _trayPopup?.Dismiss();
       _trayPresence?.Dispose();
+      await _caddyLogSink.DisposeAsync();
       Exit();
     }
   }

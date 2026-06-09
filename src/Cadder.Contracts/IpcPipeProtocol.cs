@@ -20,6 +20,8 @@ public static class CadderIpcMessageTypes
   public const string HeartbeatEntrypointResponse = "heartbeat-entrypoint-response";
   public const string QueryGuiStateRequest = "query-gui-state-request";
   public const string QueryGuiStateResponse = "query-gui-state-response";
+  public const string QueryCaddyLogsRequest = "query-caddy-logs-request";
+  public const string QueryCaddyLogsResponse = "query-caddy-logs-response";
   public const string SubscribeGuiStateRequest = "subscribe-gui-state-request";
   public const string GuiStateChangedEvent = "gui-state-changed-event";
 }

@@ -94,6 +94,111 @@ public sealed class CadderIpcEndpointTests
   }
 
   [Fact]
+  public async Task QueryCaddyLogsAsync_ReturnsDomainLogsWithoutEmbeddingThemInGuiSnapshot()
+  {
+    var store = new InMemoryRegistrationStore();
+    var logStore = new InMemoryCaddyLogStore();
+    var endpoint = new CadderIpcEndpoint(
+        store,
+        new NoopRealCaddyRuntimeAdapter(),
+        caddyLogStore: logStore);
+    var domainStream = new LogStreamIdentity("domain-example.localhost", "example.localhost", "caddy");
+    var registration = CreateRegistration("nonce-1") with
+    {
+      RegisteredDomains =
+      [
+          new RegisteredDomain(
+              new DomainName("Example.Localhost", "example.localhost"),
+              ActivationState.Active,
+              domainStream)
+      ]
+    };
+    await endpoint.RegisterAsync(new RegisterEntrypointRequest("register-1", registration));
+    logStore.TryWrite(new CaddyLogWriteRequest(
+        domainStream,
+        CaddyLogSeverity.Info,
+        CaddyLogAttributionKind.Domain,
+        CaddyLogEntryKind.Normal,
+        "handled request token=secret-value",
+        DomainKey: "example.localhost",
+        SourceRegistrationId: registration.RegistrationId,
+        SourceInstanceId: registration.EntrypointInstance.InstanceId,
+        Operation: "run"));
+
+    var logs = await endpoint.QueryCaddyLogsAsync(new QueryCaddyLogsRequest("logs-1", domainStream));
+    var snapshot = await endpoint.QueryStateAsync(new QueryGuiStateRequest("state-1"));
+    var snapshotJson = System.Text.Json.JsonSerializer.Serialize(snapshot.Snapshot, CadderIpcJson.SerializerOptions);
+
+    Assert.True(logs.Accepted);
+    Assert.Equal(CaddyLogStreamStatus.Active, logs.StreamStatus);
+    var entry = Assert.Single(logs.Entries);
+    Assert.Equal("example.localhost", entry.DomainKey);
+    Assert.Equal(registration.RegistrationId, entry.SourceRegistrationId);
+    Assert.DoesNotContain("secret-value", entry.RawMessage, StringComparison.Ordinal);
+    Assert.DoesNotContain("handled request", snapshotJson, StringComparison.Ordinal);
+  }
+
+  [Fact]
+  public async Task QueryCaddyLogsAsync_AfterDomainRemoval_ReturnsStaleStoredLogs()
+  {
+    var store = new InMemoryRegistrationStore();
+    var logStore = new InMemoryCaddyLogStore();
+    var endpoint = new CadderIpcEndpoint(
+        store,
+        new NoopRealCaddyRuntimeAdapter(),
+        caddyLogStore: logStore);
+    var domainStream = new LogStreamIdentity("domain-example.localhost", "example.localhost", "caddy");
+    var registration = CreateRegistration("nonce-1") with
+    {
+      RegisteredDomains =
+      [
+          new RegisteredDomain(
+              new DomainName("Example.Localhost", "example.localhost"),
+              ActivationState.Active,
+              domainStream)
+      ]
+    };
+    await endpoint.RegisterAsync(new RegisterEntrypointRequest("register-1", registration));
+    logStore.TryWrite(new CaddyLogWriteRequest(
+        domainStream,
+        CaddyLogSeverity.Info,
+        CaddyLogAttributionKind.Domain,
+        CaddyLogEntryKind.Normal,
+        "before removal",
+        DomainKey: "example.localhost"));
+    await endpoint.UnregisterAsync(new UnregisterEntrypointRequest("unregister-1", registration.RegistrationId, "nonce-1"));
+
+    var logs = await endpoint.QueryCaddyLogsAsync(new QueryCaddyLogsRequest("logs-1", domainStream));
+
+    Assert.True(logs.Accepted);
+    Assert.Equal(CaddyLogStreamStatus.Stale, logs.StreamStatus);
+    Assert.Single(logs.Entries);
+  }
+
+  [Fact]
+  public async Task QueryGuiStateAsync_RedactsFullShimCommandLine()
+  {
+    var store = new InMemoryRegistrationStore();
+    var endpoint = new CadderIpcEndpoint(store, new NoopRealCaddyRuntimeAdapter());
+    await endpoint.RegisterAsync(new RegisterEntrypointRequest(
+        "register-1",
+        CreateRegistration("nonce-1") with
+        {
+          ShimRun = new ShimRunMetadata(
+              "caddyfile",
+              ["run", "--config", "Caddyfile", "--env", "token=secret-value"],
+              "run --config Caddyfile --env token=secret-value")
+        }));
+
+    var snapshot = await endpoint.QueryStateAsync(new QueryGuiStateRequest("state-1"));
+
+    var shimRun = Assert.Single(snapshot.Snapshot?.Registrations ?? []).ShimRun;
+    Assert.NotNull(shimRun);
+    Assert.Equal(["<redacted arguments>"], shimRun.RawArguments);
+    Assert.Equal("<redacted command line>", shimRun.CommandLine);
+  }
+
+  [Fact]
   public async Task RegisterAsync_WithMismatchedOwnerNonce_RejectsRegistration()
   {
     var store = new InMemoryRegistrationStore();

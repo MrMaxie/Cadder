@@ -25,7 +25,31 @@ public sealed class CaddyConfigCoordinatorTests
     Assert.Equal(
         ["api.example.localhost", "app.example.localhost"],
         registrations.Registrations.Single().RegisteredDomains.Select(static domain => domain.Name.Canonical!).ToArray());
+    Assert.Equal(
+        ["domain-api.example.localhost", "domain-app.example.localhost"],
+        registrations.Registrations.Single().RegisteredDomains.Select(static domain => domain.LogStream.StreamId).ToArray());
+    Assert.All(registrations.Registrations.Single().RegisteredDomains, static domain => Assert.Equal("caddy", domain.LogStream.Channel));
     Assert.Equal(CaddyConfigApplyStatus.Applied, (await endpoint.QueryStateAsync(new QueryGuiStateRequest("state-1"))).Snapshot?.CaddyConfig?.Status);
+  }
+
+  [Fact]
+  public async Task RegisterAsync_WithActiveDomains_ComposesControlledJsonLogging()
+  {
+    using var temp = TestCaddyfile.Create();
+    var runtime = new RecordingRuntimeAdapter();
+    var adapter = new RecordingConfigAdapter();
+    adapter.SetConfig(temp.Path, AdaptedJson(["api.example.localhost"]));
+    var endpoint = CreateEndpoint(runtime, adapter);
+
+    await endpoint.RegisterAsync(new RegisterEntrypointRequest(
+        "register-1",
+        CreateRegistration("nonce-1", temp.Path)));
+
+    var reloadedConfig = Assert.Single(runtime.ReloadedConfigs);
+    Assert.Contains("\"logging\"", reloadedConfig, StringComparison.Ordinal);
+    Assert.Contains("\"output\": \"stdout\"", reloadedConfig, StringComparison.Ordinal);
+    Assert.Contains("\"format\": \"json\"", reloadedConfig, StringComparison.Ordinal);
+    Assert.Contains("\"default_logger_name\": \"default\"", reloadedConfig, StringComparison.Ordinal);
   }
 
   [Fact]

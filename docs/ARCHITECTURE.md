@@ -72,6 +72,20 @@ Validation and reload are atomic from Cadder's perspective. The coordinator call
 
 Runtime failures are structured separately from config diagnostics. `RealCaddyRuntimeState` carries status, binary identity, Cadder-owned process identity, admin endpoint, version, and runtime diagnostics. GUI state snapshots include both runtime diagnostics and config diagnostics so the tray and panel can show whether Cadder is idle, unresolved, running, or unhealthy without crashing the daemon.
 
+## Runtime Log Capture And Query
+
+Cadder captures recent Caddy logs inside the daemon and exposes them through explicit IPC log queries rather than embedding log payloads in `GuiStateSnapshot`. The canonical selector is `LogStreamIdentity`: registered domains use their existing `domain-{canonical-host}` stream with the `caddy` channel, entrypoints keep their entrypoint stream, and runtime-wide control output uses the `runtime-control` stream.
+
+The Cadder-owned long-lived `caddy run` process redirects stdout and stderr. Reader tasks drain both streams and write parsed log entries into a bounded ingestion path so process pipes are not held up by GUI consumers or slower diagnostics handling. Caddy JSON log lines are parsed when possible for timestamp, severity, request host/domain, and runtime session context. Lines that cannot be parsed remain available as raw redacted messages on runtime stdout/stderr streams with unknown domain attribution.
+
+Runtime-control operations also write structured log entries. Version, validation, reload, start, stop, runtime-exit, and reader-overflow events are marked with an operation name and severity so callers can distinguish runtime errors from ordinary access logs and from config reload lifecycle events.
+
+The in-memory log store is bounded by global count, per-stream count, and age. It assigns monotonic sequence numbers, returns opaque `seq:{number}` cursors, and reports gap metadata such as `HasGap`, `HasMoreBefore`, and `TruncatedByRetention` when retention means a caller's cursor can no longer be satisfied exactly. Durable log persistence across daemon restart is intentionally out of scope for TASK-1.7.
+
+Redaction is shared by runtime diagnostics, config diagnostics, GUI state projection, and log storage. Token-like assignments, authorization headers, bearer values, and full shim command lines/argument arrays are replaced before they are exposed through diagnostics, GUI snapshots, or log query responses.
+
+The log IPC surface is lazy: `QueryCaddyLogsRequest` filters by `LogStreamIdentity`, optional cursor, severity, and time range, and `QueryCaddyLogsResponse` returns only the requested page plus stream lifecycle status. TASK-1.10 owns the full logs UI, tailing controls, filtering controls, copy actions, and pause/auto-scroll behavior.
+
 ## Initial Domain Model
 
 `Cadder.Contracts` carries JSON-friendly DTOs for:

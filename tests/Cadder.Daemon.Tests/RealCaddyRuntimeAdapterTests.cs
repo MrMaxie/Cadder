@@ -25,10 +25,12 @@ public sealed class RealCaddyRuntimeAdapterTests
     using var temp = TestExecutable.Create("caddy-real.exe");
     var resolver = new RealCaddyExecutableResolver(temp.Path, []);
     var processFactory = new FakeProcessFactory();
+    var logStore = new InMemoryCaddyLogStore(maxAge: TimeSpan.FromDays(1));
     var adapter = new ProcessRealCaddyRuntimeAdapter(
         resolver: resolver,
         processFactory: processFactory,
-        startupObservationDelay: TimeSpan.Zero);
+        startupObservationDelay: TimeSpan.Zero,
+        logSink: logStore);
 
     var state = await adapter.EnsureRunningAsync(new CaddyRuntimeConfig("{}"));
     await adapter.StopAsync();
@@ -40,6 +42,76 @@ public sealed class RealCaddyRuntimeAdapterTests
     Assert.Equal(["version", "run"], processFactory.StartedOperations);
     Assert.True(processFactory.OwnedRuntimeProcess?.KillCalled);
     Assert.True(processFactory.OwnedRuntimeProcess?.Disposed);
+    Assert.True(processFactory.RunStartInfo?.RedirectStandardOutput);
+    Assert.True(processFactory.RunStartInfo?.RedirectStandardError);
+  }
+
+  [Fact]
+  public async Task EnsureRunningAsync_CapturesRuntimeJsonOutputByDomainStream()
+  {
+    using var temp = TestExecutable.Create("caddy-real.exe");
+    var resolver = new RealCaddyExecutableResolver(temp.Path, []);
+    var processFactory = new FakeProcessFactory
+    {
+      RuntimeStdout = """
+        {"level":"info","ts":"2026-06-09T12:00:05Z","request":{"host":"Api.Example.Localhost"},"msg":"handled"}
+        """
+    };
+    var logStore = new InMemoryCaddyLogStore(maxAge: TimeSpan.FromDays(1));
+    var adapter = new ProcessRealCaddyRuntimeAdapter(
+        resolver: resolver,
+        processFactory: processFactory,
+        startupObservationDelay: TimeSpan.Zero,
+        logSink: logStore);
+
+    await adapter.EnsureRunningAsync(new CaddyRuntimeConfig("{}"));
+    await adapter.StopAsync();
+
+    var result = logStore.Query(new CaddyLogQuery(
+        new LogStreamIdentity("domain-api.example.localhost", "api.example.localhost", "caddy"),
+        10,
+        null,
+        null,
+        null,
+        null));
+
+    var entry = Assert.Single(result.Entries);
+    Assert.Equal(CaddyLogSeverity.Info, entry.Severity);
+    Assert.Equal(CaddyLogAttributionKind.Domain, entry.AttributionKind);
+    Assert.Equal("api.example.localhost", entry.DomainKey);
+    Assert.Equal("run", entry.Operation);
+    Assert.Contains("\"msg\":\"handled\"", entry.RawMessage, StringComparison.Ordinal);
+  }
+
+  [Fact]
+  public async Task ValidateConfigAsync_CapturesRuntimeControlOutputAndRedactsSecrets()
+  {
+    using var temp = TestExecutable.Create("caddy-real.exe");
+    var resolver = new RealCaddyExecutableResolver(temp.Path, []);
+    var processFactory = new FakeProcessFactory
+    {
+      ValidateExitCode = 1,
+      ValidateStderr = "validation failed token=super-secret"
+    };
+    var logStore = new InMemoryCaddyLogStore();
+    var adapter = new ProcessRealCaddyRuntimeAdapter(
+        resolver: resolver,
+        processFactory: processFactory,
+        logSink: logStore);
+
+    var result = await adapter.ValidateConfigAsync(new CaddyRuntimeConfig("{}"));
+
+    Assert.False(result.Succeeded);
+    Assert.DoesNotContain("super-secret", result.Message, StringComparison.Ordinal);
+    var logs = logStore.Query(new CaddyLogQuery(
+        CaddyRuntimeLogParser.RuntimeControlStream,
+        10,
+        null,
+        CaddyLogSeverity.Error,
+        null,
+        null));
+    Assert.Contains(logs.Entries, static entry => entry.Operation == "validate");
+    Assert.DoesNotContain(logs.Entries, static entry => entry.RawMessage.Contains("super-secret", StringComparison.Ordinal));
   }
 
   [Fact]
@@ -63,6 +135,18 @@ public sealed class RealCaddyRuntimeAdapterTests
 
     public List<string> StartedOperations { get; } = [];
 
+    public ProcessStartInfo? RunStartInfo { get; private set; }
+
+    public string RuntimeStdout { get; init; } = string.Empty;
+
+    public string RuntimeStderr { get; init; } = string.Empty;
+
+    public int ValidateExitCode { get; init; }
+
+    public string ValidateStdout { get; init; } = string.Empty;
+
+    public string ValidateStderr { get; init; } = string.Empty;
+
     public IManagedProcess? Start(ProcessStartInfo startInfo)
     {
       var operation = startInfo.ArgumentList[0];
@@ -75,8 +159,14 @@ public sealed class RealCaddyRuntimeAdapterTests
 
       if (operation == "run")
       {
-        OwnedRuntimeProcess = FakeManagedProcess.Running(8675);
+        RunStartInfo = startInfo;
+        OwnedRuntimeProcess = FakeManagedProcess.Running(8675, RuntimeStdout, RuntimeStderr);
         return OwnedRuntimeProcess;
+      }
+
+      if (operation == "validate")
+      {
+        return FakeManagedProcess.Exited(302, ValidateStdout, ValidateStderr, ValidateExitCode);
       }
 
       throw new InvalidOperationException($"Unexpected operation '{operation}'.");
@@ -116,14 +206,21 @@ public sealed class RealCaddyRuntimeAdapterTests
 
     public bool Disposed { get; private set; }
 
-    public static FakeManagedProcess Exited(int id, string stdout)
+    public static FakeManagedProcess Exited(
+        int id,
+        string stdout,
+        string stderr = "",
+        int exitCode = 0)
     {
-      return new FakeManagedProcess(id, true, 0, stdout, string.Empty);
+      return new FakeManagedProcess(id, true, exitCode, stdout, stderr);
     }
 
-    public static FakeManagedProcess Running(int id)
+    public static FakeManagedProcess Running(
+        int id,
+        string stdout = "",
+        string stderr = "")
     {
-      return new FakeManagedProcess(id, false, 0, string.Empty, string.Empty);
+      return new FakeManagedProcess(id, false, 0, stdout, stderr);
     }
 
     public ValueTask WaitForExitAsync(CancellationToken cancellationToken = default)

@@ -36,6 +36,44 @@ public enum CaddyConfigApplyStatus
   Idle = 4
 }
 
+public enum CaddyLogSeverity
+{
+  Unknown = 0,
+  Trace = 1,
+  Debug = 2,
+  Info = 3,
+  Warn = 4,
+  Error = 5,
+  Fatal = 6
+}
+
+public enum CaddyLogAttributionKind
+{
+  Unknown = 0,
+  Runtime = 1,
+  RuntimeControl = 2,
+  Entrypoint = 3,
+  Domain = 4
+}
+
+public enum CaddyLogEntryKind
+{
+  Normal = 0,
+  Lifecycle = 1,
+  IngestionOverflow = 2,
+  RetentionGap = 3
+}
+
+public enum CaddyLogStreamStatus
+{
+  Unknown = 0,
+  Empty = 1,
+  Active = 2,
+  Stale = 3,
+  Removed = 4,
+  ReadError = 5
+}
+
 public sealed record SourcePath(
     string Raw,
     string? Canonical);
@@ -117,6 +155,19 @@ public sealed record CaddyConfigState(
     DateTimeOffset? LastSuccessfulReloadAtUtc,
     string? EffectiveConfigHash,
     CaddyConfigDiagnostic[] Diagnostics);
+
+public sealed record CaddyLogEntry(
+    long SequenceNumber,
+    DateTimeOffset TimestampUtc,
+    CaddyLogSeverity Severity,
+    LogStreamIdentity Stream,
+    CaddyLogAttributionKind AttributionKind,
+    CaddyLogEntryKind EntryKind,
+    string RawMessage,
+    string? DomainKey = null,
+    string? SourceRegistrationId = null,
+    string? SourceInstanceId = null,
+    string? Operation = null);
 
 public sealed record GuiStateSnapshot(
     DateTimeOffset CapturedAtUtc,

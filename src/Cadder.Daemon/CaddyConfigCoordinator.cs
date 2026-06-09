@@ -10,6 +10,7 @@ public sealed class CaddyConfigCoordinator : ICaddyConfigCoordinator
   private readonly CaddyJsonConfigInspector _inspector;
   private readonly CaddyJsonConfigComposer _composer;
   private readonly IRealCaddyRuntimeAdapter _runtime;
+  private readonly ICaddyLogRedactor _redactor;
   private readonly TimeProvider _timeProvider;
   private readonly SemaphoreSlim _gate = new(1, 1);
   private CaddyConfigState _currentState = new(
@@ -25,12 +26,14 @@ public sealed class CaddyConfigCoordinator : ICaddyConfigCoordinator
       ICaddyfileConfigAdapter? adapter = null,
       CaddyJsonConfigInspector? inspector = null,
       CaddyJsonConfigComposer? composer = null,
+      ICaddyLogRedactor? redactor = null,
       TimeProvider? timeProvider = null)
   {
     _runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
     _adapter = adapter ?? new ProcessCaddyfileConfigAdapter();
     _inspector = inspector ?? new CaddyJsonConfigInspector();
     _composer = composer ?? new CaddyJsonConfigComposer(_inspector);
+    _redactor = redactor ?? new CaddyLogRedactor();
     _timeProvider = timeProvider ?? TimeProvider.System;
   }
 
@@ -174,7 +177,7 @@ public sealed class CaddyConfigCoordinator : ICaddyConfigCoordinator
         attemptedAtUtc,
         _currentState.LastSuccessfulReloadAtUtc,
         _lastKnownGoodConfig is null ? _currentState.EffectiveConfigHash : ComputeHash(_lastKnownGoodConfig),
-        diagnostics);
+        [.. diagnostics.Select(_redactor.Redact)]);
   }
 
   private RegisteredDomain[] CreateRegisteredDomains(

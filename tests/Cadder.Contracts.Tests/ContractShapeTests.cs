@@ -129,6 +129,46 @@ public sealed class ContractShapeTests
     Assert.Contains("activationState", json, StringComparison.Ordinal);
   }
 
+  [Fact]
+  public void CaddyLogContractsSerializeQueryAndCursorMetadata()
+  {
+    var stream = new LogStreamIdentity("domain-example.com", "example.com", "caddy");
+    var entry = new CaddyLogEntry(
+        42,
+        DateTimeOffset.Parse("2026-06-09T10:00:05Z"),
+        CaddyLogSeverity.Info,
+        stream,
+        CaddyLogAttributionKind.Domain,
+        CaddyLogEntryKind.Normal,
+        "{\"level\":\"info\",\"msg\":\"handled\"}",
+        "example.com",
+        "registration-1",
+        "runtime-session-1",
+        "run");
+    var response = new QueryCaddyLogsResponse(
+        "logs-1",
+        true,
+        "Caddy logs returned.",
+        stream,
+        CaddyLogStreamStatus.Active,
+        [entry],
+        "seq:42",
+        HasGap: false,
+        HasMoreBefore: true,
+        TruncatedByRetention: false);
+
+    var json = JsonSerializer.Serialize(response, CadderIpcJson.SerializerOptions);
+
+    Assert.Equal("query-caddy-logs-request", CadderIpcMessageTypes.QueryCaddyLogsRequest);
+    Assert.Equal("query-caddy-logs-response", CadderIpcMessageTypes.QueryCaddyLogsResponse);
+    Assert.Contains("entries", json, StringComparison.Ordinal);
+    Assert.Contains("nextCursor", json, StringComparison.Ordinal);
+    Assert.Contains("hasMoreBefore", json, StringComparison.Ordinal);
+    Assert.Contains("truncatedByRetention", json, StringComparison.Ordinal);
+    Assert.Contains("rawMessage", json, StringComparison.Ordinal);
+    Assert.Contains("sourceRegistrationId", json, StringComparison.Ordinal);
+  }
+
   private static class Samples
   {
     public static EntrypointRegistration Registration()

@@ -84,6 +84,27 @@ public sealed record QueryGuiStateResponse(
     string? Message,
     GuiStateSnapshot? Snapshot) : CadderIpcResponse(RequestId, Accepted, Message);
 
+public sealed record QueryCaddyLogsRequest(
+    string RequestId,
+    LogStreamIdentity Stream,
+    int? Limit = null,
+    string? Cursor = null,
+    CaddyLogSeverity? MinimumSeverity = null,
+    DateTimeOffset? SinceUtc = null,
+    DateTimeOffset? UntilUtc = null) : CadderIpcRequest(RequestId);
+
+public sealed record QueryCaddyLogsResponse(
+    string RequestId,
+    bool Accepted,
+    string? Message,
+    LogStreamIdentity Stream,
+    CaddyLogStreamStatus StreamStatus,
+    CaddyLogEntry[] Entries,
+    string? NextCursor,
+    bool HasGap,
+    bool HasMoreBefore,
+    bool TruncatedByRetention) : CadderIpcResponse(RequestId, Accepted, Message);
+
 public sealed record SubscribeGuiStateRequest(
     string RequestId) : CadderIpcRequest(RequestId);
 

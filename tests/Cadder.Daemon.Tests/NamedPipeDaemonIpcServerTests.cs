@@ -222,6 +222,17 @@ public sealed class NamedPipeDaemonIpcServerTests
           new HeartbeatEntrypointRequest("heartbeat-1", "shim-nonce-1", "nonce-1"));
       Assert.True(heartbeat.Accepted);
 
+      var logs = await SendMessageAsync<QueryCaddyLogsRequest, QueryCaddyLogsResponse>(
+          writer,
+          reader,
+          CadderIpcMessageTypes.QueryCaddyLogsRequest,
+          CadderIpcMessageTypes.QueryCaddyLogsResponse,
+          new QueryCaddyLogsRequest(
+              "logs-1",
+              new LogStreamIdentity("runtime-control", null, "caddy-control")));
+      Assert.True(logs.Accepted);
+      Assert.Equal(CaddyLogStreamStatus.Empty, logs.StreamStatus);
+
       var unregister = await SendMessageAsync<UnregisterEntrypointRequest, UnregisterEntrypointResponse>(
           writer,
           reader,

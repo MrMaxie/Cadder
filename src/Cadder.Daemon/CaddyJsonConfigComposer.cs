@@ -101,6 +101,24 @@ public sealed class CaddyJsonConfigComposer
 
     var output = new JsonObject
     {
+      ["logging"] = new JsonObject
+      {
+        ["logs"] = new JsonObject
+        {
+          ["default"] = new JsonObject
+          {
+            ["level"] = "INFO",
+            ["writer"] = new JsonObject
+            {
+              ["output"] = "stdout"
+            },
+            ["encoder"] = new JsonObject
+            {
+              ["format"] = "json"
+            }
+          }
+        }
+      },
       ["apps"] = new JsonObject
       {
         ["http"] = new JsonObject
@@ -110,6 +128,10 @@ public sealed class CaddyJsonConfigComposer
             ["srv0"] = new JsonObject
             {
               ["listen"] = new JsonArray([.. outputListen.Select(static listen => JsonValue.Create(listen))]),
+              ["logs"] = new JsonObject
+              {
+                ["default_logger_name"] = "default"
+              },
               ["routes"] = outputRoutes
             }
           }

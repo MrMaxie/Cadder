@@ -7,6 +7,7 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
   private readonly IRegistrationStore _registrationStore;
   private readonly IRealCaddyRuntimeAdapter _realCaddyRuntime;
   private readonly ICaddyConfigCoordinator _caddyConfigCoordinator;
+  private readonly ICaddyLogStore _caddyLogStore;
   private readonly IGuiStateChangeBroadcaster _guiStateBroadcaster;
   private readonly IGuiStateProjector _guiStateProjector;
   private readonly Func<int, CancellationToken, ValueTask>? _registrationCountChanged;
@@ -16,6 +17,7 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
       IRegistrationStore registrationStore,
       IRealCaddyRuntimeAdapter realCaddyRuntime,
       ICaddyConfigCoordinator? caddyConfigCoordinator = null,
+      ICaddyLogStore? caddyLogStore = null,
       IGuiStateChangeBroadcaster? guiStateBroadcaster = null,
       IGuiStateProjector? guiStateProjector = null,
       Func<int, CancellationToken, ValueTask>? registrationCountChanged = null,
@@ -24,6 +26,7 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
     _registrationStore = registrationStore ?? throw new ArgumentNullException(nameof(registrationStore));
     _realCaddyRuntime = realCaddyRuntime ?? throw new ArgumentNullException(nameof(realCaddyRuntime));
     _caddyConfigCoordinator = caddyConfigCoordinator ?? new NoopCaddyConfigCoordinator();
+    _caddyLogStore = caddyLogStore ?? new InMemoryCaddyLogStore();
     _guiStateBroadcaster = guiStateBroadcaster ?? new InMemoryGuiStateChangeBroadcaster();
     _guiStateProjector = guiStateProjector ?? new GuiStateProjector();
     _registrationCountChanged = registrationCountChanged;
@@ -223,6 +226,50 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
         cancellationToken);
   }
 
+  public async ValueTask<QueryCaddyLogsResponse> QueryCaddyLogsAsync(
+      QueryCaddyLogsRequest request,
+      CancellationToken cancellationToken = default)
+  {
+    ArgumentNullException.ThrowIfNull(request);
+    ArgumentNullException.ThrowIfNull(request.Stream);
+
+    if (!TryValidateLogLimit(request.Limit, out var limit, out var limitMessage))
+    {
+      return LogQueryFailure(request, limitMessage);
+    }
+
+    if (!TryParseCursor(request.Cursor, out var afterSequence, out var cursorMessage))
+    {
+      return LogQueryFailure(request, cursorMessage);
+    }
+
+    var registrations = await _registrationStore.ListAsync(cancellationToken).ConfigureAwait(false);
+    var streamStatus = ResolveStreamStatus(request.Stream, registrations);
+    var result = _caddyLogStore.Query(new CaddyLogQuery(
+        request.Stream,
+        limit,
+        afterSequence,
+        request.MinimumSeverity,
+        request.SinceUtc,
+        request.UntilUtc));
+
+    var responseStatus = streamStatus == CaddyLogStreamStatus.Active
+        ? (result.Entries.Length == 0 ? CaddyLogStreamStatus.Empty : CaddyLogStreamStatus.Active)
+        : (result.Entries.Length == 0 ? CaddyLogStreamStatus.Removed : CaddyLogStreamStatus.Stale);
+
+    return new QueryCaddyLogsResponse(
+        request.RequestId,
+        true,
+        "Caddy logs returned.",
+        request.Stream,
+        responseStatus,
+        result.Entries,
+        FormatCursor(result.NextSequence),
+        result.HasGap,
+        result.HasMoreBefore,
+        result.TruncatedByRetention);
+  }
+
   private async ValueTask PublishRegistrationsChangedAsync(
       string? registrationId,
       bool publishRegistrationCount,
@@ -270,6 +317,96 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
 
     var detail = configState.Diagnostics.FirstOrDefault()?.Message ?? "Caddy config reload failed.";
     return $"{successMessage} {detail}";
+  }
+
+  private static bool TryValidateLogLimit(int? requestedLimit, out int limit, out string message)
+  {
+    limit = requestedLimit ?? 100;
+    if (limit is < 1 or > 500)
+    {
+      message = "Log query limit must be between 1 and 500.";
+      return false;
+    }
+
+    message = string.Empty;
+    return true;
+  }
+
+  private static bool TryParseCursor(string? cursor, out long? afterSequence, out string message)
+  {
+    afterSequence = null;
+    if (string.IsNullOrWhiteSpace(cursor))
+    {
+      message = string.Empty;
+      return true;
+    }
+
+    if (cursor.StartsWith("seq:", StringComparison.Ordinal)
+        && long.TryParse(cursor["seq:".Length..], out var sequence)
+        && sequence >= 0)
+    {
+      afterSequence = sequence;
+      message = string.Empty;
+      return true;
+    }
+
+    message = "Log query cursor is invalid.";
+    return false;
+  }
+
+  private static string? FormatCursor(long? sequence)
+  {
+    return sequence is null ? null : $"seq:{sequence.Value}";
+  }
+
+  private static QueryCaddyLogsResponse LogQueryFailure(
+      QueryCaddyLogsRequest request,
+      string message)
+  {
+    return new QueryCaddyLogsResponse(
+        request.RequestId,
+        false,
+        message,
+        request.Stream,
+        CaddyLogStreamStatus.ReadError,
+        [],
+        null,
+        false,
+        false,
+        false);
+  }
+
+  private static CaddyLogStreamStatus ResolveStreamStatus(
+      LogStreamIdentity stream,
+      IReadOnlyList<EntrypointRegistration> registrations)
+  {
+    foreach (var registration in registrations)
+    {
+      if (StreamEquals(registration.LogStream, stream))
+      {
+        return CaddyLogStreamStatus.Active;
+      }
+
+      if (registration.RegisteredDomains.Any(domain => StreamEquals(domain.LogStream, stream)))
+      {
+        return CaddyLogStreamStatus.Active;
+      }
+    }
+
+    if (string.Equals(stream.StreamId, "runtime", StringComparison.Ordinal)
+        || string.Equals(stream.StreamId, "runtime-control", StringComparison.Ordinal))
+    {
+      return CaddyLogStreamStatus.Active;
+    }
+
+    return CaddyLogStreamStatus.Removed;
+  }
+
+  private static bool StreamEquals(LogStreamIdentity left, LogStreamIdentity right)
+  {
+    return string.Equals(left.StreamId, right.StreamId, StringComparison.Ordinal)
+        && string.Equals(left.Channel, right.Channel, StringComparison.Ordinal)
+        && string.Equals(left.DomainKey, right.DomainKey, StringComparison.Ordinal);
   }
 
   private static bool TryValidateRegistration(
