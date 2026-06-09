@@ -6,7 +6,7 @@ Cadder is a Windows tray daemon that lets project-local `caddy.exe` invocations 
 
 - Tray/daemon singleton: owns Cadder state for the signed-in Windows user and is the only process that should mutate registrations or talk to the real Caddy runtime.
 - PATH-facing `caddy.exe` shim: a small executable named `caddy.exe` that intentionally shadows Caddy on PATH. It discovers the caller context and forwards registration requests to the daemon.
-- Real Caddy runtime adapter: resolves, starts, reloads, observes, and eventually stops the real Caddy binary. Current TASK-1.5 code validates and reloads composed configs through this boundary; full runtime ownership remains TASK-1.6.
+- Real Caddy runtime adapter: resolves, starts, reloads, observes, and stops the Cadder-owned real Caddy process. It keeps binary identity, process identity, admin endpoint, version, health status, idle state, and structured runtime diagnostics separate from registration and config diagnostics.
 - IPC contract: request/response DTOs shared by the shim, daemon, and tray host.
 - Registration store: transient in-memory owner-aware state for entrypoint registrations.
 - GUI state projection: daemon read model that the tray UI can render without reaching into storage or runtime internals.
@@ -15,9 +15,9 @@ Cadder is a Windows tray daemon that lets project-local `caddy.exe` invocations 
 
 The WinUI tray host is the Cadder daemon process. It is a per-user singleton: startup first registers a stable Windows App SDK `AppInstance` key for activation redirection, then acquires a per-user named mutex before creating any window or tray icon. If another process launches Cadder while the daemon is already running, the new activation is redirected to the registered instance and the second process exits before creating another daemon surface.
 
-The named mutex is the deterministic ownership boundary for the daemon lifecycle. A clean explicit quit releases the mutex after stopping IPC, clearing transient registrations, and asking the Cadder-owned runtime boundary to stop. If Windows reports an abandoned mutex, Cadder treats the lock as recoverable and rebuilds transient in-memory daemon state rather than permanently blocking startup.
+The named mutex is the deterministic ownership boundary for the daemon lifecycle. A clean explicit quit releases the mutex after stopping IPC, clearing transient registrations, and asking the Cadder-owned runtime boundary to stop. The runtime boundary stops only the process handle that Cadder started and still identifies as owned; it does not enumerate or kill unrelated `caddy.exe` or `caddy-real.exe` processes. If Windows reports an abandoned mutex, Cadder treats the lock as recoverable and rebuilds transient in-memory daemon state rather than permanently blocking startup.
 
-Zero registrations are a normal running state. The daemon must stay alive and visible in the tray until the user chooses the explicit quit path. Later owner-cleanup tasks may remove registrations, but registration count alone must not terminate the daemon.
+Zero registrations, or zero active domains after per-domain toggles, are a normal running daemon state. The config coordinator enters an explicit idle config state and asks the runtime boundary to enter an idle runtime state instead of reloading an empty active configuration. The daemon stays alive and visible in the tray until the user chooses the explicit quit path.
 
 ## Shim Versus Real Caddy
 
@@ -29,9 +29,9 @@ When `caddy run` is invoked, the shim captures the caller working directory, res
 
 After registration succeeds, the shim keeps the pipe session open, sends periodic heartbeat messages, and waits for process lifetime signals. Heartbeat updates `LastHeartbeatUtc` for freshness and diagnostics; it is not the only cleanup mechanism. On a graceful exit path such as Ctrl+C, the shim sends an unregister request before exiting. If the shim process is terminated or the pipe is otherwise lost, the daemon removes only the registrations owned by that pipe session.
 
-Future resolver work must exclude Cadder's own shim identity before selecting a real Caddy binary. That exclusion should compare normalized paths and, where Windows APIs make it practical, file identity. A single raw string comparison is not enough because PATH entries, symlinks, casing, and short names can describe the same executable in different ways.
+Runtime resolution first uses the configured command or path from `CADDER_CADDY_REAL_COMMAND`, then falls back to the development command `caddy-real`. Path-like commands are normalized directly; command names are searched through `PATH` and executable extensions. The resolver rejects candidates that normalize to known Cadder shim paths, including `CADDER_CADDY_SHIM_PATH` and the app-local `caddy.exe` shim path. Accepted binaries record a stable path plus a lightweight file identity based on file metadata.
 
-The exact resolver precedence is intentionally deferred to TASK-1.6 and TASK-1.11. This scaffold only records the safety rule: Cadder may shadow `caddy.exe`, but runtime operations must target a real Caddy binary that is not the shim.
+TASK-1.11 still owns installation, PATH shadowing, and packaging. TASK-1.6 only enforces the safety rule inside the daemon runtime boundary: Cadder may shadow `caddy.exe`, but runtime operations must target a real Caddy binary that is not Cadder's shim.
 
 ## IPC Boundary
 
@@ -50,7 +50,7 @@ The daemon endpoint writes registrations to an in-memory transient store and pro
 
 GUI subscriptions are long-lived pipe reads. The server sends an initial `GuiStateChangedEvent` with `Snapshot`, then sends `RegistrationsChanged` events after registration mutations or heartbeat updates. This gives GUI code a push model without tight polling loops. Query remains available for one-shot state reads.
 
-Real Caddy binary resolution, runtime management, and unsupported-command delegation remain TASK-1.6 and TASK-1.11.
+Unsupported-command delegation remains TASK-1.11. Real Caddy binary resolution and owned runtime management now live behind the daemon runtime boundary.
 
 ## Effective Caddy Configuration
 
@@ -68,7 +68,9 @@ The effective runtime config is composed as Caddy JSON. Cadder appends enabled r
 
 Conflict detection runs before runtime validation or reload. Domains are keyed by canonical host name, and conflicts are reported only when the same active domain appears in more than one active entrypoint instance. Diagnostics include the conflicting domain and the source config paths.
 
-Validation and reload are atomic from Cadder's perspective. The coordinator calls the runtime boundary to validate the composed JSON first, then reloads only after validation succeeds. Failed adaptation, conflict detection, validation, or reload attempts leave the last known good config hash and last successful reload timestamp intact.
+Validation and reload are atomic from Cadder's perspective. The coordinator calls the runtime boundary to validate the composed JSON first, ensures the Cadder-owned runtime process is running when there is active config to serve, then reloads only after validation and startup succeed. Failed adaptation, conflict detection, validation, startup, or reload attempts leave the last known good config hash and last successful reload timestamp intact.
+
+Runtime failures are structured separately from config diagnostics. `RealCaddyRuntimeState` carries status, binary identity, Cadder-owned process identity, admin endpoint, version, and runtime diagnostics. GUI state snapshots include both runtime diagnostics and config diagnostics so the tray and panel can show whether Cadder is idle, unresolved, running, or unhealthy without crashing the daemon.
 
 ## Initial Domain Model
 
@@ -83,11 +85,11 @@ Validation and reload are atomic from Cadder's perspective. The coordinator call
 - owner process identity using PID plus process start time and shim nonce;
 - registration lifecycle timestamps, including created time and last heartbeat;
 - log stream identity for per-domain and entrypoint streams;
-- GUI state snapshots, including current Caddy config apply status and diagnostics, and IPC request/response shapes.
+- GUI state snapshots, including current runtime state, Caddy config apply status and diagnostics, and IPC request/response shapes.
 
 Owner cleanup uses two daemon-side signals. Pipe disconnect cleanup unregisters only registrations created through that pipe session. The process watcher scans registrations and probes owner liveness by PID plus recorded process start time; a reused PID with a different start time is treated as a dead original owner, while lookup/access failures that do not prove death are treated conservatively as unknown and are not removed.
 
-Path canonicalization, symlink handling, full real Caddy runtime ownership, durable persistence, and advanced Caddy JSON merging beyond host-routed HTTP servers are intentionally out of scope for this task.
+Full installer/PATH setup, durable persistence, deep Windows file identity beyond current normalized-path and metadata checks, and advanced Caddy JSON merging beyond host-routed HTTP servers are intentionally out of scope for this task.
 
 ## Project Layout
 

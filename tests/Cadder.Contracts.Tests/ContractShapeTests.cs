@@ -39,7 +39,13 @@ public sealed class ContractShapeTests
     var snapshot = new GuiStateSnapshot(
         DateTimeOffset.Parse("2026-06-09T10:00:03Z"),
         [Samples.Registration()],
-        new RealCaddyRuntimeState(RealCaddyRuntimeStatus.Running, null, "2.8.4"),
+        new RealCaddyRuntimeState(
+            RealCaddyRuntimeStatus.Running,
+            new RealCaddyBinaryIdentity("C:\\tools\\caddy-real.exe", "file-id-1"),
+            "2.8.4",
+            new RealCaddyProcessIdentity(8675, DateTimeOffset.Parse("2026-06-09T10:00:01Z"), true),
+            "http://127.0.0.1:2019",
+            [new CaddyRuntimeDiagnostic("runtime-healthy", "Runtime process is running.", "inspect")]),
         new CaddyConfigState(
             CaddyConfigApplyStatus.Failed,
             DateTimeOffset.Parse("2026-06-09T10:00:04Z"),
@@ -56,6 +62,9 @@ public sealed class ContractShapeTests
     var json = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions(JsonSerializerDefaults.Web));
 
     Assert.Contains("caddyConfig", json, StringComparison.Ordinal);
+    Assert.Contains("adminEndpoint", json, StringComparison.Ordinal);
+    Assert.Contains("ownedByCadder", json, StringComparison.Ordinal);
+    Assert.Contains("runtime-healthy", json, StringComparison.Ordinal);
     Assert.Contains("domain-conflict", json, StringComparison.Ordinal);
     Assert.Contains("effectiveConfigHash", json, StringComparison.Ordinal);
   }

@@ -16,7 +16,8 @@ public enum RealCaddyRuntimeStatus
   NotResolved = 1,
   Resolved = 2,
   Running = 3,
-  Unhealthy = 4
+  Unhealthy = 4,
+  Idle = 5
 }
 
 public enum GuiStateChangeKind
@@ -31,7 +32,8 @@ public enum CaddyConfigApplyStatus
   Unknown = 0,
   NotApplied = 1,
   Applied = 2,
-  Failed = 3
+  Failed = 3,
+  Idle = 4
 }
 
 public sealed record SourcePath(
@@ -85,10 +87,23 @@ public sealed record RealCaddyBinaryIdentity(
     string? ResolvedPath,
     string? FileIdentity);
 
+public sealed record RealCaddyProcessIdentity(
+    int ProcessId,
+    DateTimeOffset ProcessStartTimeUtc,
+    bool OwnedByCadder);
+
+public sealed record CaddyRuntimeDiagnostic(
+    string Code,
+    string Message,
+    string? Operation);
+
 public sealed record RealCaddyRuntimeState(
     RealCaddyRuntimeStatus Status,
     RealCaddyBinaryIdentity? Binary,
-    string? Version);
+    string? Version,
+    RealCaddyProcessIdentity? Process = null,
+    string? AdminEndpoint = null,
+    CaddyRuntimeDiagnostic[]? Diagnostics = null);
 
 public sealed record CaddyConfigDiagnostic(
     string Code,

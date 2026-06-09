@@ -50,6 +50,10 @@ public interface IRealCaddyRuntimeAdapter
 {
   ValueTask<RealCaddyRuntimeState> InspectAsync(CancellationToken cancellationToken = default);
 
+  ValueTask<RealCaddyRuntimeState> EnsureRunningAsync(
+      CaddyRuntimeConfig config,
+      CancellationToken cancellationToken = default);
+
   ValueTask<CaddyRuntimeOperationResult> ValidateConfigAsync(
       CaddyRuntimeConfig config,
       CancellationToken cancellationToken = default);
@@ -57,6 +61,8 @@ public interface IRealCaddyRuntimeAdapter
   ValueTask<CaddyRuntimeOperationResult> ReloadConfigAsync(
       CaddyRuntimeConfig config,
       CancellationToken cancellationToken = default);
+
+  ValueTask<RealCaddyRuntimeState> EnterIdleAsync(CancellationToken cancellationToken = default);
 }
 
 public interface ICaddyConfigCoordinator
@@ -200,12 +206,31 @@ public sealed class GuiStateProjector : IGuiStateProjector
 
 public sealed class NoopRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter
 {
+  private RealCaddyRuntimeState _state = new(
+      RealCaddyRuntimeStatus.NotResolved,
+      null,
+      null,
+      Diagnostics: []);
+
   public ValueTask<RealCaddyRuntimeState> InspectAsync(CancellationToken cancellationToken = default)
   {
-    return ValueTask.FromResult(new RealCaddyRuntimeState(
-        RealCaddyRuntimeStatus.NotResolved,
+    cancellationToken.ThrowIfCancellationRequested();
+    return ValueTask.FromResult(_state);
+  }
+
+  public ValueTask<RealCaddyRuntimeState> EnsureRunningAsync(
+      CaddyRuntimeConfig config,
+      CancellationToken cancellationToken = default)
+  {
+    ArgumentNullException.ThrowIfNull(config);
+    cancellationToken.ThrowIfCancellationRequested();
+
+    _state = new RealCaddyRuntimeState(
+        RealCaddyRuntimeStatus.Running,
         null,
-        null));
+        null,
+        Diagnostics: []);
+    return ValueTask.FromResult(_state);
   }
 
   public ValueTask<CaddyRuntimeOperationResult> ValidateConfigAsync(
@@ -226,6 +251,18 @@ public sealed class NoopRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter
     cancellationToken.ThrowIfCancellationRequested();
 
     return ValueTask.FromResult(CaddyRuntimeOperationResult.Success("Config reload skipped."));
+  }
+
+  public ValueTask<RealCaddyRuntimeState> EnterIdleAsync(CancellationToken cancellationToken = default)
+  {
+    cancellationToken.ThrowIfCancellationRequested();
+
+    _state = new RealCaddyRuntimeState(
+        RealCaddyRuntimeStatus.Idle,
+        null,
+        null,
+        Diagnostics: []);
+    return ValueTask.FromResult(_state);
   }
 }
 

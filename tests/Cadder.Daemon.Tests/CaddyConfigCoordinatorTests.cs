@@ -20,6 +20,7 @@ public sealed class CaddyConfigCoordinatorTests
 
     var registrations = await endpoint.ListAsync(new ListEntrypointsRequest("list-1"));
     Assert.True(response.Accepted);
+    Assert.Single(runtime.EnsuredConfigs);
     Assert.Single(runtime.ReloadedConfigs);
     Assert.Equal(
         ["api.example.localhost", "app.example.localhost"],
@@ -54,10 +55,43 @@ public sealed class CaddyConfigCoordinatorTests
         null));
 
     Assert.True(update.Accepted);
+    Assert.Equal(2, runtime.EnsuredConfigs.Count);
     Assert.Equal(2, runtime.ReloadedConfigs.Count);
     Assert.DoesNotContain("api.example.localhost", runtime.ReloadedConfigs.Last(), StringComparison.Ordinal);
     Assert.Contains("app.example.localhost", runtime.ReloadedConfigs.Last(), StringComparison.Ordinal);
     Assert.Equal(2, update.Registration?.RegisteredDomains.Length);
+  }
+
+  [Fact]
+  public async Task UpdateAsync_WithZeroActiveDomains_EntersIdleWithoutReloadingEmptyConfig()
+  {
+    using var temp = TestCaddyfile.Create();
+    var runtime = new RecordingRuntimeAdapter();
+    var adapter = new RecordingConfigAdapter();
+    adapter.SetConfig(temp.Path, AdaptedJson(["api.example.localhost"]));
+    var endpoint = CreateEndpoint(runtime, adapter);
+    await endpoint.RegisterAsync(new RegisterEntrypointRequest("register-1", CreateRegistration("nonce-1", temp.Path)));
+    var registered = (await endpoint.ListAsync(new ListEntrypointsRequest("list-1"))).Registrations.Single();
+    var inactiveDomains = registered.RegisteredDomains
+        .Select(static domain => domain with { ActivationState = ActivationState.Inactive })
+        .ToArray();
+
+    var update = await endpoint.UpdateAsync(new UpdateEntrypointRequest(
+        "update-1",
+        registered.RegistrationId,
+        registered.EntrypointInstance.ShimSessionNonce,
+        null,
+        null,
+        inactiveDomains,
+        null,
+        null));
+    var snapshot = (await endpoint.QueryStateAsync(new QueryGuiStateRequest("state-1"))).Snapshot;
+
+    Assert.True(update.Accepted);
+    Assert.Single(runtime.ReloadedConfigs);
+    Assert.Equal(1, runtime.IdleCount);
+    Assert.Equal(CaddyConfigApplyStatus.Idle, snapshot?.CaddyConfig?.Status);
+    Assert.Equal(RealCaddyRuntimeStatus.Idle, snapshot?.RealCaddyRuntime.Status);
   }
 
   [Fact]
@@ -119,6 +153,41 @@ public sealed class CaddyConfigCoordinatorTests
     Assert.Equal(CaddyConfigApplyStatus.Failed, failedState?.Status);
     Assert.Equal(goodState?.EffectiveConfigHash, failedState?.EffectiveConfigHash);
     Assert.Equal(goodState?.LastSuccessfulReloadAtUtc, failedState?.LastSuccessfulReloadAtUtc);
+  }
+
+  [Fact]
+  public async Task RegisterAsync_WhenRuntimeStartFails_ReportsStructuredRuntimeDiagnosticWithoutReload()
+  {
+    using var temp = TestCaddyfile.Create();
+    var runtime = new RecordingRuntimeAdapter
+    {
+      EnsureRunning = _ => new RealCaddyRuntimeState(
+          RealCaddyRuntimeStatus.Unhealthy,
+          new RealCaddyBinaryIdentity("C:\\tools\\caddy-real.exe", "real-caddy"),
+          "2.8.4",
+          Diagnostics:
+          [
+              new CaddyRuntimeDiagnostic(
+                    "runtime-start-failed",
+                    "Injected runtime start failure.",
+                    "run")
+          ])
+    };
+    var adapter = new RecordingConfigAdapter();
+    adapter.SetConfig(temp.Path, AdaptedJson(["api.example.localhost"]));
+    var endpoint = CreateEndpoint(runtime, adapter);
+
+    var response = await endpoint.RegisterAsync(new RegisterEntrypointRequest(
+        "register-1",
+        CreateRegistration("nonce-1", temp.Path)));
+    var snapshot = (await endpoint.QueryStateAsync(new QueryGuiStateRequest("state-1"))).Snapshot;
+
+    Assert.True(response.Accepted);
+    Assert.Empty(runtime.ReloadedConfigs);
+    Assert.Equal(CaddyConfigApplyStatus.Failed, snapshot?.CaddyConfig?.Status);
+    Assert.Equal("runtime-start-failed", snapshot?.CaddyConfig?.Diagnostics.Single().Code);
+    Assert.Equal(RealCaddyRuntimeStatus.Unhealthy, snapshot?.RealCaddyRuntime.Status);
+    Assert.Equal("runtime-start-failed", snapshot?.RealCaddyRuntime.Diagnostics?.Single().Code);
   }
 
   private static CadderIpcEndpoint CreateEndpoint(
@@ -225,18 +294,46 @@ public sealed class CaddyConfigCoordinatorTests
 
   private sealed class RecordingRuntimeAdapter : IRealCaddyRuntimeAdapter
   {
+    private RealCaddyRuntimeState _state = new(
+        RealCaddyRuntimeStatus.Running,
+        new RealCaddyBinaryIdentity("C:\\tools\\caddy-real.exe", "real-caddy"),
+        "2.8.4",
+        new RealCaddyProcessIdentity(2019, DateTimeOffset.Parse("2026-06-09T12:00:00Z"), true),
+        "http://127.0.0.1:2019",
+        []);
+
+    public List<string> EnsuredConfigs { get; } = [];
+
     public List<string> ReloadedConfigs { get; } = [];
 
+    public int IdleCount { get; private set; }
+
     public Func<string, bool> Validate { get; init; } = static _ => true;
+
+    public Func<string, RealCaddyRuntimeState>? EnsureRunning { get; init; }
 
     public ValueTask<RealCaddyRuntimeState> InspectAsync(CancellationToken cancellationToken = default)
     {
       cancellationToken.ThrowIfCancellationRequested();
 
-      return ValueTask.FromResult(new RealCaddyRuntimeState(
-          RealCaddyRuntimeStatus.Running,
-          new RealCaddyBinaryIdentity("C:\\tools\\caddy-real.exe", "real-caddy"),
-          "2.8.4"));
+      return ValueTask.FromResult(_state);
+    }
+
+    public ValueTask<RealCaddyRuntimeState> EnsureRunningAsync(
+        CaddyRuntimeConfig config,
+        CancellationToken cancellationToken = default)
+    {
+      cancellationToken.ThrowIfCancellationRequested();
+
+      EnsuredConfigs.Add(config.Content);
+      if (EnsureRunning is not null)
+      {
+        _state = EnsureRunning(config.Content);
+        return ValueTask.FromResult(_state);
+      }
+
+      _state = _state with { Status = RealCaddyRuntimeStatus.Running };
+      return ValueTask.FromResult(_state);
     }
 
     public ValueTask<CaddyRuntimeOperationResult> ValidateConfigAsync(
@@ -258,6 +355,20 @@ public sealed class CaddyConfigCoordinatorTests
 
       ReloadedConfigs.Add(config.Content);
       return ValueTask.FromResult(CaddyRuntimeOperationResult.Success("Reloaded."));
+    }
+
+    public ValueTask<RealCaddyRuntimeState> EnterIdleAsync(CancellationToken cancellationToken = default)
+    {
+      cancellationToken.ThrowIfCancellationRequested();
+
+      IdleCount++;
+      _state = _state with
+      {
+        Status = RealCaddyRuntimeStatus.Idle,
+        Process = null,
+        Diagnostics = []
+      };
+      return ValueTask.FromResult(_state);
     }
   }
 

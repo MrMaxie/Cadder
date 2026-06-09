@@ -9,14 +9,87 @@
     mc:Ignorable="d">
 
     <Grid Padding="24">
-        <StackPanel Spacing="8">
+        <StackPanel Spacing="12">
             <TextBlock
+                AutomationProperties.AutomationId="PageTitleText"
                 FontSize="20"
                 FontWeight="SemiBold"
                 Text="Cadder daemon" />
-            <TextBlock Text="The daemon is running with zero active registrations." />
+            <Grid ColumnSpacing="24" RowSpacing="8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="160" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <TextBlock Text="Runtime" />
+                <TextBlock
+                    x:Name="RuntimeStatusText"
+                    AutomationProperties.AutomationId="RuntimeStatusText"
+                    Grid.Column="1"
+                    FontWeight="SemiBold"
+                    Text="Unknown" />
+
+                <TextBlock Grid.Row="1" Text="Process ID" />
+                <TextBlock
+                    x:Name="RuntimeProcessText"
+                    AutomationProperties.AutomationId="RuntimeProcessText"
+                    Grid.Row="1"
+                    Grid.Column="1"
+                    Text="-" />
+
+                <TextBlock Grid.Row="2" Text="Admin endpoint" />
+                <TextBlock
+                    x:Name="RuntimeAdminEndpointText"
+                    AutomationProperties.AutomationId="RuntimeAdminEndpointText"
+                    Grid.Row="2"
+                    Grid.Column="1"
+                    Text="-" />
+
+                <TextBlock Grid.Row="3" Text="Version" />
+                <TextBlock
+                    x:Name="RuntimeVersionText"
+                    AutomationProperties.AutomationId="RuntimeVersionText"
+                    Grid.Row="3"
+                    Grid.Column="1"
+                    Text="-" />
+
+                <TextBlock Grid.Row="4" Text="Config" />
+                <TextBlock
+                    x:Name="ConfigStatusText"
+                    AutomationProperties.AutomationId="ConfigStatusText"
+                    Grid.Row="4"
+                    Grid.Column="1"
+                    Text="Not applied" />
+
+                <TextBlock Grid.Row="5" Text="Registrations" />
+                <TextBlock
+                    x:Name="RegistrationCountText"
+                    AutomationProperties.AutomationId="RegistrationCountText"
+                    Grid.Row="5"
+                    Grid.Column="1"
+                    Text="0" />
+
+                <TextBlock Grid.Row="6" Text="Diagnostic" />
+                <TextBlock
+                    x:Name="RuntimeDiagnosticText"
+                    AutomationProperties.AutomationId="RuntimeDiagnosticText"
+                    Grid.Row="6"
+                    Grid.Column="1"
+                    Text="-"
+                    TextWrapping="WrapWholeWords" />
+            </Grid>
             <Button
                 x:Name="QuitDaemonButton"
+                AutomationProperties.AutomationId="QuitDaemonButton"
                 Click="QuitDaemonButton_Click"
                 Content="Quit daemon" />
         </StackPanel>

@@ -1,3 +1,4 @@
+using Cadder.Contracts;
 using Cadder.Daemon;
 using Microsoft.UI.Xaml;
 using Microsoft.Windows.AppLifecycle;
@@ -8,6 +9,7 @@ public partial class App : Application
 {
   private static DaemonSingletonAcquisition? s_singletonAcquisition;
   private readonly DaemonLifecycleHost _daemonHost;
+  private readonly CadderIpcEndpoint _endpoint;
   private DaemonTrayPresence? _trayPresence;
   private MainWindow? _window;
 
@@ -40,6 +42,7 @@ public partial class App : Application
         guiStateBroadcaster,
         guiStateProjector,
         registrationCountChanged);
+    _endpoint = endpoint;
     var ipcServer = new NamedPipeDaemonIpcServer(endpoint);
     var ownerWatcher = new RegistrationOwnerWatcher(
         registrationStore,
@@ -53,7 +56,7 @@ public partial class App : Application
         acquisition.Lease,
         ipcServer,
         registrationStore,
-        new NoopCadderOwnedRuntime(),
+        realCaddyRuntime,
         ownerWatcher: ownerWatcher);
     _daemonHost = daemonHost;
 
@@ -84,6 +87,14 @@ public partial class App : Application
       _trayPresence?.Dispose();
       Exit();
     }
+  }
+
+  public async ValueTask<GuiStateSnapshot?> QueryGuiStateAsync(CancellationToken cancellationToken = default)
+  {
+    var response = await _endpoint.QueryStateAsync(
+        new QueryGuiStateRequest($"tray-state-{Guid.NewGuid():N}"),
+        cancellationToken);
+    return response.Snapshot;
   }
 
   protected override async void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)

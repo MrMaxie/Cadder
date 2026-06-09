@@ -109,6 +109,18 @@ public sealed class CaddyConfigCoordinator : ICaddyConfigCoordinator
         return _currentState;
       }
 
+      if (IsIdleComposition(composition))
+      {
+        await _runtime.EnterIdleAsync(cancellationToken).ConfigureAwait(false);
+        _currentState = new CaddyConfigState(
+            CaddyConfigApplyStatus.Idle,
+            attemptedAtUtc,
+            _currentState.LastSuccessfulReloadAtUtc,
+            null,
+            []);
+        return _currentState;
+      }
+
       var config = new CaddyRuntimeConfig(composition.Content);
       var validation = await _runtime.ValidateConfigAsync(config, cancellationToken).ConfigureAwait(false);
       if (!validation.Succeeded)
@@ -117,6 +129,16 @@ public sealed class CaddyConfigCoordinator : ICaddyConfigCoordinator
             "config-validation-failed",
             validation.Message ?? "Composed Caddy config validation failed.",
             validation.Diagnostics));
+        return _currentState;
+      }
+
+      var runtimeState = await _runtime.EnsureRunningAsync(config, cancellationToken).ConfigureAwait(false);
+      if (runtimeState.Status is not RealCaddyRuntimeStatus.Running)
+      {
+        _currentState = Failed(attemptedAtUtc, NormalizeRuntimeDiagnostics(
+            runtimeState.Diagnostics ?? [],
+            "runtime-start-failed",
+            "Real Caddy runtime could not be started."));
         return _currentState;
       }
 
@@ -188,6 +210,25 @@ public sealed class CaddyConfigCoordinator : ICaddyConfigCoordinator
     return diagnostics.Length > 0
         ? diagnostics
         : [new CaddyConfigDiagnostic(code, message, null, [])];
+  }
+
+  private static CaddyConfigDiagnostic[] NormalizeRuntimeDiagnostics(
+      CaddyRuntimeDiagnostic[] diagnostics,
+      string fallbackCode,
+      string fallbackMessage)
+  {
+    return diagnostics.Length > 0
+        ? [.. diagnostics.Select(diagnostic => new CaddyConfigDiagnostic(
+            diagnostic.Code,
+            diagnostic.Message,
+            null,
+            []))]
+        : [new CaddyConfigDiagnostic(fallbackCode, fallbackMessage, null, [])];
+  }
+
+  private static bool IsIdleComposition(CaddyConfigComposition composition)
+  {
+    return string.Equals(composition.Content, "{}", StringComparison.Ordinal);
   }
 
   private static string ComputeHash(string content)
