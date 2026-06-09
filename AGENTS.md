@@ -38,6 +38,11 @@ dotnet format Cadder.slnx --verify-no-changes
 - Avoid running multiple `dotnet restore/build/test` commands in parallel against the same projects; this can corrupt or race `project.assets.json` and output DLL writes.
 - For WinUI changes, build `src\Cadder.Tray.WinUI\Cadder.Tray.WinUI.csproj` with `-p:Platform=x64 -p:RuntimeIdentifier=win-x64`.
 
+## Debugging Notes
+
+- Read [AGENTS_DEBUG.md](AGENTS_DEBUG.md) before investigating WinUI, UI Automation, Windows input/clicking, process lifetime, or flaky validation problems.
+- Record new recurring debugging lessons in `AGENTS_DEBUG.md` instead of repeating them in this file.
+
 ## Skill Routing
 
 Actively use available skills and helpers when they can improve correctness or reduce uncertainty.
