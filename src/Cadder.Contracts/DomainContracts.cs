@@ -2,21 +2,21 @@ namespace Cadder.Contracts;
 
 public enum ActivationState
 {
-    Unknown = 0,
-    Registered = 1,
-    Activating = 2,
-    Active = 3,
-    Inactive = 4,
-    Faulted = 5
+  Unknown = 0,
+  Registered = 1,
+  Activating = 2,
+  Active = 3,
+  Inactive = 4,
+  Faulted = 5
 }
 
 public enum RealCaddyRuntimeStatus
 {
-    Unknown = 0,
-    NotResolved = 1,
-    Resolved = 2,
-    Running = 3,
-    Unhealthy = 4
+  Unknown = 0,
+  NotResolved = 1,
+  Resolved = 2,
+  Running = 3,
+  Unhealthy = 4
 }
 
 public sealed record SourcePath(
