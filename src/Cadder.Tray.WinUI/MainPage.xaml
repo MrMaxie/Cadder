@@ -13,8 +13,12 @@
             <TextBlock
                 FontSize="20"
                 FontWeight="SemiBold"
-                Text="Cadder daemon scaffold" />
-            <TextBlock Text="Tray/daemon host boundary is present. Runtime features are implemented by later tasks." />
+                Text="Cadder daemon" />
+            <TextBlock Text="The daemon is running with zero active registrations." />
+            <Button
+                x:Name="QuitDaemonButton"
+                Click="QuitDaemonButton_Click"
+                Content="Quit daemon" />
         </StackPanel>
     </Grid>
 </Page>

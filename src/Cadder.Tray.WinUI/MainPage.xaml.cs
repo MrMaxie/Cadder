@@ -8,4 +8,14 @@ public sealed partial class MainPage : Page
     {
         InitializeComponent();
     }
+
+    private async void QuitDaemonButton_Click(object sender, Microsoft.UI.Xaml.RoutedEventArgs e)
+    {
+        QuitDaemonButton.IsEnabled = false;
+
+        if (Microsoft.UI.Xaml.Application.Current is App app)
+        {
+            await app.QuitDaemonAsync();
+        }
+    }
 }

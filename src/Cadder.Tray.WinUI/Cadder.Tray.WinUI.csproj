@@ -13,6 +13,7 @@
     <DefaultLanguage>en-US</DefaultLanguage>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(RuntimeIdentifier)' == ''">

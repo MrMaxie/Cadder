@@ -11,6 +11,14 @@ Cadder is a Windows tray daemon that lets project-local `caddy.exe` invocations 
 - Registration store: durable owner-aware state for entrypoint registrations.
 - GUI state projection: daemon read model that the tray UI can render without reaching into storage or runtime internals.
 
+## Singleton Daemon Lifecycle
+
+The WinUI tray host is the Cadder daemon process. It is a per-user singleton: startup first registers a stable Windows App SDK `AppInstance` key for activation redirection, then acquires a per-user named mutex before creating any window or tray icon. If another process launches Cadder while the daemon is already running, the new activation is redirected to the registered instance and the second process exits before creating another daemon surface.
+
+The named mutex is the deterministic ownership boundary for the daemon lifecycle. A clean explicit quit releases the mutex after stopping IPC, clearing transient registrations, and asking the Cadder-owned runtime boundary to stop. If Windows reports an abandoned mutex, Cadder treats the lock as recoverable and rebuilds transient in-memory daemon state rather than permanently blocking startup.
+
+Zero registrations are a normal running state. The daemon must stay alive and visible in the tray until the user chooses the explicit quit path. Later owner-cleanup tasks may remove registrations, but registration count alone must not terminate the daemon.
+
 ## Shim Versus Real Caddy
 
 The shim exists so tools that already run `caddy.exe` can opt into Cadder without changing their command shape. The shim is not the Caddy server. It must not recursively invoke itself when Cadder needs the real binary.
