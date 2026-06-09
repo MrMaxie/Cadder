@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "Cadder.Tray.WinUI (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "Cadder.Tray.WinUI (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

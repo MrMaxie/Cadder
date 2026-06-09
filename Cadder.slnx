@@ -1,0 +1,17 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+  </Configurations>
+  <Folder Name="/src/">
+    <Project Path="src/Cadder.CaddyShim/Cadder.CaddyShim.csproj" />
+    <Project Path="src/Cadder.Contracts/Cadder.Contracts.csproj" />
+    <Project Path="src/Cadder.Daemon/Cadder.Daemon.csproj" />
+    <Project Path="src/Cadder.Tray.WinUI/Cadder.Tray.WinUI.csproj">
+      <Platform Solution="*|x64" Project="x64" />
+    </Project>
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Cadder.Contracts.Tests/Cadder.Contracts.Tests.csproj" />
+    <Project Path="tests/Cadder.Daemon.Tests/Cadder.Daemon.Tests.csproj" />
+  </Folder>
+</Solution>
