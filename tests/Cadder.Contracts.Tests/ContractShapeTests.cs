@@ -26,6 +26,7 @@ public sealed class ContractShapeTests
         Assert.Contains("activationState", json, StringComparison.Ordinal);
         Assert.Contains("ownerProcess", json, StringComparison.Ordinal);
         Assert.Contains("logStream", json, StringComparison.Ordinal);
+        Assert.Contains("shimRun", json, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -50,6 +51,16 @@ public sealed class ContractShapeTests
         Assert.Equal("example.com", domain.Canonical);
     }
 
+    [Fact]
+    public void ShimRunMetadataPreservesAdapterAndRawArguments()
+    {
+        var shimRun = Samples.Registration().ShimRun;
+
+        Assert.NotNull(shimRun);
+        Assert.Equal("caddyfile", shimRun.Adapter);
+        Assert.Equal(["run", "--config", "Caddyfile", "--adapter", "caddyfile"], shimRun.RawArguments);
+    }
+
     private static class Samples
     {
         public static EntrypointRegistration Registration()
@@ -69,7 +80,8 @@ public sealed class ContractShapeTests
                 ],
                 ActivationState.Active,
                 new OwnerProcessIdentity(4242, DateTimeOffset.Parse("2026-06-09T09:59:59Z"), "nonce-1", "C:\\tools\\caddy.exe"),
-                logStream);
+                logStream,
+                new ShimRunMetadata("caddyfile", ["run", "--config", "Caddyfile", "--adapter", "caddyfile"]));
         }
     }
 }

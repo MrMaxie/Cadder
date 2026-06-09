@@ -75,6 +75,33 @@ public sealed class DaemonLifecycleTests
     }
 
     [Fact]
+    public async Task Shutdown_DoesNotHoldLifecycleGateWhileStoppingIpc()
+    {
+        var coordinator = new NamedMutexDaemonSingletonCoordinator(CreateMutexName());
+        var acquisition = coordinator.TryAcquire();
+        Assert.NotNull(acquisition.Lease);
+
+        DaemonLifecycleHost? host = null;
+        var ipc = new CallbackOnStopIpcServer(async () =>
+        {
+            Assert.NotNull(host);
+            await host.UpdateRegistrationCountAsync(0);
+        });
+        host = new DaemonLifecycleHost(
+            acquisition.Lease,
+            ipc,
+            new RecordingRegistrationStore(),
+            new RecordingRuntime());
+
+        await host.StartAsync();
+
+        await host.ShutdownAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(ipc.Stopped);
+        Assert.Equal(DaemonLifecycleState.Stopped, host.Snapshot.State);
+    }
+
+    [Fact]
     public async Task ZeroRegistrationsKeepDaemonRunning()
     {
         var coordinator = new NamedMutexDaemonSingletonCoordinator(CreateMutexName());
@@ -204,6 +231,22 @@ public sealed class DaemonLifecycleTests
         public ValueTask StopAsync(CancellationToken cancellationToken = default)
         {
             return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class CallbackOnStopIpcServer(Func<ValueTask> onStop) : IDaemonIpcServer
+    {
+        public bool Stopped { get; private set; }
+
+        public ValueTask StartAsync(CancellationToken cancellationToken = default)
+        {
+            return ValueTask.CompletedTask;
+        }
+
+        public async ValueTask StopAsync(CancellationToken cancellationToken = default)
+        {
+            await onStop();
+            Stopped = true;
         }
     }
 

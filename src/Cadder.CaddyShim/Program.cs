@@ -1,3 +1,3 @@
 using Cadder.CaddyShim;
 
-return ShimEntrypoint.Run(args);
+return await ShimEntrypoint.RunAsync(args);

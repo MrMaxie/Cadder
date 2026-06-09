@@ -20,11 +20,26 @@ public partial class App : Application
             throw new InvalidOperationException("Cadder daemon singleton lease is required.");
         }
 
-        _daemonHost = new DaemonLifecycleHost(
+        DaemonLifecycleHost? daemonHost = null;
+        var registrationStore = new InMemoryRegistrationStore();
+        var endpoint = new CadderIpcEndpoint(
+            registrationStore,
+            new NoopRealCaddyRuntimeAdapter(),
+            async (registrationCount, cancellationToken) =>
+            {
+                if (daemonHost is not null)
+                {
+                    await daemonHost.UpdateRegistrationCountAsync(registrationCount, cancellationToken);
+                }
+            });
+        var ipcServer = new NamedPipeDaemonIpcServer(endpoint);
+
+        daemonHost = new DaemonLifecycleHost(
             acquisition.Lease,
-            new NoopDaemonIpcServer(),
-            new InMemoryTransientRegistrationStore(),
+            ipcServer,
+            registrationStore,
             new NoopCadderOwnedRuntime());
+        _daemonHost = daemonHost;
 
         InitializeComponent();
         AppInstance.GetCurrent().Activated += OnAppInstanceActivated;

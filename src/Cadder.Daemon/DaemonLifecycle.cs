@@ -152,17 +152,25 @@ public sealed class DaemonLifecycleHost
             }
 
             SetState(DaemonLifecycleState.ShuttingDown);
+        }
+        finally
+        {
+            _gate.Release();
+        }
 
-            await RunShutdownStepAsync(
-                () => _ipcServer.StopAsync(cancellationToken),
-                errors).ConfigureAwait(false);
-            await RunShutdownStepAsync(
-                () => _registrationStore.ClearTransientRegistrationsAsync(cancellationToken),
-                errors).ConfigureAwait(false);
-            await RunShutdownStepAsync(
-                () => _runtime.StopAsync(cancellationToken),
-                errors).ConfigureAwait(false);
+        await RunShutdownStepAsync(
+            () => _ipcServer.StopAsync(cancellationToken),
+            errors).ConfigureAwait(false);
+        await RunShutdownStepAsync(
+            () => _registrationStore.ClearTransientRegistrationsAsync(cancellationToken),
+            errors).ConfigureAwait(false);
+        await RunShutdownStepAsync(
+            () => _runtime.StopAsync(cancellationToken),
+            errors).ConfigureAwait(false);
 
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
             SetState(DaemonLifecycleState.Stopped);
             DisposeLease();
         }

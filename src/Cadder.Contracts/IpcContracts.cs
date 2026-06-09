@@ -17,6 +17,16 @@ public sealed record RegisterEntrypointResponse(
     string? Message,
     string? RegistrationId) : CadderIpcResponse(RequestId, Accepted, Message);
 
+public sealed record UnregisterEntrypointRequest(
+    string RequestId,
+    string RegistrationId,
+    string ShimSessionNonce) : CadderIpcRequest(RequestId);
+
+public sealed record UnregisterEntrypointResponse(
+    string RequestId,
+    bool Accepted,
+    string? Message) : CadderIpcResponse(RequestId, Accepted, Message);
+
 public sealed record QueryGuiStateRequest(
     string RequestId) : CadderIpcRequest(RequestId);
 

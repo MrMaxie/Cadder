@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Cadder.Contracts\Cadder.Contracts.csproj" />
+    <ProjectReference Include="..\..\src\Cadder.CaddyShim\Cadder.CaddyShim.csproj" />
     <ProjectReference Include="..\..\src\Cadder.Daemon\Cadder.Daemon.csproj" />
   </ItemGroup>
 

@@ -23,9 +23,27 @@ Zero registrations are a normal running state. The daemon must stay alive and vi
 
 The shim exists so tools that already run `caddy.exe` can opt into Cadder without changing their command shape. The shim is not the Caddy server. It must not recursively invoke itself when Cadder needs the real binary.
 
+For TASK-1.3, the supported shim command set is intentionally narrow: `caddy run` with optional `--config` and `--adapter`, plus `--cadder-shim-info` for diagnostics. Unsupported Caddy commands fail with a Cadder-owned message that names this supported set. Delegation to a real Caddy binary remains deferred until Cadder has a resolver that can reliably exclude the shim itself.
+
+When `caddy run` is invoked, the shim captures the caller working directory, resolves the default `Caddyfile` under that directory when `--config` is omitted, preserves the raw command-line arguments, records the optional adapter, and builds a transient entrypoint registration with a generated shim session nonce. The shim first attempts to connect to the per-user daemon IPC pipe. If IPC is unavailable, it starts the Cadder tray daemon executable and polls for IPC readiness with a bounded timeout before registering.
+
+After registration succeeds, the shim keeps the pipe session open and waits for process lifetime signals. On a graceful exit path such as Ctrl+C, it sends an unregister request before exiting. If the shim process is terminated or the pipe is otherwise lost, the daemon removes only the registrations owned by that pipe session.
+
 Future resolver work must exclude Cadder's own shim identity before selecting a real Caddy binary. That exclusion should compare normalized paths and, where Windows APIs make it practical, file identity. A single raw string comparison is not enough because PATH entries, symlinks, casing, and short names can describe the same executable in different ways.
 
 The exact resolver precedence is intentionally deferred to TASK-1.6 and TASK-1.11. This scaffold only records the safety rule: Cadder may shadow `caddy.exe`, but runtime operations must target a real Caddy binary that is not the shim.
+
+## Minimal IPC Boundary
+
+TASK-1.3 adds a small per-user named pipe protocol shared by the shim and daemon. Messages are line-delimited JSON envelopes with an explicit message type and a JSON payload. The supported request types are:
+
+- register entrypoint;
+- unregister entrypoint;
+- query GUI state.
+
+The daemon endpoint writes registrations to an in-memory transient store and projects the current state for GUI queries. This is enough for a shim-owned session to appear in daemon state and disappear on unregister or pipe disconnect.
+
+The broader owner-aware registration store, update/list/toggle API breadth, subscriptions, concurrency guarantees, and durable GUI workflows are still TASK-1.4. Caddyfile domain extraction and effective Caddy config composition remain TASK-1.5. Real Caddy binary resolution, runtime management, and unsupported-command delegation remain TASK-1.6 and TASK-1.11.
 
 ## Initial Domain Model
 
@@ -34,6 +52,7 @@ The exact resolver precedence is intentionally deferred to TASK-1.6 and TASK-1.1
 - entrypoint instance identity, including a shim session nonce;
 - raw and canonical source working directory;
 - raw and canonical source config path;
+- shim run metadata, including adapter and raw arguments;
 - registered domains with raw and canonical names;
 - registration and domain activation state;
 - owner process identity using PID plus process start time and shim nonce;

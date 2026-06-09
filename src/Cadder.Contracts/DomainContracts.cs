@@ -56,7 +56,12 @@ public sealed record EntrypointRegistration(
     RegisteredDomain[] RegisteredDomains,
     ActivationState ActivationState,
     OwnerProcessIdentity OwnerProcess,
-    LogStreamIdentity LogStream);
+    LogStreamIdentity LogStream,
+    ShimRunMetadata? ShimRun = null);
+
+public sealed record ShimRunMetadata(
+    string? Adapter,
+    string[] RawArguments);
 
 public sealed record RealCaddyBinaryIdentity(
     string? ResolvedPath,
