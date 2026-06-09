@@ -26,6 +26,14 @@ public enum GuiStateChangeKind
   RuntimeChanged = 2
 }
 
+public enum CaddyConfigApplyStatus
+{
+  Unknown = 0,
+  NotApplied = 1,
+  Applied = 2,
+  Failed = 3
+}
+
 public sealed record SourcePath(
     string Raw,
     string? Canonical);
@@ -82,7 +90,21 @@ public sealed record RealCaddyRuntimeState(
     RealCaddyBinaryIdentity? Binary,
     string? Version);
 
+public sealed record CaddyConfigDiagnostic(
+    string Code,
+    string Message,
+    string? DomainKey,
+    string[] SourceConfigPaths);
+
+public sealed record CaddyConfigState(
+    CaddyConfigApplyStatus Status,
+    DateTimeOffset? LastAttemptedAtUtc,
+    DateTimeOffset? LastSuccessfulReloadAtUtc,
+    string? EffectiveConfigHash,
+    CaddyConfigDiagnostic[] Diagnostics);
+
 public sealed record GuiStateSnapshot(
     DateTimeOffset CapturedAtUtc,
     EntrypointRegistration[] Registrations,
-    RealCaddyRuntimeState RealCaddyRuntime);
+    RealCaddyRuntimeState RealCaddyRuntime,
+    CaddyConfigState? CaddyConfig = null);

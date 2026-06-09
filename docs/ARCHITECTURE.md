@@ -6,7 +6,7 @@ Cadder is a Windows tray daemon that lets project-local `caddy.exe` invocations 
 
 - Tray/daemon singleton: owns Cadder state for the signed-in Windows user and is the only process that should mutate registrations or talk to the real Caddy runtime.
 - PATH-facing `caddy.exe` shim: a small executable named `caddy.exe` that intentionally shadows Caddy on PATH. It discovers the caller context and forwards registration requests to the daemon.
-- Real Caddy runtime adapter: resolves, starts, reloads, observes, and eventually stops the real Caddy binary. TASK-1.1 only defines the boundary.
+- Real Caddy runtime adapter: resolves, starts, reloads, observes, and eventually stops the real Caddy binary. Current TASK-1.5 code validates and reloads composed configs through this boundary; full runtime ownership remains TASK-1.6.
 - IPC contract: request/response DTOs shared by the shim, daemon, and tray host.
 - Registration store: transient in-memory owner-aware state for entrypoint registrations.
 - GUI state projection: daemon read model that the tray UI can render without reaching into storage or runtime internals.
@@ -50,7 +50,25 @@ The daemon endpoint writes registrations to an in-memory transient store and pro
 
 GUI subscriptions are long-lived pipe reads. The server sends an initial `GuiStateChangedEvent` with `Snapshot`, then sends `RegistrationsChanged` events after registration mutations or heartbeat updates. This gives GUI code a push model without tight polling loops. Query remains available for one-shot state reads.
 
-Caddyfile domain extraction and effective Caddy config composition remain TASK-1.5. Real Caddy binary resolution, runtime management, and unsupported-command delegation remain TASK-1.6 and TASK-1.11.
+Real Caddy binary resolution, runtime management, and unsupported-command delegation remain TASK-1.6 and TASK-1.11.
+
+## Effective Caddy Configuration
+
+TASK-1.5 builds the runtime configuration from active entrypoint registrations. Cadder does not hand-parse Caddyfile syntax as the source of truth. For each registered source config, it runs the Caddy adapter command shape:
+
+```powershell
+caddy adapt --config <Caddyfile> --adapter caddyfile
+```
+
+The current local default command is `caddy-real`, matching the development setup where the real global Caddy executable has been renamed away from Cadder's PATH-facing shim. TASK-1.6 will replace this narrow command default with full real-binary resolution and runtime ownership.
+
+The adapted JSON is inspected for HTTP `host` matchers. Those host values become `RegisteredDomains` on the entrypoint registration with raw and canonical lowercase forms, so GUI and diagnostics can associate every domain with its source instance and config path. Adapter failures, missing config files, invalid adapted JSON, unsupported adapted shapes, validation failures, and reload failures are represented as structured `CaddyConfigDiagnostic` values in the GUI state snapshot.
+
+The effective runtime config is composed as Caddy JSON. Cadder appends enabled routes from active registrations in registration-id order and keeps each registration's routes contiguous in that generated output. Per-domain activation is applied to host matchers: disabling one registered domain removes that host from the generated route match while preserving other enabled domains from the same entrypoint instance.
+
+Conflict detection runs before runtime validation or reload. Domains are keyed by canonical host name, and conflicts are reported only when the same active domain appears in more than one active entrypoint instance. Diagnostics include the conflicting domain and the source config paths.
+
+Validation and reload are atomic from Cadder's perspective. The coordinator calls the runtime boundary to validate the composed JSON first, then reloads only after validation succeeds. Failed adaptation, conflict detection, validation, or reload attempts leave the last known good config hash and last successful reload timestamp intact.
 
 ## Initial Domain Model
 
@@ -60,21 +78,21 @@ Caddyfile domain extraction and effective Caddy config composition remain TASK-1
 - raw and canonical source working directory;
 - raw and canonical source config path;
 - shim run metadata, including adapter, raw arguments, and preserved command line;
-- registered domains with raw and canonical names;
+- registered domains with raw and canonical names extracted from adapted Caddy JSON host matchers;
 - registration and domain activation state;
 - owner process identity using PID plus process start time and shim nonce;
 - registration lifecycle timestamps, including created time and last heartbeat;
 - log stream identity for per-domain and entrypoint streams;
-- GUI state snapshots and IPC request/response shapes.
+- GUI state snapshots, including current Caddy config apply status and diagnostics, and IPC request/response shapes.
 
 Owner cleanup uses two daemon-side signals. Pipe disconnect cleanup unregisters only registrations created through that pipe session. The process watcher scans registrations and probes owner liveness by PID plus recorded process start time; a reused PID with a different start time is treated as a dead original owner, while lookup/access failures that do not prove death are treated conservatively as unknown and are not removed.
 
-Path canonicalization, symlink handling, Caddyfile parsing, domain normalization, durable persistence, and real Caddy runtime state are intentionally out of scope for this task.
+Path canonicalization, symlink handling, full real Caddy runtime ownership, durable persistence, and advanced Caddy JSON merging beyond host-routed HTTP servers are intentionally out of scope for this task.
 
 ## Project Layout
 
 - `src/Cadder.Contracts`: shared DTOs, process role names, and IPC contracts.
-- `src/Cadder.Daemon`: daemon boundary interfaces, registration store contract, runtime adapter boundary, IPC endpoint boundary, and GUI state projector.
+- `src/Cadder.Daemon`: daemon boundary interfaces, registration store contract, Caddy adapt/config coordination, runtime adapter boundary, IPC endpoint boundary, and GUI state projector.
 - `src/Cadder.Tray.WinUI`: minimal WinUI tray/daemon host scaffold.
 - `src/Cadder.CaddyShim`: console shim project whose output assembly name is `caddy`.
 - `tests/Cadder.Contracts.Tests`: contract shape tests.

@@ -22,7 +22,8 @@ public partial class App : Application
 
     DaemonLifecycleHost? daemonHost = null;
     var registrationStore = new InMemoryRegistrationStore();
-    var realCaddyRuntime = new NoopRealCaddyRuntimeAdapter();
+    var realCaddyRuntime = new ProcessRealCaddyRuntimeAdapter();
+    var caddyConfigCoordinator = new CaddyConfigCoordinator(realCaddyRuntime);
     var guiStateProjector = new GuiStateProjector();
     var guiStateBroadcaster = new InMemoryGuiStateChangeBroadcaster();
     Func<int, CancellationToken, ValueTask> registrationCountChanged = async (registrationCount, cancellationToken) =>
@@ -35,6 +36,7 @@ public partial class App : Application
     var endpoint = new CadderIpcEndpoint(
         registrationStore,
         realCaddyRuntime,
+        caddyConfigCoordinator,
         guiStateBroadcaster,
         guiStateProjector,
         registrationCountChanged);

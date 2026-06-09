@@ -49,6 +49,31 @@ public interface IRegistrationStore
 public interface IRealCaddyRuntimeAdapter
 {
   ValueTask<RealCaddyRuntimeState> InspectAsync(CancellationToken cancellationToken = default);
+
+  ValueTask<CaddyRuntimeOperationResult> ValidateConfigAsync(
+      CaddyRuntimeConfig config,
+      CancellationToken cancellationToken = default);
+
+  ValueTask<CaddyRuntimeOperationResult> ReloadConfigAsync(
+      CaddyRuntimeConfig config,
+      CancellationToken cancellationToken = default);
+}
+
+public interface ICaddyConfigCoordinator
+{
+  CaddyConfigState CurrentState { get; }
+
+  ValueTask<EntrypointRegistration> PrepareRegistrationAsync(
+      EntrypointRegistration registration,
+      CancellationToken cancellationToken = default);
+
+  ValueTask<EntrypointRegistrationPatch> PreparePatchAsync(
+      EntrypointRegistrationPatch patch,
+      CancellationToken cancellationToken = default);
+
+  ValueTask<CaddyConfigState> ApplyAsync(
+      IReadOnlyList<EntrypointRegistration> registrations,
+      CancellationToken cancellationToken = default);
 }
 
 public interface ICadderIpcEndpoint
@@ -136,7 +161,28 @@ public sealed record EntrypointRegistrationPatch(
 public sealed record DaemonStateSnapshot(
     DateTimeOffset CapturedAtUtc,
     IReadOnlyList<EntrypointRegistration> Registrations,
-    RealCaddyRuntimeState RealCaddyRuntime);
+    RealCaddyRuntimeState RealCaddyRuntime,
+    CaddyConfigState? CaddyConfig = null);
+
+public sealed record CaddyRuntimeConfig(string Content);
+
+public sealed record CaddyRuntimeOperationResult(
+    bool Succeeded,
+    string? Message,
+    CaddyConfigDiagnostic[] Diagnostics)
+{
+  public static CaddyRuntimeOperationResult Success(string? message = null)
+  {
+    return new CaddyRuntimeOperationResult(true, message, []);
+  }
+
+  public static CaddyRuntimeOperationResult Failure(
+      string message,
+      CaddyConfigDiagnostic[]? diagnostics = null)
+  {
+    return new CaddyRuntimeOperationResult(false, message, diagnostics ?? []);
+  }
+}
 
 public sealed class GuiStateProjector : IGuiStateProjector
 {
@@ -147,7 +193,8 @@ public sealed class GuiStateProjector : IGuiStateProjector
     return new GuiStateSnapshot(
         snapshot.CapturedAtUtc,
         snapshot.Registrations.ToArray(),
-        snapshot.RealCaddyRuntime);
+        snapshot.RealCaddyRuntime,
+        snapshot.CaddyConfig);
   }
 }
 
@@ -159,5 +206,65 @@ public sealed class NoopRealCaddyRuntimeAdapter : IRealCaddyRuntimeAdapter
         RealCaddyRuntimeStatus.NotResolved,
         null,
         null));
+  }
+
+  public ValueTask<CaddyRuntimeOperationResult> ValidateConfigAsync(
+      CaddyRuntimeConfig config,
+      CancellationToken cancellationToken = default)
+  {
+    ArgumentNullException.ThrowIfNull(config);
+    cancellationToken.ThrowIfCancellationRequested();
+
+    return ValueTask.FromResult(CaddyRuntimeOperationResult.Success("Config validation skipped."));
+  }
+
+  public ValueTask<CaddyRuntimeOperationResult> ReloadConfigAsync(
+      CaddyRuntimeConfig config,
+      CancellationToken cancellationToken = default)
+  {
+    ArgumentNullException.ThrowIfNull(config);
+    cancellationToken.ThrowIfCancellationRequested();
+
+    return ValueTask.FromResult(CaddyRuntimeOperationResult.Success("Config reload skipped."));
+  }
+}
+
+public sealed class NoopCaddyConfigCoordinator : ICaddyConfigCoordinator
+{
+  public CaddyConfigState CurrentState { get; } = new(
+      CaddyConfigApplyStatus.NotApplied,
+      null,
+      null,
+      null,
+      []);
+
+  public ValueTask<EntrypointRegistration> PrepareRegistrationAsync(
+      EntrypointRegistration registration,
+      CancellationToken cancellationToken = default)
+  {
+    ArgumentNullException.ThrowIfNull(registration);
+    cancellationToken.ThrowIfCancellationRequested();
+
+    return ValueTask.FromResult(registration);
+  }
+
+  public ValueTask<EntrypointRegistrationPatch> PreparePatchAsync(
+      EntrypointRegistrationPatch patch,
+      CancellationToken cancellationToken = default)
+  {
+    ArgumentNullException.ThrowIfNull(patch);
+    cancellationToken.ThrowIfCancellationRequested();
+
+    return ValueTask.FromResult(patch);
+  }
+
+  public ValueTask<CaddyConfigState> ApplyAsync(
+      IReadOnlyList<EntrypointRegistration> registrations,
+      CancellationToken cancellationToken = default)
+  {
+    ArgumentNullException.ThrowIfNull(registrations);
+    cancellationToken.ThrowIfCancellationRequested();
+
+    return ValueTask.FromResult(CurrentState);
   }
 }

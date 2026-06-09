@@ -6,6 +6,7 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
 {
   private readonly IRegistrationStore _registrationStore;
   private readonly IRealCaddyRuntimeAdapter _realCaddyRuntime;
+  private readonly ICaddyConfigCoordinator _caddyConfigCoordinator;
   private readonly IGuiStateChangeBroadcaster _guiStateBroadcaster;
   private readonly IGuiStateProjector _guiStateProjector;
   private readonly Func<int, CancellationToken, ValueTask>? _registrationCountChanged;
@@ -14,6 +15,7 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
   public CadderIpcEndpoint(
       IRegistrationStore registrationStore,
       IRealCaddyRuntimeAdapter realCaddyRuntime,
+      ICaddyConfigCoordinator? caddyConfigCoordinator = null,
       IGuiStateChangeBroadcaster? guiStateBroadcaster = null,
       IGuiStateProjector? guiStateProjector = null,
       Func<int, CancellationToken, ValueTask>? registrationCountChanged = null,
@@ -21,6 +23,7 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
   {
     _registrationStore = registrationStore ?? throw new ArgumentNullException(nameof(registrationStore));
     _realCaddyRuntime = realCaddyRuntime ?? throw new ArgumentNullException(nameof(realCaddyRuntime));
+    _caddyConfigCoordinator = caddyConfigCoordinator ?? new NoopCaddyConfigCoordinator();
     _guiStateBroadcaster = guiStateBroadcaster ?? new InMemoryGuiStateChangeBroadcaster();
     _guiStateProjector = guiStateProjector ?? new GuiStateProjector();
     _registrationCountChanged = registrationCountChanged;
@@ -43,17 +46,21 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
           null);
     }
 
+    var preparedRegistration = await _caddyConfigCoordinator
+        .PrepareRegistrationAsync(request.Registration, cancellationToken)
+        .ConfigureAwait(false);
     var registration = await _registrationStore.RegisterAsync(
-        request.Registration,
+        preparedRegistration,
         _timeProvider.GetUtcNow(),
         cancellationToken).ConfigureAwait(false);
+    var configState = await ApplyCurrentConfigAsync(cancellationToken).ConfigureAwait(false);
     await PublishRegistrationsChangedAsync(registration.RegistrationId, true, cancellationToken)
         .ConfigureAwait(false);
 
     return new RegisterEntrypointResponse(
         request.RequestId,
         true,
-        "Entrypoint registered.",
+        MessageWithConfigState("Entrypoint registered.", configState),
         registration.RegistrationId);
   }
 
@@ -69,6 +76,7 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
         cancellationToken).ConfigureAwait(false);
     if (removed)
     {
+      await ApplyCurrentConfigAsync(cancellationToken).ConfigureAwait(false);
       await PublishRegistrationsChangedAsync(request.RegistrationId, true, cancellationToken)
           .ConfigureAwait(false);
     }
@@ -87,7 +95,7 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
   {
     ArgumentNullException.ThrowIfNull(request);
 
-    var updated = await _registrationStore.UpdateAsync(
+    var patch = await _caddyConfigCoordinator.PreparePatchAsync(
         new EntrypointRegistrationPatch(
             request.RegistrationId,
             request.ShimSessionNonce,
@@ -96,10 +104,15 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
             request.RegisteredDomains,
             request.ActivationState,
             request.ShimRun),
+        cancellationToken).ConfigureAwait(false);
+    var updated = await _registrationStore.UpdateAsync(
+        patch,
         _timeProvider.GetUtcNow(),
         cancellationToken).ConfigureAwait(false);
+    CaddyConfigState? configState = null;
     if (updated is not null)
     {
+      configState = await ApplyCurrentConfigAsync(cancellationToken).ConfigureAwait(false);
       await PublishRegistrationsChangedAsync(updated.RegistrationId, true, cancellationToken)
           .ConfigureAwait(false);
     }
@@ -108,7 +121,7 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
         request.RequestId,
         updated is not null,
         updated is not null
-            ? "Entrypoint updated."
+            ? MessageWithConfigState("Entrypoint updated.", configState)
             : "Entrypoint was not found for the requested owner.",
         updated);
   }
@@ -140,8 +153,10 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
         request.Enabled,
         _timeProvider.GetUtcNow(),
         cancellationToken).ConfigureAwait(false);
+    CaddyConfigState? configState = null;
     if (updated is not null)
     {
+      configState = await ApplyCurrentConfigAsync(cancellationToken).ConfigureAwait(false);
       await PublishRegistrationsChangedAsync(updated.RegistrationId, true, cancellationToken)
           .ConfigureAwait(false);
     }
@@ -150,7 +165,7 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
         request.RequestId,
         updated is not null,
         updated is not null
-            ? "Entrypoint toggled."
+            ? MessageWithConfigState("Entrypoint toggled.", configState)
             : "Entrypoint was not found for the requested owner.",
         updated);
   }
@@ -227,6 +242,12 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
         cancellationToken).ConfigureAwait(false);
   }
 
+  private async ValueTask<CaddyConfigState> ApplyCurrentConfigAsync(CancellationToken cancellationToken)
+  {
+    var registrations = await _registrationStore.ListAsync(cancellationToken).ConfigureAwait(false);
+    return await _caddyConfigCoordinator.ApplyAsync(registrations, cancellationToken).ConfigureAwait(false);
+  }
+
   private async ValueTask<GuiStateSnapshot> CreateGuiStateSnapshotAsync(CancellationToken cancellationToken)
   {
     var registrations = await _registrationStore.ListAsync(cancellationToken).ConfigureAwait(false);
@@ -234,9 +255,21 @@ public sealed class CadderIpcEndpoint : ICadderIpcEndpoint
     var snapshot = new DaemonStateSnapshot(
         _timeProvider.GetUtcNow(),
         registrations,
-        runtime);
+        runtime,
+        _caddyConfigCoordinator.CurrentState);
 
     return _guiStateProjector.Project(snapshot);
+  }
+
+  private static string MessageWithConfigState(string successMessage, CaddyConfigState? configState)
+  {
+    if (configState?.Status != CaddyConfigApplyStatus.Failed)
+    {
+      return successMessage;
+    }
+
+    var detail = configState.Diagnostics.FirstOrDefault()?.Message ?? "Caddy config reload failed.";
+    return $"{successMessage} {detail}";
   }
 
   private static bool TryValidateRegistration(

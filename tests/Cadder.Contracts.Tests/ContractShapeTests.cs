@@ -34,6 +34,33 @@ public sealed class ContractShapeTests
   }
 
   [Fact]
+  public void GuiStateSnapshotSerializesCaddyConfigState()
+  {
+    var snapshot = new GuiStateSnapshot(
+        DateTimeOffset.Parse("2026-06-09T10:00:03Z"),
+        [Samples.Registration()],
+        new RealCaddyRuntimeState(RealCaddyRuntimeStatus.Running, null, "2.8.4"),
+        new CaddyConfigState(
+            CaddyConfigApplyStatus.Failed,
+            DateTimeOffset.Parse("2026-06-09T10:00:04Z"),
+            DateTimeOffset.Parse("2026-06-09T10:00:02Z"),
+            "hash-1",
+            [
+                new CaddyConfigDiagnostic(
+                    "domain-conflict",
+                    "Domain is registered by multiple entrypoint instances.",
+                    "example.com",
+                    ["C:\\work\\site\\Caddyfile", "C:\\work\\other\\Caddyfile"])
+            ]));
+
+    var json = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+    Assert.Contains("caddyConfig", json, StringComparison.Ordinal);
+    Assert.Contains("domain-conflict", json, StringComparison.Ordinal);
+    Assert.Contains("effectiveConfigHash", json, StringComparison.Ordinal);
+  }
+
+  [Fact]
   public void OwnerProcessIdentityIsNotPidOnly()
   {
     var owner = Samples.Registration().OwnerProcess;
