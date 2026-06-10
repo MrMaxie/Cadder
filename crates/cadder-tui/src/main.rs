@@ -1,7 +1,9 @@
 mod model;
 
 use anyhow::{Context, Result};
-use cadder_daemon::{CadderClient, RuntimePaths, ensure_daemon_running};
+use cadder_daemon::{
+  CadderClient, DaemonLaunchOptions, RuntimePaths, ensure_daemon_running_with_options,
+};
 use cadder_protocol::{
   BasicResponse, GuiStateSnapshot, LogSeverity, QueryLogsRequest, QueryLogsResponse,
   QueryStateRequest, QueryStateResponse, SetDomainEnabledRequest, SetEntrypointEnabledRequest,
@@ -29,6 +31,9 @@ struct Args {
   daemon_path: Option<PathBuf>,
 
   #[arg(long)]
+  real_caddy_command: Option<String>,
+
+  #[arg(long)]
   no_start: bool,
 }
 
@@ -38,7 +43,15 @@ async fn main() -> Result<()> {
   let args = Args::parse();
   let paths = RuntimePaths::resolve(args.runtime_dir)?;
   if !args.no_start {
-    ensure_daemon_running(&paths, args.daemon_path).await?;
+    ensure_daemon_running_with_options(
+      &paths,
+      DaemonLaunchOptions {
+        explicit_daemon: args.daemon_path,
+        real_caddy_command: args.real_caddy_command,
+        shim_path: None,
+      },
+    )
+    .await?;
   }
   let client = CadderClient::new(paths);
   let mut app = TuiApp {

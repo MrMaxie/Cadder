@@ -42,7 +42,22 @@ Shim registrations are tied to the IPC session that created them. If the shim pr
 
 ## Caddy Integration
 
-Real Caddy resolution checks `CADDER_CADDY_REAL_COMMAND` first, then searches PATH for `caddy-real` and `caddy` while excluding the current Cadder shim and `CADDER_CADDY_SHIM_PATH`.
+Real Caddy resolution is layered and recursion-safe. The effective command is selected in this order:
+
+1. CLI override.
+2. `cadder.toml` in the current working directory.
+3. `cadder.toml` next to the executable.
+4. Environment variables, including `CADDER_CADDY_REAL_COMMAND`.
+5. `caddy` on PATH as the final fallback.
+
+The TOML schema is:
+
+```toml
+[caddy]
+real_command = "/absolute/path/to/caddy"
+```
+
+Cadder no longer treats `caddy-real` as a built-in default. Users may still configure `caddy-real` explicitly through CLI, TOML, or environment variables. PATH fallback excludes the current executable and the known shim path from `CADDER_CADDY_SHIM_PATH`; when the shim starts the daemon, it passes its own path through that variable.
 
 For each registration, Cadder runs:
 
@@ -50,9 +65,22 @@ For each registration, Cadder runs:
 caddy adapt --config <Caddyfile> --adapter <adapter>
 ```
 
-The adapted JSON is inspected for HTTP host matchers. Active domains are composed into a generated effective Caddy JSON document. Domain conflicts are reported before runtime reload. When no active domains remain, the daemon enters idle config/runtime state instead of reloading an empty active config.
+The adapted JSON is inspected for HTTP host matchers. The adapter resolves real Caddy against the registration's source working directory, so project-local `cadder.toml` files are honored for shim-driven `caddy run` registrations from arbitrary directories. Active domains are composed into a generated effective Caddy JSON document. Domain conflicts are reported before runtime reload. When no active domains remain, the daemon enters idle config/runtime state instead of reloading an empty active config.
 
 Runtime operations start the owned real Caddy process with the generated config and reload it on subsequent config changes. Captured stdout/stderr and control events are stored in a bounded log store with redaction for token-like values.
+
+## Portable Packaging
+
+`cargo run -p xtask -- dist --out <dir>` builds release binaries and copies the current platform's executable names into a portable layout:
+
+- `cadderd`
+- `cadder-tui`
+- `caddy`
+- `cadder.toml`
+
+On Windows the binaries include the `.exe` suffix. `cargo run -p xtask -- verify-dist --dir <dir>` checks the expected files and runs `caddy --cadder-shim-info` from the layout. The packaging workflow does not modify PATH, shell profiles, package-manager shims, OS services, or other system state.
+
+The current runtime model remains a single per-user daemon that owns the backend and serves the TUI/dashboard state. A future detached backend with multiple independent dashboards is intentionally outside the current implementation.
 
 ## Workspace Layout
 

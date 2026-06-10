@@ -322,15 +322,37 @@ impl CadderSession {
   }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DaemonLaunchOptions {
+  pub explicit_daemon: Option<PathBuf>,
+  pub real_caddy_command: Option<String>,
+  pub shim_path: Option<PathBuf>,
+}
+
 pub async fn ensure_daemon_running(
   paths: &RuntimePaths,
   explicit_daemon: Option<PathBuf>,
+) -> Result<()> {
+  ensure_daemon_running_with_options(
+    paths,
+    DaemonLaunchOptions {
+      explicit_daemon,
+      ..DaemonLaunchOptions::default()
+    },
+  )
+  .await
+}
+
+pub async fn ensure_daemon_running_with_options(
+  paths: &RuntimePaths,
+  options: DaemonLaunchOptions,
 ) -> Result<()> {
   if can_connect(paths).await {
     return Ok(());
   }
 
-  let daemon = explicit_daemon
+  let daemon = options
+    .explicit_daemon
     .or_else(|| sibling_binary("cadderd"))
     .or_else(|| find_on_path("cadderd"))
     .ok_or_else(|| anyhow!("could not find `cadderd`; pass --daemon-path or add it to PATH"))?;
@@ -338,12 +360,19 @@ pub async fn ensure_daemon_running(
   let mut command = Command::new(daemon);
   configure_background_daemon(&mut command);
   command
+    .arg("--runtime-dir")
+    .arg(paths.runtime_dir())
     .arg("--detach-ready")
     .stdin(Stdio::null())
     .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .spawn()
-    .context("start cadderd")?;
+    .stderr(Stdio::null());
+  if let Some(real_caddy_command) = options.real_caddy_command {
+    command.arg("--real-caddy-command").arg(real_caddy_command);
+  }
+  if let Some(shim_path) = options.shim_path {
+    command.env("CADDER_CADDY_SHIM_PATH", shim_path);
+  }
+  command.spawn().context("start cadderd")?;
 
   for _ in 0..50 {
     if can_connect(paths).await {

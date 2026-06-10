@@ -1,4 +1,5 @@
 mod caddy;
+mod config;
 mod ipc;
 mod logs;
 mod paths;
@@ -6,7 +7,11 @@ mod runtime;
 mod state;
 
 pub use caddy::{CaddyConfigAdapter, CaddyConfigCoordinator, RealCaddyResolver};
-pub use ipc::{CadderClient, CadderSession, DaemonServer, ensure_daemon_running};
+pub use config::{CONFIG_FILE_NAME, CadderConfig, CaddyRuntimeConfig};
+pub use ipc::{
+  CadderClient, CadderSession, DaemonLaunchOptions, DaemonServer, ensure_daemon_running,
+  ensure_daemon_running_with_options,
+};
 pub use logs::{CaddyLogStore, Redactor};
 pub use paths::{DaemonLock, RuntimePaths};
 pub use runtime::ProcessRuntime;

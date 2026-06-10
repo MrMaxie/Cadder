@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, anyhow};
-use cadder_daemon::{CadderSession, RealCaddyResolver, RuntimePaths, ensure_daemon_running};
+use cadder_daemon::{
+  CadderSession, DaemonLaunchOptions, RealCaddyResolver, RuntimePaths,
+  ensure_daemon_running_with_options,
+};
 use cadder_protocol::{
   ActivationState, BasicResponse, EntrypointInstanceIdentity, EntrypointRegistration,
   HeartbeatEntrypointRequest, LogStreamIdentity, OwnerProcessIdentity, RegisterEntrypointRequest,
@@ -24,6 +27,9 @@ struct ShimArgs {
 
   #[arg(long = "cadder-daemon-path", hide = true)]
   daemon_path: Option<PathBuf>,
+
+  #[arg(long = "cadder-real-caddy-command", hide = true)]
+  real_caddy_command: Option<String>,
 
   #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
   caddy_args: Vec<String>,
@@ -51,13 +57,21 @@ async fn main() -> Result<ExitCode> {
   if args.caddy_args.first().is_some_and(|arg| arg == "run") {
     run_managed(args).await
   } else {
-    delegate_to_real_caddy(&args.caddy_args).await
+    delegate_to_real_caddy(args.real_caddy_command, &args.caddy_args).await
   }
 }
 
 async fn run_managed(args: ShimArgs) -> Result<ExitCode> {
   let paths = RuntimePaths::resolve(args.runtime_dir)?;
-  ensure_daemon_running(&paths, args.daemon_path).await?;
+  ensure_daemon_running_with_options(
+    &paths,
+    DaemonLaunchOptions {
+      explicit_daemon: args.daemon_path,
+      real_caddy_command: args.real_caddy_command,
+      shim_path: env::current_exe().ok(),
+    },
+  )
+  .await?;
   let session = std::sync::Arc::new(Mutex::new(CadderSession::connect(&paths).await?));
   let registration = build_registration(&args.caddy_args)?;
   let registration_id = registration.registration_id.clone();
@@ -177,9 +191,18 @@ fn parse_run_args(args: &[String], cwd: &std::path::Path) -> (PathBuf, Option<St
   (config.unwrap_or_else(|| cwd.join("Caddyfile")), adapter)
 }
 
-async fn delegate_to_real_caddy(args: &[String]) -> Result<ExitCode> {
-  let resolver = RealCaddyResolver::new(None);
-  let binary = resolver.resolve()?;
+async fn delegate_to_real_caddy(
+  real_caddy_command: Option<String>,
+  args: &[String],
+) -> Result<ExitCode> {
+  let resolver = RealCaddyResolver::new(real_caddy_command);
+  let binary = match resolver.resolve() {
+    Ok(binary) => binary,
+    Err(error) => {
+      eprintln!("{}", RealCaddyResolver::resolution_help(&error));
+      return Ok(ExitCode::FAILURE);
+    }
+  };
   let status = Command::new(binary)
     .args(args)
     .stdin(Stdio::inherit())

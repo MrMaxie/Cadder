@@ -3,11 +3,11 @@ id: TASK-1.11
 title: >-
   Package portable cross-platform binaries and configurable Caddy runtime
   resolution
-status: In Progress
+status: Done
 assignee:
   - '@agent'
 created_date: '2026-06-09 11:44'
-updated_date: '2026-06-10 12:03'
+updated_date: '2026-06-10 12:28'
 labels: []
 dependencies:
   - TASK-1.2
@@ -19,18 +19,17 @@ documentation:
   - docs/ARCHITECTURE.md
   - 'https://docs.rs/figment/latest/figment/'
 modified_files:
-  - Cargo.toml
   - Cargo.lock
+  - README.md
   - crates/cadder-daemon/Cargo.toml
-  - crates/cadder-daemon/src/lib.rs
+  - crates/cadder-daemon/src/config.rs
   - crates/cadder-daemon/src/caddy.rs
   - crates/cadder-daemon/src/ipc.rs
-  - crates/cadderd/src/main.rs
+  - crates/cadder-daemon/src/lib.rs
   - crates/cadder-shim/src/main.rs
   - crates/cadder-tui/src/main.rs
-  - xtask/src/main.rs
-  - README.md
   - docs/ARCHITECTURE.md
+  - xtask/src/main.rs
 parent_task_id: TASK-1
 priority: medium
 ordinal: 12000
@@ -44,11 +43,11 @@ Package Cadder as portable cross-platform Rust executables and add configurable 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Portable outputs include `cadderd`, `cadder-tui`, the current `caddy` shim binary, and a sample `cadder.toml` for the current platform without modifying PATH or other system state.
-- [ ] #2 Real Caddy command/path resolution uses layered configuration with precedence: CLI override, `cadder.toml` in the current working directory, `cadder.toml` next to the executable, environment variables, then `caddy` available on PATH as the final fallback.
-- [ ] #3 The shim can start or connect to the per-user daemon and register `caddy run` invocations from arbitrary project directories while honoring project-local layered configuration.
-- [ ] #4 Unsupported Caddy commands are delegated to the safely resolved real Caddy binary only after recursion-safe resolution; otherwise they fail with a clear Cadder-owned message explaining how to configure the real Caddy command.
-- [ ] #5 The portable build and verification workflow runs through Cargo/xtask on supported platforms and is not PowerShell-only.
+- [x] #1 Portable outputs include `cadderd`, `cadder-tui`, the current `caddy` shim binary, and a sample `cadder.toml` for the current platform without modifying PATH or other system state.
+- [x] #2 Real Caddy command/path resolution uses layered configuration with precedence: CLI override, `cadder.toml` in the current working directory, `cadder.toml` next to the executable, environment variables, then `caddy` available on PATH as the final fallback.
+- [x] #3 The shim can start or connect to the per-user daemon and register `caddy run` invocations from arbitrary project directories while honoring project-local layered configuration.
+- [x] #4 Unsupported Caddy commands are delegated to the safely resolved real Caddy binary only after recursion-safe resolution; otherwise they fail with a clear Cadder-owned message explaining how to configure the real Caddy command.
+- [x] #5 The portable build and verification workflow runs through Cargo/xtask on supported platforms and is not PowerShell-only.
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -116,6 +115,12 @@ Package Cadder as portable OS-specific Rust executables and make real Caddy runt
 
 <!-- SECTION:NOTES:BEGIN -->
 Plan approved by the user and recorded before implementation. Scope was corrected from installer/PATH ownership to portable OS-specific executables, user-managed optional PATH/shim setup, and layered real Caddy configuration. The user's `caddy-real` setup is local context only, not a promoted product workflow.
+
+Implemented TASK-1.11 portable packaging and layered real Caddy resolution. Added a Figment-backed `cadder.toml` configuration model with precedence CLI override -> current working directory `cadder.toml` -> executable-adjacent `cadder.toml` -> environment variables including `CADDER_CADDY_REAL_COMMAND` -> safe `caddy` on PATH. Removed the built-in `caddy-real` fallback; it remains supported only when explicitly configured. The shim now passes its path to daemon startup for recursion-safe resolution, can pass a hidden real-Caddy CLI override, and unsupported command delegation now prints a Cadder-owned configuration message when resolution fails. `ensure_daemon_running_with_options` now passes the selected runtime dir and launch options to `cadderd`. Added `xtask dist --out <dir>` and `xtask verify-dist --dir <dir>` to build/copy `cadderd`, `cadder-tui`, the `caddy` shim, and sample `cadder.toml` without modifying PATH or system state. Updated README and architecture docs with portable usage, config precedence, and current/future runtime model boundaries.
+
+Validation passed: `cargo fmt --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace`; `cargo run -p xtask -- check`; `cargo run -p xtask -- dist --out .local/verification/task-1.11/dist`. The `.local/verification/task-1.11` smoke artifacts were removed after verification.
+
+Closeout fresh-eyes review completed before marking Done. Re-read the changed resolver/config/shim/xtask/docs diff, verified acceptance criteria against the implementation, checked whitespace with `git diff --check`, and reran the focused project-local config test: `cargo test -p cadder-daemon adapter_resolves_real_caddy_from_registration_working_directory_config`. No substantive issue remained after the prior local fixes.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
@@ -133,3 +138,27 @@ created: 2026-06-10 10:44
 Rebaselined from Windows packaging/PATH work to cross-platform Rust binary installation and shim shadowing.
 ---
 <!-- COMMENTS:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+## Summary
+- Added a typed `cadder.toml` configuration model for real Caddy resolution with the required precedence: CLI override, project working-directory config, executable-adjacent config, environment variables, then safe `caddy` on PATH.
+- Removed `caddy-real` as an implicit fallback while preserving it as an explicitly configurable command.
+- Updated shim, daemon launch, and TUI startup wiring so the shim can start/connect to the per-user daemon, pass recursion-safety context, and honor project-local config for `caddy run` registrations.
+- Added Cadder-owned unsupported-command delegation diagnostics when no safe real Caddy binary can be resolved.
+- Added `xtask dist --out <dir>` and `xtask verify-dist --dir <dir>` for portable layouts containing `cadderd`, `cadder-tui`, `caddy`, and sample `cadder.toml` without modifying PATH or system state.
+- Updated README and architecture documentation for the portable model and runtime-resolution contract.
+
+## Validation
+- `cargo fmt --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
+- `cargo run -p xtask -- check`
+- `cargo run -p xtask -- dist --out .local/verification/task-1.11/dist`
+- `git diff --check`
+- Fresh focused check: `cargo test -p cadder-daemon adapter_resolves_real_caddy_from_registration_working_directory_config`
+
+## Risk / Follow-up
+- No installer, PATH mutation, OS service registration, or CI release publishing was added; those remain outside TASK-1.11 scope.
+<!-- SECTION:FINAL_SUMMARY:END -->
