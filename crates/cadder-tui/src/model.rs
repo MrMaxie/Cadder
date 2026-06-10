@@ -310,46 +310,63 @@ impl TuiModel {
 mod tests {
   use super::*;
   use cadder_protocol::{
-    ActivationState, ConfigState, EntrypointInstanceIdentity, LogStreamIdentity,
-    OwnerProcessIdentity, RegisteredDomain, RuntimeState, SourcePath,
+    ActivationState, ConfigApplyStatus, ConfigDiagnostic, ConfigState, EntrypointInstanceIdentity,
+    LogAttributionKind, LogEntryKind, LogStreamIdentity, OwnerProcessIdentity, QueryLogsResponse,
+    RegisteredDomain, RuntimeDiagnostic, RuntimeState, RuntimeStatus, SourcePath,
   };
   use chrono::Utc;
 
-  fn snapshot() -> GuiStateSnapshot {
-    let now = Utc::now();
-    let identity = EntrypointInstanceIdentity {
-      instance_id: "shim-1".to_string(),
-      started_at_utc: now,
-      shim_session_nonce: "nonce".to_string(),
-    };
+  fn snapshot_with_registrations(registrations: Vec<EntrypointRegistration>) -> GuiStateSnapshot {
     GuiStateSnapshot {
-      captured_at_utc: now,
-      registrations: vec![EntrypointRegistration {
-        registration_id: "shim-1".to_string(),
-        entrypoint_instance: identity.clone(),
-        source_working_directory: SourcePath::new("/work/app", None),
-        source_config_path: SourcePath::new("/work/app/Caddyfile", None),
-        registered_domains: vec![
-          RegisteredDomain::active("app.localhost"),
-          RegisteredDomain {
-            activation_state: ActivationState::Inactive,
-            ..RegisteredDomain::active("api.localhost")
-          },
-        ],
-        activation_state: ActivationState::Active,
-        owner_process: OwnerProcessIdentity {
-          process_id: 1,
-          process_start_time_utc: now,
-          shim_session_nonce: identity.shim_session_nonce,
-          executable_path: None,
-        },
-        log_stream: LogStreamIdentity::entrypoint("shim-1"),
-        shim_run: None,
-        created_at_utc: now,
-        last_heartbeat_utc: now,
-      }],
+      captured_at_utc: Utc::now(),
+      registrations,
       runtime: RuntimeState::idle(),
       config: ConfigState::idle(),
+    }
+  }
+
+  fn snapshot() -> GuiStateSnapshot {
+    snapshot_with_registrations(vec![registration(
+      "shim-1",
+      "/work/app",
+      vec![
+        RegisteredDomain::active("app.localhost"),
+        RegisteredDomain {
+          activation_state: ActivationState::Inactive,
+          ..RegisteredDomain::active("api.localhost")
+        },
+      ],
+    )])
+  }
+
+  fn registration(
+    registration_id: &str,
+    working_directory: &str,
+    registered_domains: Vec<RegisteredDomain>,
+  ) -> EntrypointRegistration {
+    let now = Utc::now();
+    let identity = EntrypointInstanceIdentity {
+      instance_id: registration_id.to_string(),
+      started_at_utc: now,
+      shim_session_nonce: format!("{registration_id}-nonce"),
+    };
+    EntrypointRegistration {
+      registration_id: registration_id.to_string(),
+      entrypoint_instance: identity.clone(),
+      source_working_directory: SourcePath::new(working_directory, None),
+      source_config_path: SourcePath::new(format!("{working_directory}/Caddyfile"), None),
+      registered_domains,
+      activation_state: ActivationState::Active,
+      owner_process: OwnerProcessIdentity {
+        process_id: 1,
+        process_start_time_utc: now,
+        shim_session_nonce: identity.shim_session_nonce,
+        executable_path: None,
+      },
+      log_stream: LogStreamIdentity::entrypoint(registration_id),
+      shim_run: None,
+      created_at_utc: now,
+      last_heartbeat_utc: now,
     }
   }
 
@@ -375,6 +392,31 @@ mod tests {
 
     assert_eq!(domains.len(), 1);
     assert_eq!(domains[0].1.name.canonical, "api.localhost");
+  }
+
+  #[test]
+  fn domain_rows_keep_entrypoint_association() {
+    let mut model = TuiModel::default();
+    model.set_snapshot(snapshot_with_registrations(vec![
+      registration(
+        "shim-1",
+        "/work/app",
+        vec![RegisteredDomain::active("app.localhost")],
+      ),
+      registration(
+        "shim-2",
+        "/work/api",
+        vec![RegisteredDomain::active("api.localhost")],
+      ),
+    ]));
+
+    let domains = model.filtered_domains();
+
+    assert_eq!(domains.len(), 2);
+    assert_eq!(domains[0].0.registration_id, "shim-1");
+    assert_eq!(domains[0].1.name.canonical, "app.localhost");
+    assert_eq!(domains[1].0.registration_id, "shim-2");
+    assert_eq!(domains[1].1.name.canonical, "api.localhost");
   }
 
   #[test]
@@ -424,5 +466,93 @@ mod tests {
     assert_eq!(logs.next_cursor, None);
     assert_eq!(logs.minimum_severity, Some(LogSeverity::Error));
     assert!(logs.loading);
+  }
+
+  #[test]
+  fn log_response_applies_status_cursor_and_retention_metadata() {
+    let mut logs = LogViewModel {
+      target: Some(LogTarget {
+        registration_id: "shim-1".to_string(),
+        domain_name: "app.localhost".to_string(),
+        stream: LogStreamIdentity::domain("app.localhost"),
+      }),
+      loading: true,
+      request_in_flight: true,
+      ..LogViewModel::default()
+    };
+
+    logs.apply_response(QueryLogsResponse {
+      request_id: "logs".to_string(),
+      accepted: true,
+      message: "ok".to_string(),
+      stream: LogStreamIdentity::domain("app.localhost"),
+      stream_status: LogStreamStatus::Stale,
+      entries: vec![cadder_protocol::LogEntry {
+        sequence_number: 7,
+        timestamp_utc: Utc::now(),
+        severity: LogSeverity::Warn,
+        stream: LogStreamIdentity::domain("app.localhost"),
+        attribution_kind: LogAttributionKind::Domain,
+        entry_kind: LogEntryKind::Normal,
+        raw_message: "retained warning".to_string(),
+        domain_key: Some("app.localhost".to_string()),
+        source_registration_id: None,
+        source_instance_id: None,
+        operation: None,
+      }],
+      next_cursor: Some("seq:7".to_string()),
+      has_gap: true,
+      has_more_before: true,
+      truncated_by_retention: true,
+    });
+
+    assert!(!logs.loading);
+    assert!(!logs.request_in_flight);
+    assert_eq!(logs.status, LogStreamStatus::Stale);
+    assert_eq!(logs.next_cursor.as_deref(), Some("seq:7"));
+    assert!(logs.has_gap);
+    assert!(logs.has_more_before);
+    assert!(logs.truncated_by_retention);
+  }
+
+  #[test]
+  fn diagnostics_snapshot_is_available_to_diagnostics_view() {
+    let mut model = TuiModel::default();
+    let mut snapshot = snapshot();
+    snapshot.config = ConfigState {
+      status: ConfigApplyStatus::Failed,
+      last_attempted_at_utc: Some(Utc::now()),
+      last_successful_reload_at_utc: None,
+      effective_config_hash: None,
+      diagnostics: vec![ConfigDiagnostic {
+        code: "runtime-apply-failed".to_string(),
+        message: "reload failed".to_string(),
+        domain_key: None,
+        source_config_paths: vec!["/work/app/Caddyfile".to_string()],
+      }],
+    };
+    snapshot.runtime = RuntimeState {
+      status: RuntimeStatus::Unhealthy,
+      binary_path: None,
+      version: None,
+      process_id: None,
+      admin_endpoint: None,
+      diagnostics: vec![RuntimeDiagnostic {
+        code: "runtime-error".to_string(),
+        message: "process exited".to_string(),
+        operation: Some("run".to_string()),
+      }],
+    };
+
+    model.set_snapshot(snapshot);
+
+    assert_eq!(
+      model.snapshot().config.diagnostics[0].code,
+      "runtime-apply-failed"
+    );
+    assert_eq!(
+      model.snapshot().runtime.diagnostics[0].code,
+      "runtime-error"
+    );
   }
 }
