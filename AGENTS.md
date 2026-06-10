@@ -36,6 +36,9 @@ cargo run -p xtask -- check
 - Run focused tests after narrow edits, then run the full relevant validation before closeout or commit.
 - Use `cargo add`, `cargo remove`, or another Cargo command for dependency changes; do not hand-edit dependency entries.
 - Keep automated tests independent of a locally installed real Caddy unless explicitly marked ignored. Prefer fake Caddy fixtures for lifecycle/config/runtime tests.
+- Application have to be well tested (at least 85% coverage) and well documented (docs/ with Astro + Starlight theme, that allows to create nice documentation pages).
+- Application have to be building on CI/CD pipeline (GitHub Actions) and release artifacts have to be published to GitHub Releases.
+- Documentation have to be written in English, and be regenerated and published via Github Actions as well.
 
 ## Engineering Notes
 
@@ -51,6 +54,15 @@ cargo run -p xtask -- check
 - Use `$backlogmd-task-*` skills for Backlog.md intake, execution, review, and closeout.
 - Use `$commit-work` when staging or committing changes.
 - Use `$agents-md-maintainer` when updating agent instructions.
+- Use `$are-you-sure` after making any changes to code, for performing fresh-eyes self-review.
+- Use `$caddy` as general-purpose reference for Caddy-specific knowledge needed in business layer of this code.
+- Use `$code-simplifier` after making any changes to code, to simplify the code for readability or performance.
+- Use `$handoff` when you are asked about handoff to other agents.
+- Use `$humanizer` when you are creating or updating user-facing text.
+- Use `$ratatui-tui` for Rust production code in this application.
+- Use `$rust-async-patterns` for Rust production code in this application that uses async patterns.
+- Use `$rust-best-practices` for Rust production code in this application that follows best practices.
+- Use `$rust-profiling` for Rust production code in this application to make application more performant.
 
 ## Commit Rules
 
