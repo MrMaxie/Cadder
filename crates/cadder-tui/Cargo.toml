@@ -1,7 +1,10 @@
 [package]
 name = "cadder-tui"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cadder terminal UI for daemon state, domains, logs, and diagnostics"
 
 [dependencies]
 anyhow = "1.0.102"

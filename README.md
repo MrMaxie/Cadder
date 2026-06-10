@@ -14,7 +14,13 @@ Cadder builds three executables:
 - `caddy` is the Caddy-compatible shim. For `caddy run`, it starts or connects to `cadderd`, registers the current project's Caddyfile, keeps that registration alive while the shim process runs, and unregisters on exit. Other Caddy commands are delegated to the safely resolved real Caddy binary.
 - `cadder-tui` is the terminal UI. It connects to the daemon, can start it unless `--no-start` is used, and shows overview state, entrypoints, domains, per-domain logs, diagnostics, filters, toggles, log export, and daemon shutdown.
 
+Each executable supports `--help` and `--version`. The command names, versions, and short descriptions match the Rust package metadata for the release.
+
 The daemon owns only the real Caddy process it starts. It does not enumerate or kill unrelated Caddy processes.
+
+## Visual assets
+
+`assets/banner.png` and `assets/logo.png` are checked in for documentation and release pages. Cadder's runtime commands do not load these files, and the portable layout works without image assets.
 
 ## Build and validate
 

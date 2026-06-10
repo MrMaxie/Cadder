@@ -1,7 +1,10 @@
 [package]
 name = "cadder-shim"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cadder PATH-facing Caddy shim"
 
 [[bin]]
 name = "caddy"

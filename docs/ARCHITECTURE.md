@@ -9,6 +9,8 @@ Cadder is a cross-platform Rust daemon, shim, and terminal UI for routing projec
 - `cadder-tui`: Ratatui/Crossterm UI. It connects to the daemon and shows overview, entrypoints, grouped domains, per-domain logs, diagnostics, search/filtering, and activation toggles.
 - Real Caddy runtime: resolved external binary. Cadder never embeds Caddy and must not recursively execute its own shim.
 
+All three Cadder binaries expose `--help` and `--version` through their Clap command definitions. The release-facing command names are `cadderd`, `caddy`, and `cadder-tui`.
+
 ## Cross-Platform Runtime Model
 
 Cadder uses per-user runtime paths from `directories::ProjectDirs`, with `CADDER_RUNTIME_DIR` as an override for tests and custom deployments. The daemon owns:
@@ -89,6 +91,8 @@ The log store reports stream status and retention metadata in `query-logs-respon
 - `cadder.toml`
 
 On Windows the binaries include the `.exe` suffix. `cargo run -p xtask -- verify-dist --dir <dir>` checks the expected files and runs `caddy --cadder-shim-info` from the layout. The packaging workflow does not modify PATH, shell profiles, package-manager shims, OS services, or other system state.
+
+Image assets under `assets/` are documentation and release artwork only. They are not copied into the runtime layout and are not required by the daemon, shim, TUI, or verification commands.
 
 The current runtime model remains a single per-user daemon that owns the backend and serves the TUI/dashboard state. A future detached backend with multiple independent dashboards is intentionally outside the current implementation.
 

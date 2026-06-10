@@ -20,7 +20,12 @@ use std::{
 use tokio::{process::Command, sync::Mutex, time::interval};
 
 #[derive(Debug, Parser)]
-#[command(name = "caddy", version, about = "Cadder PATH-facing Caddy shim")]
+#[command(
+  name = "caddy",
+  version,
+  about = "Cadder PATH-facing Caddy shim",
+  long_about = "Acts as the Cadder-managed caddy command. `caddy run` starts or connects to cadderd and registers the current project; other commands are delegated to the safely resolved real Caddy binary."
+)]
 struct ShimArgs {
   #[arg(long = "cadder-runtime-dir", hide = true)]
   runtime_dir: Option<PathBuf>,
@@ -31,7 +36,12 @@ struct ShimArgs {
   #[arg(long = "cadder-real-caddy-command", hide = true)]
   real_caddy_command: Option<String>,
 
-  #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+  #[arg(
+    value_name = "CADDY_ARGS",
+    trailing_var_arg = true,
+    allow_hyphen_values = true,
+    help = "Arguments for the caddy command; `run` is managed by Cadder and other commands are delegated to real Caddy"
+  )]
   caddy_args: Vec<String>,
 }
 
@@ -217,6 +227,43 @@ async fn delegate_to_real_caddy(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use clap::CommandFactory;
+
+  #[test]
+  fn command_metadata_matches_release_identity() {
+    let command = ShimArgs::command();
+
+    assert_eq!(command.get_name(), "caddy");
+    assert_eq!(command.get_version(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+      command.get_about().map(ToString::to_string),
+      Some(env!("CARGO_PKG_DESCRIPTION").to_string())
+    );
+  }
+
+  #[test]
+  fn short_help_uses_package_description() {
+    let help = ShimArgs::command().render_help().to_string();
+
+    assert!(
+      help.contains(env!("CARGO_PKG_DESCRIPTION")),
+      "short help output should include the package description: {help}"
+    );
+  }
+
+  #[test]
+  fn long_help_describes_managed_and_delegated_commands() {
+    let help = ShimArgs::command().render_long_help().to_string();
+
+    assert!(
+      help.contains("`run` is managed by Cadder"),
+      "long help output should describe managed caddy run behavior: {help}"
+    );
+    assert!(
+      help.contains("delegated to real Caddy"),
+      "long help output should describe delegation behavior: {help}"
+    );
+  }
 
   #[test]
   fn parses_config_and_adapter_flags() {

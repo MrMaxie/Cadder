@@ -27,18 +27,32 @@ use std::{
 use tokio::sync::mpsc;
 
 #[derive(Debug, Parser)]
-#[command(name = "cadder-tui", version, about = "Cadder terminal UI")]
+#[command(
+  name = "cadder-tui",
+  version,
+  about = "Cadder terminal UI for daemon state, domains, logs, and diagnostics",
+  long_about = "Opens the Cadder terminal UI. It connects to cadderd, starts it by default, and displays entrypoints, domains, logs, diagnostics, activation controls, and daemon shutdown."
+)]
 struct Args {
-  #[arg(long)]
+  #[arg(
+    long,
+    help = "Override the Cadder runtime directory used to find daemon IPC and state"
+  )]
   runtime_dir: Option<PathBuf>,
 
-  #[arg(long)]
+  #[arg(long, help = "Path to a cadderd executable to start when needed")]
   daemon_path: Option<PathBuf>,
 
-  #[arg(long)]
+  #[arg(
+    long,
+    help = "Command or path passed to cadderd for starting the real Caddy binary"
+  )]
   real_caddy_command: Option<String>,
 
-  #[arg(long)]
+  #[arg(
+    long,
+    help = "Connect to an existing daemon instead of starting cadderd"
+  )]
   no_start: bool,
 }
 
@@ -718,3 +732,49 @@ impl TuiApp {
 
 #[allow(dead_code)]
 fn _assert_snapshot_send_sync(_: &GuiStateSnapshot) {}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use clap::CommandFactory;
+
+  #[test]
+  fn command_metadata_matches_release_identity() {
+    let command = Args::command();
+
+    assert_eq!(command.get_name(), "cadder-tui");
+    assert_eq!(command.get_version(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+      command.get_about().map(ToString::to_string),
+      Some(env!("CARGO_PKG_DESCRIPTION").to_string())
+    );
+  }
+
+  #[test]
+  fn short_help_uses_package_description() {
+    let help = Args::command().render_help().to_string();
+
+    assert!(
+      help.contains(env!("CARGO_PKG_DESCRIPTION")),
+      "short help output should include the package description: {help}"
+    );
+  }
+
+  #[test]
+  fn long_help_describes_tui_launch_options() {
+    let help = Args::command().render_long_help().to_string();
+
+    assert!(
+      help.contains("Override the Cadder runtime directory"),
+      "long help output should describe --runtime-dir: {help}"
+    );
+    assert!(
+      help.contains("Path to a cadderd executable"),
+      "long help output should describe --daemon-path: {help}"
+    );
+    assert!(
+      help.contains("Connect to an existing daemon"),
+      "long help output should describe --no-start: {help}"
+    );
+  }
+}
