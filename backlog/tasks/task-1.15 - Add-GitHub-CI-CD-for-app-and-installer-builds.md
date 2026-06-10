@@ -1,10 +1,10 @@
 ---
 id: TASK-1.15
-title: Add GitHub CI/CD for Rust binaries and release artifacts
+title: Add GitHub CI/CD for Rust portable binaries and release artifacts
 status: To Do
 assignee: []
 created_date: '2026-06-09 18:45'
-updated_date: '2026-06-10 11:29'
+updated_date: '2026-06-10 12:04'
 labels: []
 dependencies:
   - TASK-1.11
@@ -24,16 +24,16 @@ ordinal: 15000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Add CI/CD for the Rust workspace and cross-platform binary artifacts. The pipeline should validate formatting, Clippy, tests, and release builds for `cadderd`, `caddy`, and `cadder-tui` on supported platforms.
+Add CI/CD for the Rust workspace and cross-platform portable binary artifacts. The pipeline should validate formatting, Clippy, tests, and release builds for `cadderd`, `caddy`, and `cadder-tui` on supported platforms, then publish portable archives without relying on OS installers or system PATH mutation.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [ ] #1 CI runs `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`.
-- [ ] #2 CI builds release artifacts for `cadderd`, `caddy`, and `cadder-tui` on Windows, Linux, and macOS or documents any platform intentionally deferred.
-- [ ] #3 Release packaging does not depend on WinUI, Windows App SDK, MSIX, NuGet, or .NET SDK.
+- [ ] #2 CI builds portable release artifacts for `cadderd`, `caddy`, and `cadder-tui` on Windows, Linux, and macOS or documents any platform intentionally deferred.
+- [ ] #3 Release packaging does not depend on WinUI, Windows App SDK, MSIX, NuGet, .NET SDK, shell profile edits, package-manager shims, or installer-specific state changes.
 - [ ] #4 CI uses fake Caddy fixtures for automated tests and does not require a machine-global real Caddy install.
-- [ ] #5 Release workflow publishes versioned artifacts to GitHub Releases for supported platforms or documents any platform intentionally deferred.
+- [ ] #5 Release workflow publishes versioned portable archives to GitHub Releases for supported platforms or documents any platform intentionally deferred.
 - [ ] #6 GitHub Actions builds and publishes the generated documentation after the Astro Starlight documentation site exists.
 <!-- AC:END -->
 
@@ -50,5 +50,10 @@ author: agent
 created: 2026-06-10 11:29
 ---
 Expanded from base Rust CI/CD to include the new AGENTS.md requirements for GitHub Releases artifact publishing and generated documentation publishing. Added TASK-1.16 as a dependency because documentation publishing needs the Astro Starlight site first.
+---
+
+created: 2026-06-10 12:04
+---
+TASK-1.11 planning clarified that Cadder should publish portable executables/archives, not installers or package-manager-specific PATH changes. CI/CD release artifacts should preserve that boundary.
 ---
 <!-- COMMENTS:END -->
