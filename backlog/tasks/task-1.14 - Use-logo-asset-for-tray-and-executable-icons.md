@@ -1,9 +1,10 @@
 ---
 id: TASK-1.14
-title: Use logo asset for tray and executable icons
+title: Add cross-platform release metadata and terminal branding
 status: To Do
 assignee: []
 created_date: '2026-06-09 16:10'
+updated_date: '2026-06-10 10:44'
 labels: []
 dependencies:
   - TASK-1.11
@@ -32,14 +33,23 @@ ordinal: 14000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Make the existing `assets/logo.png` the source branding asset for Cadder's Windows identity surfaces. The tray icon, window or title-bar icon, packaged app logos, and generated executable or published file icons should all use the Cadder logo instead of scaffold or default Windows assets, while keeping the current WinUI tray host behavior intact.
+Replace the previous Windows tray/executable icon scope with cross-platform release metadata and lightweight terminal branding. Cadder should not depend on Windows tray icons or Windows App SDK assets in the final Rust implementation.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The WinUI tray host uses icon assets derived from `assets/logo.png` for the notification-area tray icon and does not fall back to the default Windows application icon during normal builds.
-- [ ] #2 The app window, title bar, taskbar, and other visible WinUI app identity surfaces display Cadder branding derived from `assets/logo.png`.
-- [ ] #3 The project or packaging configuration assigns a branded icon to produced `Cadder.Tray.WinUI.exe` artifacts where supported, including file Explorer display and file properties after build or publish.
-- [ ] #4 MSIX/package logo assets under `src/Cadder.Tray.WinUI/Assets` are regenerated or replaced from `assets/logo.png` at the required Windows asset sizes and remain referenced correctly from `Package.appxmanifest`.
-- [ ] #5 A local build or publish verification confirms the icon files are included in output artifacts, and a manual or automated Windows visual check verifies the tray and executable icons render as expected.
+- [ ] #1 Rust binaries expose consistent names, versions, descriptions, and help text through `--help` and `--version`.
+- [ ] #2 README and architecture docs describe the `cadderd`, `caddy`, and `cadder-tui` binaries and the cross-platform install model.
+- [ ] #3 Any retained image or logo assets are optional documentation/release assets and are not required for runtime behavior.
+- [ ] #4 No Windows tray icon, WinUI asset, or Windows App SDK packaging requirement remains in the final build path.
 <!-- AC:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+author: @agent
+created: 2026-06-10 10:44
+---
+Rebaselined from Windows tray/executable icon work to cross-platform release metadata because the user explicitly redirected the project to Rust + Ratatui and no Windows-only GUI.
+---
+<!-- COMMENTS:END -->

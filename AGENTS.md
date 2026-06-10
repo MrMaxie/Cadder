@@ -2,7 +2,7 @@
 
 ## Project
 
-Cadder is a Windows tray daemon that routes project-local `caddy.exe` invocations into one persistent real Caddy runtime. Treat `docs/ARCHITECTURE.md` and Backlog.md tasks as the source of truth for process boundaries, task scope, and planned work.
+Cadder is a cross-platform Rust Caddy coordinator. It provides a per-user daemon (`cadderd`), a PATH-facing `caddy` shim, and a minimal Ratatui terminal UI (`cadder-tui`). Treat `docs/ARCHITECTURE.md` and Backlog.md tasks as the source of truth for process boundaries, task scope, and planned work.
 
 ## Local Workspace Rules
 
@@ -14,54 +14,43 @@ Cadder is a Windows tray daemon that routes project-local `caddy.exe` invocation
 
 ## Repo Layout
 
-- `src/Cadder.Contracts`: shared DTOs, IPC contracts, and process role names.
-- `src/Cadder.Daemon`: daemon lifecycle, registration store, IPC endpoint, Caddy config composition, and real Caddy runtime boundary.
-- `src/Cadder.CaddyShim`: PATH-facing `caddy.exe` shim.
-- `src/Cadder.Tray.WinUI`: WinUI 3 tray/daemon host.
-- `tests/Cadder.Contracts.Tests`: contract serialization and shape tests.
-- `tests/Cadder.Daemon.Tests`: daemon, shim, IPC, config, and runtime tests.
+- `crates/cadder-protocol`: shared DTOs, IPC envelopes, and request/response contracts.
+- `crates/cadder-daemon`: daemon state, local IPC, lockfiles, Caddy integration, runtime process management, and log storage.
+- `crates/cadderd`: daemon binary.
+- `crates/cadder-shim`: package that builds the PATH-facing `caddy` shim binary.
+- `crates/cadder-tui`: Ratatui/Crossterm terminal UI.
+- `xtask`: validation task runner.
 - `docs/ARCHITECTURE.md`: durable architecture notes.
 
 ## Build And Validation
 
-Use PowerShell from the repository root.
+Use Cargo from the repository root.
 
-```powershell
-dotnet test tests\Cadder.Contracts.Tests\Cadder.Contracts.Tests.csproj -p:Platform=x64 -p:RuntimeIdentifier=win-x64
-dotnet test tests\Cadder.Daemon.Tests\Cadder.Daemon.Tests.csproj -p:Platform=x64 -p:RuntimeIdentifier=win-x64
-dotnet test Cadder.slnx -p:Platform=x64 -p:RuntimeIdentifier=win-x64
-.\build.ps1
-dotnet format Cadder.slnx --verify-no-changes
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p xtask -- check
 ```
 
 - Run focused tests after narrow edits, then run the full relevant validation before closeout or commit.
-- Avoid running multiple `dotnet restore/build/test` commands in parallel against the same projects; this can corrupt or race `project.assets.json` and output DLL writes.
-- For WinUI changes, build `src\Cadder.Tray.WinUI\Cadder.Tray.WinUI.csproj` with `-p:Platform=x64 -p:RuntimeIdentifier=win-x64`.
+- Use `cargo add`, `cargo remove`, or another Cargo command for dependency changes; do not hand-edit dependency entries.
+- Keep automated tests independent of a locally installed real Caddy unless explicitly marked ignored. Prefer fake Caddy fixtures for lifecycle/config/runtime tests.
 
-## Debugging Notes
+## Engineering Notes
 
-- Read [AGENTS_DEBUG.md](AGENTS_DEBUG.md) before investigating WinUI, UI Automation, Windows input/clicking, process lifetime, or flaky validation problems.
-- Record new recurring debugging lessons in `AGENTS_DEBUG.md` instead of repeating them in this file.
+- Cadder is cross-platform by default. OS-specific code must sit behind a small abstraction and keep Windows, Linux, and macOS behavior explicit.
+- Runtime state is per user and rooted in `directories::ProjectDirs`, with `CADDER_RUNTIME_DIR` available for tests and custom deployments.
+- IPC is versioned newline-delimited JSON over a per-user local socket via `interprocess`.
+- The `caddy` shim must never recursively execute itself when Cadder needs real Caddy. Real Caddy resolution checks `CADDER_CADDY_REAL_COMMAND` before PATH.
+- The daemon owns only the real Caddy process it starts. It must not enumerate or kill unrelated Caddy processes.
 
 ## Skill Routing
 
-Actively use available skills and helpers when they can improve correctness or reduce uncertainty.
-
-- Use `$dotnet-csharp` for C# production code, async, process management, contracts, and runtime boundaries.
-- Use `$dotnet-testing` for xUnit, fake/spy design, integration boundaries, and validation strategy.
-- Use `$winui-app` for WinUI 3 app structure, XAML, lifecycle, packaging, and launch behavior.
-- Use `$winui-ui-testing` for WinUI UI verification. Prefer `winapp ui` scripted tests and screenshots. Do not default to legacy pywinauto UIA for WinUI unless `winapp ui` is unavailable or explicitly unsuitable.
-- Use `$windows-desktop-e2e` only for non-WinUI desktop automation or as a fallback after `winui-ui-testing` has been tried.
+- Use `$rust-pro` for Rust production code, async, process management, ownership-heavy design, contracts, and runtime boundaries.
 - Use `$backlogmd-task-*` skills for Backlog.md intake, execution, review, and closeout.
 - Use `$commit-work` when staging or committing changes.
 - Use `$agents-md-maintainer` when updating agent instructions.
-
-## WinUI UI Testing
-
-- Prefer running the built app from its output directory and target it by PID or HWND with `winapp ui`.
-- Add stable `AutomationProperties.AutomationId` values for controls that tests need to assert or invoke.
-- Capture screenshots with `winapp ui screenshot` and inspect them visually for clipping, overlap, missing content, and layout issues.
-- If `winapp ui inspect` cannot see child controls, record the limitation clearly and keep the screenshot evidence; do not claim child-level automation passed.
 
 ## Commit Rules
 

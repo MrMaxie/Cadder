@@ -1,9 +1,10 @@
 ---
 id: TASK-1.15
-title: Add GitHub CI/CD for app and installer builds
+title: Add GitHub CI/CD for Rust binaries and release artifacts
 status: To Do
 assignee: []
 created_date: '2026-06-09 18:45'
+updated_date: '2026-06-10 11:06'
 labels: []
 dependencies:
   - TASK-1.11
@@ -20,14 +21,23 @@ ordinal: 15000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Add a GitHub-based CI/CD workflow that validates Cadder on pull requests and produces build artifacts for the Windows application together with its installer or package output. The workflow should align with the existing Windows x64 build requirements and consume the installer/package shape defined by TASK-1.11 rather than inventing a separate distribution path.
+Add CI/CD for the Rust workspace and cross-platform binary artifacts. The pipeline should validate formatting, Clippy, tests, and release builds for `cadderd`, `caddy`, and `cadder-tui` on supported platforms.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Pull requests run a GitHub workflow that restores and builds the solution using the repository's Windows x64 build requirements.
-- [ ] #2 The workflow runs the relevant automated tests for Cadder and reports failures through GitHub checks.
-- [ ] #3 A release or manually triggered workflow produces downloadable artifacts for the Cadder application and the installer/package output.
-- [ ] #4 The CI/CD workflow documents required runner prerequisites, signing or certificate assumptions, and any secrets or manual release inputs without committing private credentials.
-- [ ] #5 The workflow is kept consistent with build.ps1 and the packaging behavior from TASK-1.11 so local and CI builds do not diverge.
+- [ ] #1 CI runs `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`.
+- [ ] #2 CI builds release artifacts for `cadderd`, `caddy`, and `cadder-tui` on Windows, Linux, and macOS or documents any platform intentionally deferred.
+- [ ] #3 Release packaging does not depend on WinUI, Windows App SDK, MSIX, NuGet, or .NET SDK.
+- [ ] #4 CI uses fake Caddy fixtures for automated tests and does not require a machine-global real Caddy install.
 <!-- AC:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+author: @agent
+created: 2026-06-10 11:06
+---
+Rebaselined from app/installer CI to Rust binary CI/CD after the project pivot away from .NET/WinUI.
+---
+<!-- COMMENTS:END -->

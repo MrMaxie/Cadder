@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@agent'
 created_date: '2026-06-09 11:43'
-updated_date: '2026-06-09 20:17'
+updated_date: '2026-06-10 11:06'
 labels: []
 dependencies:
   - TASK-1.4
@@ -143,6 +143,16 @@ Follow-up validation after investigating the UIA crash: reduced unnecessary page
 
 Closeout validation on 2026-06-09: `dotnet test tests\Cadder.Tray.WinUI.Tests\Cadder.Tray.WinUI.Tests.csproj -p:Platform=x64 -p:RuntimeIdentifier=win-x64` passed (14/14), `dotnet test Cadder.slnx -p:Platform=x64 -p:RuntimeIdentifier=win-x64` passed (74/74), `dotnet build src\Cadder.Tray.WinUI\Cadder.Tray.WinUI.csproj -p:Platform=x64 -p:RuntimeIdentifier=win-x64` passed with 0 warnings and 0 errors, `./build.ps1` passed, and `dotnet format Cadder.slnx --verify-no-changes` exited 0 with a generic workspace-loading warning. Visual/UIA limitation remains as previously recorded: `winapp ui inspect` destabilizes the WinUI process on this machine, so final UI validation relies on PrintWindow screenshots under `.local/verification/TASK-1.9/`, especially `09-final-programmatic-pages-printwindow.png`.
 <!-- SECTION:NOTES:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+author: @agent
+created: 2026-06-10 11:06
+---
+Superseded by the Rust cross-platform rewrite on 2026-06-10. The WinUI panel implementation was removed from the final codebase; future overview/registry UI work lives in `cadder-tui`.
+---
+<!-- COMMENTS:END -->
 
 ## Final Summary
 

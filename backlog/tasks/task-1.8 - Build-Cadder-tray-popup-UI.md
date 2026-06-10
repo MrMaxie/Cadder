@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@agent'
 created_date: '2026-06-09 11:43'
-updated_date: '2026-06-09 18:40'
+updated_date: '2026-06-10 11:06'
 labels: []
 dependencies:
   - TASK-1.4
@@ -146,6 +146,16 @@ Closeout blocker fixed: `TrayPopupWindow` now restores a rejected/failed domain 
 
 Post-closeout test fixture correction: the daemon Caddyfile adapter test no longer reads `D:\Projects\Selleo\smarketing\apps\reverse-proxy\Caddyfile`. It now uses the repository-local fixture `tests\Cadder.Daemon.Tests\Fixtures\SmarketingReverseProxy.Caddyfile`, copied into the test output by `Cadder.Daemon.Tests.csproj`. Validation after the correction: `dotnet test tests\Cadder.Daemon.Tests\Cadder.Daemon.Tests.csproj -p:Platform=x64 -p:RuntimeIdentifier=win-x64` passed 54/54; `dotnet test Cadder.slnx -p:Platform=x64 -p:RuntimeIdentifier=win-x64` passed 65/65; `dotnet format Cadder.slnx --verify-no-changes` exited 0 with a workspace-load warning.
 <!-- SECTION:NOTES:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+author: @agent
+created: 2026-06-10 11:06
+---
+Superseded by the Rust cross-platform rewrite on 2026-06-10. The WinUI tray popup implementation was removed from the final codebase; future UI work lives in `cadder-tui` and related TUI tasks.
+---
+<!-- COMMENTS:END -->
 
 ## Final Summary
 
