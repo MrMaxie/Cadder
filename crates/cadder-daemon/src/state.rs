@@ -1,12 +1,12 @@
 use crate::{
-    CaddyConfigCoordinator,
-    logs::{CaddyLogStore, LogQuery},
+  CaddyConfigCoordinator,
+  logs::{CaddyLogStore, LogQuery},
 };
 use cadder_protocol::{
-    ActivationState, BasicResponse, ConfigState, EntrypointRegistration, GuiStateSnapshot,
-    HeartbeatEntrypointRequest, LogStreamIdentity, QueryLogsResponse, QueryStateResponse,
-    RegisterEntrypointResponse, RuntimeState, SetDomainEnabledRequest, SetEntrypointEnabledRequest,
-    StateChangeKind, StateChangedEvent,
+  ActivationState, BasicResponse, ConfigState, EntrypointRegistration, GuiStateSnapshot,
+  HeartbeatEntrypointRequest, LogStreamIdentity, QueryLogsResponse, QueryStateResponse,
+  RegisterEntrypointResponse, RuntimeState, SetDomainEnabledRequest, SetEntrypointEnabledRequest,
+  StateChangeKind, StateChangedEvent,
 };
 use chrono::Utc;
 use std::{collections::BTreeMap, sync::Arc};
@@ -14,408 +14,411 @@ use tokio::sync::{Mutex, broadcast};
 
 #[derive(Debug, Clone)]
 pub struct DaemonState {
-    inner: Arc<Mutex<DaemonInner>>,
-    events: broadcast::Sender<StateChangedEvent>,
-    logs: CaddyLogStore,
+  inner: Arc<Mutex<DaemonInner>>,
+  events: broadcast::Sender<StateChangedEvent>,
+  logs: CaddyLogStore,
 }
 
 #[derive(Debug)]
 struct DaemonInner {
-    registrations: BTreeMap<String, EntrypointRegistration>,
-    coordinator: CaddyConfigCoordinator,
-    sequence: u64,
+  registrations: BTreeMap<String, EntrypointRegistration>,
+  coordinator: CaddyConfigCoordinator,
+  sequence: u64,
 }
 
 impl DaemonState {
-    pub fn new(coordinator: CaddyConfigCoordinator) -> Self {
-        let (events, _) = broadcast::channel(256);
-        Self {
-            inner: Arc::new(Mutex::new(DaemonInner {
-                registrations: BTreeMap::new(),
-                coordinator,
-                sequence: 0,
-            })),
-            events,
-            logs: CaddyLogStore::default(),
-        }
+  pub fn new(coordinator: CaddyConfigCoordinator) -> Self {
+    let (events, _) = broadcast::channel(256);
+    Self {
+      inner: Arc::new(Mutex::new(DaemonInner {
+        registrations: BTreeMap::new(),
+        coordinator,
+        sequence: 0,
+      })),
+      events,
+      logs: CaddyLogStore::default(),
+    }
+  }
+
+  pub fn subscribe(&self) -> broadcast::Receiver<StateChangedEvent> {
+    self.events.subscribe()
+  }
+
+  pub fn logs(&self) -> CaddyLogStore {
+    self.logs.clone()
+  }
+
+  pub async fn register(
+    &self,
+    request_id: String,
+    registration: EntrypointRegistration,
+  ) -> RegisterEntrypointResponse {
+    if let Err(message) = registration.validate_owner() {
+      return RegisterEntrypointResponse {
+        request_id,
+        accepted: false,
+        message,
+        registration_id: None,
+      };
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<StateChangedEvent> {
-        self.events.subscribe()
+    let mut inner = self.inner.lock().await;
+    let mut prepared = inner.coordinator.prepare_registration(registration).await;
+    let now = Utc::now();
+    prepared.created_at_utc = now;
+    prepared.last_heartbeat_utc = now;
+    let id = prepared.registration_id.clone();
+    inner.registrations.insert(id.clone(), prepared);
+    let registrations = inner.registrations.values().cloned().collect::<Vec<_>>();
+    inner.coordinator.apply(&registrations, &self.logs).await;
+    self
+      .publish_locked(
+        &mut inner,
+        StateChangeKind::RegistrationsChanged,
+        Some(id.clone()),
+      )
+      .await;
+
+    RegisterEntrypointResponse {
+      request_id,
+      accepted: true,
+      message: "Entrypoint registered.".to_string(),
+      registration_id: Some(id),
     }
+  }
 
-    pub fn logs(&self) -> CaddyLogStore {
-        self.logs.clone()
-    }
-
-    pub async fn register(
-        &self,
-        request_id: String,
-        registration: EntrypointRegistration,
-    ) -> RegisterEntrypointResponse {
-        if let Err(message) = registration.validate_owner() {
-            return RegisterEntrypointResponse {
-                request_id,
-                accepted: false,
-                message,
-                registration_id: None,
-            };
-        }
-
-        let mut inner = self.inner.lock().await;
-        let mut prepared = inner.coordinator.prepare_registration(registration).await;
-        let now = Utc::now();
-        prepared.created_at_utc = now;
-        prepared.last_heartbeat_utc = now;
-        let id = prepared.registration_id.clone();
-        inner.registrations.insert(id.clone(), prepared);
-        let registrations = inner.registrations.values().cloned().collect::<Vec<_>>();
-        inner.coordinator.apply(&registrations, &self.logs).await;
-        self.publish_locked(
-            &mut inner,
-            StateChangeKind::RegistrationsChanged,
-            Some(id.clone()),
+  pub async fn unregister(
+    &self,
+    request_id: String,
+    registration_id: &str,
+    shim_session_nonce: &str,
+  ) -> BasicResponse {
+    let mut inner = self.inner.lock().await;
+    let removed = inner
+      .registrations
+      .get(registration_id)
+      .is_some_and(|registration| {
+        registration.entrypoint_instance.shim_session_nonce == shim_session_nonce
+      });
+    if removed {
+      inner.registrations.remove(registration_id);
+      let registrations = inner.registrations.values().cloned().collect::<Vec<_>>();
+      inner.coordinator.apply(&registrations, &self.logs).await;
+      self
+        .publish_locked(
+          &mut inner,
+          StateChangeKind::RegistrationsChanged,
+          Some(registration_id.to_string()),
         )
         .await;
-
-        RegisterEntrypointResponse {
-            request_id,
-            accepted: true,
-            message: "Entrypoint registered.".to_string(),
-            registration_id: Some(id),
-        }
     }
 
-    pub async fn unregister(
-        &self,
-        request_id: String,
-        registration_id: &str,
-        shim_session_nonce: &str,
-    ) -> BasicResponse {
-        let mut inner = self.inner.lock().await;
-        let removed = inner
-            .registrations
-            .get(registration_id)
-            .is_some_and(|registration| {
-                registration.entrypoint_instance.shim_session_nonce == shim_session_nonce
-            });
-        if removed {
-            inner.registrations.remove(registration_id);
-            let registrations = inner.registrations.values().cloned().collect::<Vec<_>>();
-            inner.coordinator.apply(&registrations, &self.logs).await;
-            self.publish_locked(
-                &mut inner,
-                StateChangeKind::RegistrationsChanged,
-                Some(registration_id.to_string()),
-            )
-            .await;
-        }
+    BasicResponse {
+      request_id,
+      accepted: removed,
+      message: if removed {
+        "Entrypoint unregistered."
+      } else {
+        "Entrypoint was not found for the requested owner."
+      }
+      .to_string(),
+    }
+  }
 
-        BasicResponse {
-            request_id,
-            accepted: removed,
-            message: if removed {
-                "Entrypoint unregistered."
-            } else {
-                "Entrypoint was not found for the requested owner."
-            }
-            .to_string(),
-        }
+  pub async fn heartbeat(&self, request: HeartbeatEntrypointRequest) -> BasicResponse {
+    let mut inner = self.inner.lock().await;
+    let accepted = inner
+      .registrations
+      .get_mut(&request.registration_id)
+      .filter(|registration| {
+        registration.entrypoint_instance.shim_session_nonce == request.shim_session_nonce
+      })
+      .map(|registration| {
+        registration.last_heartbeat_utc = Utc::now();
+      })
+      .is_some();
+    if accepted {
+      self
+        .publish_locked(
+          &mut inner,
+          StateChangeKind::RegistrationsChanged,
+          Some(request.registration_id),
+        )
+        .await;
     }
 
-    pub async fn heartbeat(&self, request: HeartbeatEntrypointRequest) -> BasicResponse {
-        let mut inner = self.inner.lock().await;
-        let accepted = inner
-            .registrations
-            .get_mut(&request.registration_id)
-            .filter(|registration| {
-                registration.entrypoint_instance.shim_session_nonce == request.shim_session_nonce
-            })
-            .map(|registration| {
-                registration.last_heartbeat_utc = Utc::now();
-            })
-            .is_some();
-        if accepted {
-            self.publish_locked(
-                &mut inner,
-                StateChangeKind::RegistrationsChanged,
-                Some(request.registration_id),
-            )
-            .await;
-        }
+    BasicResponse {
+      request_id: request.request_id,
+      accepted,
+      message: if accepted {
+        "Heartbeat accepted."
+      } else {
+        "Entrypoint was not found for the requested owner."
+      }
+      .to_string(),
+    }
+  }
 
-        BasicResponse {
-            request_id: request.request_id,
-            accepted,
-            message: if accepted {
-                "Heartbeat accepted."
-            } else {
-                "Entrypoint was not found for the requested owner."
-            }
-            .to_string(),
-        }
+  pub async fn set_entrypoint_enabled(
+    &self,
+    request: SetEntrypointEnabledRequest,
+  ) -> BasicResponse {
+    let mut inner = self.inner.lock().await;
+    let accepted = inner
+      .registrations
+      .get_mut(&request.registration_id)
+      .filter(|registration| {
+        request
+          .shim_session_nonce
+          .as_ref()
+          .is_none_or(|nonce| registration.entrypoint_instance.shim_session_nonce == *nonce)
+      })
+      .map(|registration| {
+        registration.activation_state = ActivationState::from_enabled(request.enabled);
+      })
+      .is_some();
+
+    if accepted {
+      let registrations = inner.registrations.values().cloned().collect::<Vec<_>>();
+      inner.coordinator.apply(&registrations, &self.logs).await;
+      self
+        .publish_locked(
+          &mut inner,
+          StateChangeKind::RegistrationsChanged,
+          Some(request.registration_id),
+        )
+        .await;
     }
 
-    pub async fn set_entrypoint_enabled(
-        &self,
-        request: SetEntrypointEnabledRequest,
-    ) -> BasicResponse {
-        let mut inner = self.inner.lock().await;
-        let accepted = inner
-            .registrations
-            .get_mut(&request.registration_id)
-            .filter(|registration| {
-                request.shim_session_nonce.as_ref().is_none_or(|nonce| {
-                    registration.entrypoint_instance.shim_session_nonce == *nonce
-                })
-            })
-            .map(|registration| {
-                registration.activation_state = ActivationState::from_enabled(request.enabled);
-            })
-            .is_some();
-
-        if accepted {
-            let registrations = inner.registrations.values().cloned().collect::<Vec<_>>();
-            inner.coordinator.apply(&registrations, &self.logs).await;
-            self.publish_locked(
-                &mut inner,
-                StateChangeKind::RegistrationsChanged,
-                Some(request.registration_id),
-            )
-            .await;
-        }
-
-        BasicResponse {
-            request_id: request.request_id,
-            accepted,
-            message: if accepted {
-                "Entrypoint activation updated."
-            } else {
-                "Entrypoint was not found."
-            }
-            .to_string(),
-        }
+    BasicResponse {
+      request_id: request.request_id,
+      accepted,
+      message: if accepted {
+        "Entrypoint activation updated."
+      } else {
+        "Entrypoint was not found."
+      }
+      .to_string(),
     }
+  }
 
-    pub async fn set_domain_enabled(&self, request: SetDomainEnabledRequest) -> BasicResponse {
-        let mut inner = self.inner.lock().await;
-        let accepted = inner
-            .registrations
-            .get_mut(&request.registration_id)
-            .and_then(|registration| {
-                registration.registered_domains.iter_mut().find(|domain| {
-                    domain
-                        .name
-                        .canonical
-                        .eq_ignore_ascii_case(&request.domain_key)
-                })
-            })
-            .map(|domain| {
-                domain.activation_state = ActivationState::from_enabled(request.enabled);
-            })
-            .is_some();
-
-        if accepted {
-            let registrations = inner.registrations.values().cloned().collect::<Vec<_>>();
-            inner.coordinator.apply(&registrations, &self.logs).await;
-            self.publish_locked(
-                &mut inner,
-                StateChangeKind::RegistrationsChanged,
-                Some(request.registration_id),
-            )
-            .await;
-        }
-
-        BasicResponse {
-            request_id: request.request_id,
-            accepted,
-            message: if accepted {
-                "Domain activation updated."
-            } else {
-                "Domain was not found."
-            }
-            .to_string(),
-        }
-    }
-
-    pub async fn query_state(&self, request_id: String) -> QueryStateResponse {
-        QueryStateResponse {
-            request_id,
-            accepted: true,
-            message: "State snapshot returned.".to_string(),
-            snapshot: Some(self.snapshot().await),
-        }
-    }
-
-    pub async fn query_logs(
-        &self,
-        request: cadder_protocol::QueryLogsRequest,
-    ) -> QueryLogsResponse {
-        let active = self.stream_is_active(&request.stream).await;
-        let result = self.logs.query(
-            LogQuery {
-                stream: request.stream.clone(),
-                limit: request.limit.unwrap_or(100).clamp(1, 500),
-                after_sequence: request
-                    .cursor
-                    .as_deref()
-                    .and_then(|cursor| cursor.strip_prefix("seq:"))
-                    .and_then(|sequence| sequence.parse::<u64>().ok()),
-                minimum_severity: request.minimum_severity,
-            },
-            active,
-        );
-
-        QueryLogsResponse {
-            request_id: request.request_id,
-            accepted: true,
-            message: "Caddy logs returned.".to_string(),
-            stream: request.stream,
-            stream_status: result.status,
-            entries: result.entries,
-            next_cursor: result.next_cursor,
-            has_gap: result.has_gap,
-            has_more_before: result.has_more_before,
-            truncated_by_retention: result.truncated_by_retention,
-        }
-    }
-
-    pub async fn shutdown(&self) -> BasicResponse {
-        let mut inner = self.inner.lock().await;
-        let result = inner.coordinator.shutdown().await;
-        BasicResponse {
-            request_id: "shutdown".to_string(),
-            accepted: result.is_ok(),
-            message: result
-                .map(|_| "Daemon shutdown requested.".to_string())
-                .unwrap_or_else(|error| error.to_string()),
-        }
-    }
-
-    pub async fn snapshot(&self) -> GuiStateSnapshot {
-        let inner = self.inner.lock().await;
-        self.snapshot_locked(&inner).await
-    }
-
-    async fn publish_locked(
-        &self,
-        inner: &mut DaemonInner,
-        kind: StateChangeKind,
-        registration_id: Option<String>,
-    ) {
-        inner.sequence += 1;
-        let event = StateChangedEvent {
-            request_id: "state-change".to_string(),
-            sequence_number: inner.sequence,
-            change_kind: kind,
-            snapshot: self.snapshot_locked(inner).await,
-            registration_id,
-        };
-        let _ = self.events.send(event);
-    }
-
-    async fn snapshot_locked(&self, inner: &DaemonInner) -> GuiStateSnapshot {
-        GuiStateSnapshot {
-            captured_at_utc: Utc::now(),
-            registrations: inner.registrations.values().cloned().collect(),
-            runtime: self.runtime_state_locked(inner).await,
-            config: self.config_state_locked(inner),
-        }
-    }
-
-    async fn runtime_state_locked(&self, inner: &DaemonInner) -> RuntimeState {
-        inner.coordinator_runtime_state().await
-    }
-
-    fn config_state_locked(&self, inner: &DaemonInner) -> ConfigState {
-        inner.coordinator.current_state()
-    }
-
-    async fn stream_is_active(&self, stream: &LogStreamIdentity) -> bool {
-        let inner = self.inner.lock().await;
-        if stream.stream_id == "runtime" || stream.stream_id == "runtime-control" {
-            return true;
-        }
-        inner.registrations.values().any(|registration| {
-            registration.log_stream == *stream
-                || registration
-                    .registered_domains
-                    .iter()
-                    .any(|domain| domain.log_stream == *stream)
+  pub async fn set_domain_enabled(&self, request: SetDomainEnabledRequest) -> BasicResponse {
+    let mut inner = self.inner.lock().await;
+    let accepted = inner
+      .registrations
+      .get_mut(&request.registration_id)
+      .and_then(|registration| {
+        registration.registered_domains.iter_mut().find(|domain| {
+          domain
+            .name
+            .canonical
+            .eq_ignore_ascii_case(&request.domain_key)
         })
+      })
+      .map(|domain| {
+        domain.activation_state = ActivationState::from_enabled(request.enabled);
+      })
+      .is_some();
+
+    if accepted {
+      let registrations = inner.registrations.values().cloned().collect::<Vec<_>>();
+      inner.coordinator.apply(&registrations, &self.logs).await;
+      self
+        .publish_locked(
+          &mut inner,
+          StateChangeKind::RegistrationsChanged,
+          Some(request.registration_id),
+        )
+        .await;
     }
+
+    BasicResponse {
+      request_id: request.request_id,
+      accepted,
+      message: if accepted {
+        "Domain activation updated."
+      } else {
+        "Domain was not found."
+      }
+      .to_string(),
+    }
+  }
+
+  pub async fn query_state(&self, request_id: String) -> QueryStateResponse {
+    QueryStateResponse {
+      request_id,
+      accepted: true,
+      message: "State snapshot returned.".to_string(),
+      snapshot: Some(self.snapshot().await),
+    }
+  }
+
+  pub async fn query_logs(&self, request: cadder_protocol::QueryLogsRequest) -> QueryLogsResponse {
+    let active = self.stream_is_active(&request.stream).await;
+    let result = self.logs.query(
+      LogQuery {
+        stream: request.stream.clone(),
+        limit: request.limit.unwrap_or(100).clamp(1, 500),
+        after_sequence: request
+          .cursor
+          .as_deref()
+          .and_then(|cursor| cursor.strip_prefix("seq:"))
+          .and_then(|sequence| sequence.parse::<u64>().ok()),
+        minimum_severity: request.minimum_severity,
+      },
+      active,
+    );
+
+    QueryLogsResponse {
+      request_id: request.request_id,
+      accepted: true,
+      message: "Caddy logs returned.".to_string(),
+      stream: request.stream,
+      stream_status: result.status,
+      entries: result.entries,
+      next_cursor: result.next_cursor,
+      has_gap: result.has_gap,
+      has_more_before: result.has_more_before,
+      truncated_by_retention: result.truncated_by_retention,
+    }
+  }
+
+  pub async fn shutdown(&self) -> BasicResponse {
+    let mut inner = self.inner.lock().await;
+    let result = inner.coordinator.shutdown().await;
+    BasicResponse {
+      request_id: "shutdown".to_string(),
+      accepted: result.is_ok(),
+      message: result
+        .map(|_| "Daemon shutdown requested.".to_string())
+        .unwrap_or_else(|error| error.to_string()),
+    }
+  }
+
+  pub async fn snapshot(&self) -> GuiStateSnapshot {
+    let inner = self.inner.lock().await;
+    self.snapshot_locked(&inner).await
+  }
+
+  async fn publish_locked(
+    &self,
+    inner: &mut DaemonInner,
+    kind: StateChangeKind,
+    registration_id: Option<String>,
+  ) {
+    inner.sequence += 1;
+    let event = StateChangedEvent {
+      request_id: "state-change".to_string(),
+      sequence_number: inner.sequence,
+      change_kind: kind,
+      snapshot: self.snapshot_locked(inner).await,
+      registration_id,
+    };
+    let _ = self.events.send(event);
+  }
+
+  async fn snapshot_locked(&self, inner: &DaemonInner) -> GuiStateSnapshot {
+    GuiStateSnapshot {
+      captured_at_utc: Utc::now(),
+      registrations: inner.registrations.values().cloned().collect(),
+      runtime: self.runtime_state_locked(inner).await,
+      config: self.config_state_locked(inner),
+    }
+  }
+
+  async fn runtime_state_locked(&self, inner: &DaemonInner) -> RuntimeState {
+    inner.coordinator_runtime_state().await
+  }
+
+  fn config_state_locked(&self, inner: &DaemonInner) -> ConfigState {
+    inner.coordinator.current_state()
+  }
+
+  async fn stream_is_active(&self, stream: &LogStreamIdentity) -> bool {
+    let inner = self.inner.lock().await;
+    if stream.stream_id == "runtime" || stream.stream_id == "runtime-control" {
+      return true;
+    }
+    inner.registrations.values().any(|registration| {
+      registration.log_stream == *stream
+        || registration
+          .registered_domains
+          .iter()
+          .any(|domain| domain.log_stream == *stream)
+    })
+  }
 }
 
 impl DaemonInner {
-    async fn coordinator_runtime_state(&self) -> RuntimeState {
-        self.coordinator.runtime_state().await
-    }
+  async fn coordinator_runtime_state(&self) -> RuntimeState {
+    self.coordinator.runtime_state().await
+  }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{
-        CaddyConfigAdapter, CaddyConfigCoordinator, ProcessRuntime, RealCaddyResolver, RuntimePaths,
-    };
-    use cadder_protocol::{
-        EntrypointInstanceIdentity, LogStreamIdentity, OwnerProcessIdentity, RegisteredDomain,
-        SourcePath,
-    };
-    use chrono::Utc;
+  use super::*;
+  use crate::{
+    CaddyConfigAdapter, CaddyConfigCoordinator, ProcessRuntime, RealCaddyResolver, RuntimePaths,
+  };
+  use cadder_protocol::{
+    EntrypointInstanceIdentity, LogStreamIdentity, OwnerProcessIdentity, RegisteredDomain,
+    SourcePath,
+  };
+  use chrono::Utc;
 
-    fn state() -> DaemonState {
-        let paths = RuntimePaths::resolve(Some(tempfile::tempdir().unwrap().keep())).unwrap();
-        let resolver = RealCaddyResolver::new(Some("definitely-missing-caddy".to_string()));
-        let adapter = CaddyConfigAdapter::new(resolver.clone());
-        let runtime = ProcessRuntime::new(resolver, paths);
-        DaemonState::new(CaddyConfigCoordinator::new(adapter, runtime))
+  fn state() -> DaemonState {
+    let paths = RuntimePaths::resolve(Some(tempfile::tempdir().unwrap().keep())).unwrap();
+    let resolver = RealCaddyResolver::new(Some("definitely-missing-caddy".to_string()));
+    let adapter = CaddyConfigAdapter::new(resolver.clone());
+    let runtime = ProcessRuntime::new(resolver, paths);
+    DaemonState::new(CaddyConfigCoordinator::new(adapter, runtime))
+  }
+
+  fn registration(id: &str, nonce: &str) -> EntrypointRegistration {
+    let now = Utc::now();
+    EntrypointRegistration {
+      registration_id: id.to_string(),
+      entrypoint_instance: EntrypointInstanceIdentity {
+        instance_id: id.to_string(),
+        started_at_utc: now,
+        shim_session_nonce: nonce.to_string(),
+      },
+      source_working_directory: SourcePath::new(".", None),
+      source_config_path: SourcePath::new("Caddyfile", None),
+      registered_domains: vec![RegisteredDomain::active("app.localhost")],
+      activation_state: ActivationState::Active,
+      owner_process: OwnerProcessIdentity {
+        process_id: 1,
+        process_start_time_utc: now,
+        shim_session_nonce: nonce.to_string(),
+        executable_path: None,
+      },
+      log_stream: LogStreamIdentity::entrypoint(id),
+      shim_run: None,
+      created_at_utc: now,
+      last_heartbeat_utc: now,
     }
+  }
 
-    fn registration(id: &str, nonce: &str) -> EntrypointRegistration {
-        let now = Utc::now();
-        EntrypointRegistration {
-            registration_id: id.to_string(),
-            entrypoint_instance: EntrypointInstanceIdentity {
-                instance_id: id.to_string(),
-                started_at_utc: now,
-                shim_session_nonce: nonce.to_string(),
-            },
-            source_working_directory: SourcePath::new(".", None),
-            source_config_path: SourcePath::new("Caddyfile", None),
-            registered_domains: vec![RegisteredDomain::active("app.localhost")],
-            activation_state: ActivationState::Active,
-            owner_process: OwnerProcessIdentity {
-                process_id: 1,
-                process_start_time_utc: now,
-                shim_session_nonce: nonce.to_string(),
-                executable_path: None,
-            },
-            log_stream: LogStreamIdentity::entrypoint(id),
-            shim_run: None,
-            created_at_utc: now,
-            last_heartbeat_utc: now,
-        }
-    }
+  #[tokio::test]
+  async fn register_and_unregister_preserve_owner_boundary() {
+    let state = state();
+    let response = state
+      .register("register".to_string(), registration("shim-1", "nonce-1"))
+      .await;
+    assert!(response.accepted);
 
-    #[tokio::test]
-    async fn register_and_unregister_preserve_owner_boundary() {
-        let state = state();
-        let response = state
-            .register("register".to_string(), registration("shim-1", "nonce-1"))
-            .await;
-        assert!(response.accepted);
+    let wrong = state
+      .unregister("wrong".to_string(), "shim-1", "other")
+      .await;
+    assert!(!wrong.accepted);
+    assert_eq!(state.snapshot().await.registrations.len(), 1);
 
-        let wrong = state
-            .unregister("wrong".to_string(), "shim-1", "other")
-            .await;
-        assert!(!wrong.accepted);
-        assert_eq!(state.snapshot().await.registrations.len(), 1);
-
-        let right = state
-            .unregister("right".to_string(), "shim-1", "nonce-1")
-            .await;
-        assert!(right.accepted);
-        assert!(state.snapshot().await.registrations.is_empty());
-    }
+    let right = state
+      .unregister("right".to_string(), "shim-1", "nonce-1")
+      .await;
+    assert!(right.accepted);
+    assert!(state.snapshot().await.registrations.is_empty());
+  }
 }

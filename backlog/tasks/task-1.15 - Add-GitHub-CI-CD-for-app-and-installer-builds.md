@@ -4,17 +4,20 @@ title: Add GitHub CI/CD for Rust binaries and release artifacts
 status: To Do
 assignee: []
 created_date: '2026-06-09 18:45'
-updated_date: '2026-06-10 11:06'
+updated_date: '2026-06-10 11:29'
 labels: []
 dependencies:
   - TASK-1.11
+  - TASK-1.16
 references:
-  - build.ps1
-  - src/Cadder.Tray.WinUI/Cadder.Tray.WinUI.csproj
+  - AGENTS.md
+  - .github/workflows
+  - Cargo.toml
+  - xtask
 documentation:
   - docs/ARCHITECTURE.md
 parent_task_id: TASK-1
-priority: low
+priority: medium
 ordinal: 15000
 ---
 
@@ -30,6 +33,8 @@ Add CI/CD for the Rust workspace and cross-platform binary artifacts. The pipeli
 - [ ] #2 CI builds release artifacts for `cadderd`, `caddy`, and `cadder-tui` on Windows, Linux, and macOS or documents any platform intentionally deferred.
 - [ ] #3 Release packaging does not depend on WinUI, Windows App SDK, MSIX, NuGet, or .NET SDK.
 - [ ] #4 CI uses fake Caddy fixtures for automated tests and does not require a machine-global real Caddy install.
+- [ ] #5 Release workflow publishes versioned artifacts to GitHub Releases for supported platforms or documents any platform intentionally deferred.
+- [ ] #6 GitHub Actions builds and publishes the generated documentation after the Astro Starlight documentation site exists.
 <!-- AC:END -->
 
 ## Comments
@@ -39,5 +44,11 @@ author: @agent
 created: 2026-06-10 11:06
 ---
 Rebaselined from app/installer CI to Rust binary CI/CD after the project pivot away from .NET/WinUI.
+---
+
+author: agent
+created: 2026-06-10 11:29
+---
+Expanded from base Rust CI/CD to include the new AGENTS.md requirements for GitHub Releases artifact publishing and generated documentation publishing. Added TASK-1.16 as a dependency because documentation publishing needs the Astro Starlight site first.
 ---
 <!-- COMMENTS:END -->

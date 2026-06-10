@@ -18,21 +18,21 @@ use tokio::sync::watch;
 
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
-    pub runtime_dir: Option<PathBuf>,
-    pub real_caddy_command: Option<String>,
+  pub runtime_dir: Option<PathBuf>,
+  pub real_caddy_command: Option<String>,
 }
 
 pub async fn run_daemon(options: DaemonOptions, shutdown: watch::Receiver<bool>) -> Result<()> {
-    let paths = RuntimePaths::resolve(options.runtime_dir)?;
-    paths.ensure_dirs()?;
-    let _lock = DaemonLock::acquire(paths.lock_path())?;
+  let paths = RuntimePaths::resolve(options.runtime_dir)?;
+  paths.ensure_dirs()?;
+  let _lock = DaemonLock::acquire(paths.lock_path())?;
 
-    let real_caddy = RealCaddyResolver::new(options.real_caddy_command);
-    let adapter = CaddyConfigAdapter::new(real_caddy.clone());
-    let runtime = ProcessRuntime::new(real_caddy, paths.clone());
-    let coordinator = CaddyConfigCoordinator::new(adapter, runtime);
-    let state = DaemonState::new(coordinator);
+  let real_caddy = RealCaddyResolver::new(options.real_caddy_command);
+  let adapter = CaddyConfigAdapter::new(real_caddy.clone());
+  let runtime = ProcessRuntime::new(real_caddy, paths.clone());
+  let coordinator = CaddyConfigCoordinator::new(adapter, runtime);
+  let state = DaemonState::new(coordinator);
 
-    let server = DaemonServer::new(paths, state);
-    server.run_until(shutdown).await
+  let server = DaemonServer::new(paths, state);
+  server.run_until(shutdown).await
 }
