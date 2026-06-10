@@ -5,9 +5,10 @@ use cadder_daemon::{
   CadderClient, DaemonLaunchOptions, RuntimePaths, ensure_daemon_running_with_options,
 };
 use cadder_protocol::{
-  BasicResponse, GuiStateSnapshot, LogSeverity, QueryLogsRequest, QueryLogsResponse,
-  QueryStateRequest, QueryStateResponse, SetDomainEnabledRequest, SetEntrypointEnabledRequest,
-  ShutdownDaemonRequest, message_types, new_request_id,
+  BasicResponse, GuiStateSnapshot, LogEntry, LogSeverity, LogStreamIdentity, LogStreamStatus,
+  QueryLogsRequest, QueryLogsResponse, QueryStateRequest, QueryStateResponse,
+  SetDomainEnabledRequest, SetEntrypointEnabledRequest, ShutdownDaemonRequest, message_types,
+  new_request_id,
 };
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -19,7 +20,11 @@ use ratatui::{
   text::Line,
   widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, Tabs, Wrap},
 };
-use std::{path::PathBuf, time::Duration};
+use std::{
+  path::PathBuf,
+  time::{Duration, Instant},
+};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Parser)]
 #[command(name = "cadder-tui", version, about = "Cadder terminal UI")]
@@ -54,11 +59,18 @@ async fn main() -> Result<()> {
     .await?;
   }
   let client = CadderClient::new(paths);
+  let (responses_tx, responses_rx) = mpsc::unbounded_channel();
   let mut app = TuiApp {
     client,
     model: TuiModel::default(),
-    logs: Vec::new(),
     message: String::new(),
+    responses_tx,
+    responses_rx,
+    state_request_in_flight: false,
+    toggle_request_in_flight: false,
+    shutdown_request_in_flight: false,
+    last_log_refresh: Instant::now(),
+    log_request_serial: 0,
   };
   app.refresh().await?;
 
@@ -71,13 +83,34 @@ async fn main() -> Result<()> {
 struct TuiApp {
   client: CadderClient,
   model: TuiModel,
-  logs: Vec<String>,
   message: String,
+  responses_tx: mpsc::UnboundedSender<AppResponse>,
+  responses_rx: mpsc::UnboundedReceiver<AppResponse>,
+  state_request_in_flight: bool,
+  toggle_request_in_flight: bool,
+  shutdown_request_in_flight: bool,
+  last_log_refresh: Instant,
+  log_request_serial: u64,
+}
+
+#[derive(Debug)]
+enum AppResponse {
+  State(Result<QueryStateResponse, String>),
+  Toggle(Result<BasicResponse, String>),
+  Logs {
+    serial: u64,
+    stream: LogStreamIdentity,
+    minimum_severity: Option<LogSeverity>,
+    result: Result<QueryLogsResponse, String>,
+  },
+  Shutdown(Result<BasicResponse, String>),
 }
 
 impl TuiApp {
   async fn run(&mut self, mut terminal: DefaultTerminal) -> Result<()> {
     loop {
+      self.drain_responses();
+      self.maybe_tail_logs();
       terminal.draw(|frame| self.draw(frame))?;
       if event::poll(Duration::from_millis(200))?
         && let Event::Key(key) = event::read()?
@@ -85,51 +118,138 @@ impl TuiApp {
         if key.kind != KeyEventKind::Press {
           continue;
         }
+        if self.model.search_mode {
+          match key.code {
+            KeyCode::Esc => {
+              self.model.search_mode = false;
+              self.model.search.clear();
+            }
+            KeyCode::Backspace => {
+              self.model.search.pop();
+            }
+            KeyCode::Char(ch) => self.model.search.push(ch),
+            _ => {}
+          }
+          continue;
+        }
         match key.code {
           KeyCode::Char('q') => return Ok(()),
-          KeyCode::Char('r') => self.refresh().await?,
+          KeyCode::Char('r') => self.start_state_refresh(),
           KeyCode::Tab => self.model.next_view(),
           KeyCode::BackTab => self.model.previous_view(),
           KeyCode::Down => self.model.move_selection(1),
           KeyCode::Up => self.model.move_selection(-1),
           KeyCode::Char('/') => self.model.search_mode = true,
-          KeyCode::Esc => {
-            self.model.search_mode = false;
-            self.model.search.clear();
-          }
-          KeyCode::Backspace if self.model.search_mode => {
-            self.model.search.pop();
-          }
-          KeyCode::Char(' ') => self.toggle_selected().await?,
+          KeyCode::Char(' ') => self.start_toggle_selected(),
           KeyCode::Char('p') if self.model.view == View::Logs => {
-            self.model.logs_paused = !self.model.logs_paused;
+            self.model.logs.paused = !self.model.logs.paused;
+            self.message = if self.model.logs.paused {
+              "Log tailing paused.".to_string()
+            } else {
+              "Log tailing resumed.".to_string()
+            };
           }
           KeyCode::Char('0') if self.model.view == View::Logs => {
-            self.model.minimum_log_severity = None;
-            self.refresh_logs().await?;
+            self.set_log_severity(None);
           }
           KeyCode::Char('i') if self.model.view == View::Logs => {
-            self.model.minimum_log_severity = Some(LogSeverity::Info);
-            self.refresh_logs().await?;
+            self.set_log_severity(Some(LogSeverity::Info));
           }
           KeyCode::Char('w') if self.model.view == View::Logs => {
-            self.model.minimum_log_severity = Some(LogSeverity::Warn);
-            self.refresh_logs().await?;
+            self.set_log_severity(Some(LogSeverity::Warn));
           }
           KeyCode::Char('e') if self.model.view == View::Logs => {
-            self.model.minimum_log_severity = Some(LogSeverity::Error);
-            self.refresh_logs().await?;
+            self.set_log_severity(Some(LogSeverity::Error));
           }
           KeyCode::Char('x') if self.model.view == View::Logs => self.export_logs()?,
-          KeyCode::Char('d') => self.shutdown_daemon().await?,
-          KeyCode::Enter if self.model.view == View::Logs => self.refresh_logs().await?,
-          KeyCode::Char(ch) if self.model.search_mode => self.model.search.push(ch),
+          KeyCode::Char('d') => self.start_shutdown_daemon(),
+          KeyCode::Enter if self.model.view == View::Domains => self.open_selected_domain_logs(),
+          KeyCode::Char('l') if self.model.view == View::Domains => {
+            self.open_selected_domain_logs()
+          }
+          KeyCode::Enter if self.model.view == View::Logs => self.start_log_refresh(),
           _ => {}
         }
       }
-      if self.model.view == View::Logs && !self.model.logs_paused {
-        let _ = self.refresh_logs().await;
+    }
+  }
+
+  fn drain_responses(&mut self) {
+    while let Ok(response) = self.responses_rx.try_recv() {
+      match response {
+        AppResponse::State(result) => {
+          self.state_request_in_flight = false;
+          match result {
+            Ok(response) => self.apply_state_response(response),
+            Err(error) => self.message = format!("State refresh failed: {error}"),
+          }
+        }
+        AppResponse::Toggle(result) => {
+          self.toggle_request_in_flight = false;
+          match result {
+            Ok(response) => {
+              self.message = response.message;
+              self.start_state_refresh();
+            }
+            Err(error) => self.message = format!("Toggle failed: {error}"),
+          }
+        }
+        AppResponse::Logs {
+          serial,
+          stream,
+          minimum_severity,
+          result,
+        } => {
+          let current_matches = serial == self.log_request_serial
+            && self
+              .model
+              .logs
+              .active_stream()
+              .is_some_and(|active| active == stream)
+            && self.model.logs.minimum_severity == minimum_severity;
+          if !current_matches {
+            continue;
+          }
+          match result {
+            Ok(response) => {
+              self.message = response.message.clone();
+              self.model.logs.apply_response(response);
+            }
+            Err(error) => {
+              self.message = format!("Log refresh failed: {error}");
+              self.model.logs.apply_read_error(error);
+            }
+          }
+        }
+        AppResponse::Shutdown(result) => {
+          self.shutdown_request_in_flight = false;
+          match result {
+            Ok(response) => self.message = response.message,
+            Err(error) => self.message = format!("Shutdown failed: {error}"),
+          }
+        }
       }
+    }
+  }
+
+  fn maybe_tail_logs(&mut self) {
+    if self.model.view != View::Logs
+      || self.model.logs.paused
+      || self.model.logs.request_in_flight
+      || self.model.logs.target.is_none()
+      || self.last_log_refresh.elapsed() < Duration::from_millis(750)
+    {
+      return;
+    }
+    self.start_log_refresh();
+  }
+
+  fn apply_state_response(&mut self, response: QueryStateResponse) {
+    if let Some(snapshot) = response.snapshot {
+      self.model.set_snapshot(snapshot);
+      self.message = response.message;
+    } else {
+      self.message = "Daemon returned no state snapshot.".to_string();
     }
   }
 
@@ -144,64 +264,129 @@ impl TuiApp {
         },
       )
       .await?;
-    if let Some(snapshot) = response.snapshot {
-      self.model.set_snapshot(snapshot);
-      self.message = response.message;
-    } else {
-      self.message = "Daemon returned no state snapshot.".to_string();
-    }
+    self.apply_state_response(response);
     Ok(())
   }
 
-  async fn toggle_selected(&mut self) -> Result<()> {
-    match self.model.view {
-      View::Entrypoints => {
-        if let Some(entrypoint) = self.model.selected_entrypoint() {
-          let response: BasicResponse = self
-            .client
+  fn start_state_refresh(&mut self) {
+    if self.state_request_in_flight {
+      return;
+    }
+    self.state_request_in_flight = true;
+    let client = self.client.clone();
+    let responses = self.responses_tx.clone();
+    tokio::spawn(async move {
+      let result = client
+        .request(
+          message_types::QUERY_STATE_REQUEST,
+          message_types::QUERY_STATE_RESPONSE,
+          &QueryStateRequest {
+            request_id: new_request_id("tui-state"),
+          },
+        )
+        .await
+        .map_err(|error| error.to_string());
+      let _ = responses.send(AppResponse::State(result));
+    });
+  }
+
+  fn start_toggle_selected(&mut self) {
+    if self.toggle_request_in_flight {
+      return;
+    }
+    let request = match self.model.view {
+      View::Entrypoints => self.model.selected_entrypoint().map(|entrypoint| {
+        ToggleRequest::Entrypoint(SetEntrypointEnabledRequest {
+          request_id: new_request_id("tui-entrypoint-toggle"),
+          registration_id: entrypoint.registration_id.clone(),
+          shim_session_nonce: None,
+          enabled: !entrypoint.activation_state.is_enabled(),
+        })
+      }),
+      View::Domains => self
+        .model
+        .selected_domain()
+        .map(|(registration_id, domain)| {
+          ToggleRequest::Domain(SetDomainEnabledRequest {
+            request_id: new_request_id("tui-domain-toggle"),
+            registration_id,
+            domain_key: domain.name.canonical,
+            enabled: !domain.activation_state.is_enabled(),
+          })
+        }),
+      _ => None,
+    };
+
+    let Some(request) = request else {
+      return;
+    };
+    self.toggle_request_in_flight = true;
+    let client = self.client.clone();
+    let responses = self.responses_tx.clone();
+    tokio::spawn(async move {
+      let result = match request {
+        ToggleRequest::Entrypoint(request) => {
+          client
             .request(
               message_types::SET_ENTRYPOINT_ENABLED_REQUEST,
               message_types::SET_ENTRYPOINT_ENABLED_RESPONSE,
-              &SetEntrypointEnabledRequest {
-                request_id: new_request_id("tui-entrypoint-toggle"),
-                registration_id: entrypoint.registration_id.clone(),
-                shim_session_nonce: None,
-                enabled: !entrypoint.activation_state.is_enabled(),
-              },
+              &request,
             )
-            .await?;
-          self.message = response.message;
-          self.refresh().await?;
+            .await
         }
-      }
-      View::Domains => {
-        if let Some((registration_id, domain)) = self.model.selected_domain() {
-          let response: BasicResponse = self
-            .client
+        ToggleRequest::Domain(request) => {
+          client
             .request(
               message_types::SET_DOMAIN_ENABLED_REQUEST,
               message_types::SET_DOMAIN_ENABLED_RESPONSE,
-              &SetDomainEnabledRequest {
-                request_id: new_request_id("tui-domain-toggle"),
-                registration_id,
-                domain_key: domain.name.canonical.clone(),
-                enabled: !domain.activation_state.is_enabled(),
-              },
+              &request,
             )
-            .await?;
-          self.message = response.message;
-          self.refresh().await?;
+            .await
         }
       }
-      _ => {}
-    }
-    Ok(())
+      .map_err(|error| error.to_string());
+      let _ = responses.send(AppResponse::Toggle(result));
+    });
   }
 
-  async fn refresh_logs(&mut self) -> Result<()> {
-    if let Some(stream) = self.model.selected_log_stream() {
-      let response: QueryLogsResponse = self
-        .client
+  fn open_selected_domain_logs(&mut self) {
+    if self.model.open_selected_domain_logs() {
+      self.message = "Loading domain logs.".to_string();
+      self.start_log_refresh();
+    }
+  }
+
+  fn set_log_severity(&mut self, severity: Option<LogSeverity>) {
+    if self.model.logs.minimum_severity == severity {
+      return;
+    }
+    self.model.logs.reset_for_filter(severity);
+    self.message = match severity {
+      Some(severity) => format!("Log severity filter set to {severity:?}."),
+      None => "Log severity filter cleared.".to_string(),
+    };
+    self.start_log_refresh();
+  }
+
+  fn start_log_refresh(&mut self) {
+    if self.model.logs.request_in_flight {
+      return;
+    }
+    let Some(stream) = self.model.logs.active_stream() else {
+      self.message = "Select a domain and press Enter or l to view logs.".to_string();
+      return;
+    };
+    let cursor = self.model.logs.next_cursor.clone();
+    let minimum_severity = self.model.logs.minimum_severity;
+    self.model.logs.mark_loading();
+    self.last_log_refresh = Instant::now();
+    self.log_request_serial += 1;
+    let serial = self.log_request_serial;
+    let client = self.client.clone();
+    let responses = self.responses_tx.clone();
+    let response_stream = stream.clone();
+    tokio::spawn(async move {
+      let result = client
         .request(
           message_types::QUERY_LOGS_REQUEST,
           message_types::QUERY_LOGS_RESPONSE,
@@ -209,53 +394,113 @@ impl TuiApp {
             request_id: new_request_id("tui-logs"),
             stream,
             limit: Some(100),
-            cursor: None,
-            minimum_severity: self.model.minimum_log_severity,
+            cursor,
+            minimum_severity,
           },
         )
-        .await?;
-      self.logs = response
-        .entries
-        .into_iter()
-        .map(|entry| {
-          format!(
-            "{} {:?} {}",
-            entry.timestamp_utc.format("%H:%M:%S"),
-            entry.severity,
-            entry.raw_message
-          )
-        })
-        .collect();
-      self.message = response.message;
-    }
-    Ok(())
+        .await
+        .map_err(|error| error.to_string());
+      let _ = responses.send(AppResponse::Logs {
+        serial,
+        stream: response_stream,
+        minimum_severity,
+        result,
+      });
+    });
   }
 
-  async fn shutdown_daemon(&mut self) -> Result<()> {
-    let response: BasicResponse = self
-      .client
-      .request(
-        message_types::SHUTDOWN_DAEMON_REQUEST,
-        message_types::SHUTDOWN_DAEMON_RESPONSE,
-        &ShutdownDaemonRequest {
-          request_id: new_request_id("tui-shutdown"),
-        },
-      )
-      .await?;
-    self.message = response.message;
-    Ok(())
+  fn start_shutdown_daemon(&mut self) {
+    if self.shutdown_request_in_flight {
+      return;
+    }
+    self.shutdown_request_in_flight = true;
+    let client = self.client.clone();
+    let responses = self.responses_tx.clone();
+    tokio::spawn(async move {
+      let result = client
+        .request(
+          message_types::SHUTDOWN_DAEMON_REQUEST,
+          message_types::SHUTDOWN_DAEMON_RESPONSE,
+          &ShutdownDaemonRequest {
+            request_id: new_request_id("tui-shutdown"),
+          },
+        )
+        .await
+        .map_err(|error| error.to_string());
+      let _ = responses.send(AppResponse::Shutdown(result));
+    });
   }
 
   fn export_logs(&mut self) -> Result<()> {
+    let Some(target) = self.model.logs.target.as_ref() else {
+      self.message = "No domain log stream is open.".to_string();
+      return Ok(());
+    };
+    if self.model.logs.entries.is_empty() {
+      self.message = "No log entries to export.".to_string();
+      return Ok(());
+    }
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let filename = format!(
+      "cadder-logs-{}-{timestamp}.txt",
+      safe_filename(&target.domain_name)
+    );
     let output_path = std::env::current_dir()
       .context("resolve current directory")?
-      .join("cadder-logs-excerpt.txt");
-    std::fs::write(&output_path, self.logs.join("\n"))
-      .with_context(|| format!("write {}", output_path.display()))?;
+      .join(filename);
+    std::fs::write(
+      &output_path,
+      format_log_excerpt(target, &self.model.logs.entries),
+    )
+    .with_context(|| format!("write {}", output_path.display()))?;
     self.message = format!("Exported {}", output_path.display());
     Ok(())
   }
+}
 
+enum ToggleRequest {
+  Entrypoint(SetEntrypointEnabledRequest),
+  Domain(SetDomainEnabledRequest),
+}
+
+fn safe_filename(input: &str) -> String {
+  let mut output = String::with_capacity(input.len());
+  for ch in input.chars() {
+    if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+      output.push(ch);
+    } else {
+      output.push('-');
+    }
+  }
+  output.trim_matches('-').to_string()
+}
+
+fn format_log_excerpt(target: &model::LogTarget, entries: &[LogEntry]) -> String {
+  let mut lines = vec![
+    format!("Cadder diagnostic log excerpt for {}", target.domain_name),
+    format!("Registration: {}", target.registration_id),
+    format!("Stream: {}", target.stream.stream_id),
+    "Messages are daemon-redacted before export.".to_string(),
+    String::new(),
+  ];
+  lines.extend(entries.iter().map(|entry| {
+    format!(
+      "{} {:?} domain={} source={:?} {}",
+      entry.timestamp_utc.to_rfc3339(),
+      entry.severity,
+      entry
+        .domain_key
+        .as_deref()
+        .unwrap_or(target.domain_name.as_str()),
+      entry.source_registration_id,
+      entry.raw_message
+    )
+  }));
+  lines.push(String::new());
+  lines.join("\n")
+}
+
+impl TuiApp {
   fn draw(&self, frame: &mut Frame<'_>) {
     let [tabs_area, body_area, status_area] = Layout::vertical([
       Constraint::Length(3),
@@ -296,7 +541,8 @@ impl TuiApp {
       search,
       self
         .model
-        .minimum_log_severity
+        .logs
+        .minimum_severity
         .map(|severity| format!(" severity: {severity:?}"))
         .unwrap_or_default()
     );
@@ -379,17 +625,73 @@ impl TuiApp {
   }
 
   fn draw_logs(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
-    let title = if self.model.logs_paused {
-      "Logs paused"
-    } else {
-      "Logs tailing"
-    };
-    let items = self
-      .logs
-      .iter()
-      .map(|line| ListItem::new(line.clone()))
-      .collect::<Vec<_>>();
+    let logs = &self.model.logs;
+    let target = logs
+      .target
+      .as_ref()
+      .map(|target| target.domain_name.as_str())
+      .unwrap_or("no domain selected");
+    let mode = if logs.paused { "paused" } else { "tailing" };
+    let title = format!(
+      "Logs: {target} | {mode} | {:?}{}",
+      logs.status,
+      logs
+        .minimum_severity
+        .map(|severity| format!(" | min {severity:?}"))
+        .unwrap_or_default()
+    );
+    let mut items = Vec::new();
+    items.extend(self.log_state_lines().into_iter().map(ListItem::new));
+    items.extend(logs.entries.iter().map(|entry| {
+      ListItem::new(format!(
+        "{} {:?} {}",
+        entry.timestamp_utc.format("%H:%M:%S"),
+        entry.severity,
+        entry.raw_message
+      ))
+    }));
     frame.render_widget(List::new(items).block(Block::bordered().title(title)), area);
+  }
+
+  fn log_state_lines(&self) -> Vec<String> {
+    let logs = &self.model.logs;
+    let mut lines = Vec::new();
+    if logs.target.is_none() {
+      lines.push("Select a domain row and press Enter or l to view logs.".to_string());
+      return lines;
+    }
+    if logs.loading {
+      lines.push("Loading log entries...".to_string());
+    }
+    if logs.paused {
+      lines.push("Auto-scroll paused. Press p to resume or Enter to refresh.".to_string());
+    }
+    if let Some(error) = &logs.read_error {
+      lines.push(format!("Read error: {error}"));
+    }
+    match logs.status {
+      LogStreamStatus::Empty if !logs.loading => {
+        lines.push("No log entries for this domain.".to_string())
+      }
+      LogStreamStatus::Stale => {
+        lines.push("The stream is stale because the domain is not active.".to_string())
+      }
+      LogStreamStatus::Removed => {
+        lines.push("The domain was removed; retained entries may still be shown.".to_string())
+      }
+      LogStreamStatus::ReadError => {}
+      _ => {}
+    }
+    if logs.has_gap {
+      lines.push("Some entries were skipped before this page.".to_string());
+    }
+    if logs.has_more_before {
+      lines.push("Older entries exist before this excerpt.".to_string());
+    }
+    if logs.truncated_by_retention {
+      lines.push("Older entries were truncated by daemon retention.".to_string());
+    }
+    lines
   }
 
   fn draw_diagnostics(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {

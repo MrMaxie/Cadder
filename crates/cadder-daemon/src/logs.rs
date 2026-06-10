@@ -41,7 +41,15 @@ pub struct CaddyLogStore {
 struct LogInner {
   next_sequence: u64,
   entries: VecDeque<LogEntry>,
-  per_stream_counts: HashMap<String, usize>,
+  per_stream: HashMap<String, StreamRetention>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct StreamRetention {
+  retained_count: usize,
+  dropped_count: usize,
+  first_sequence: Option<u64>,
+  last_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,13 +110,16 @@ impl CaddyLogStore {
     };
     let key = stream_key(&entry.stream);
     inner.entries.push_back(entry.clone());
-    *inner.per_stream_counts.entry(key.clone()).or_default() += 1;
+    let stats = inner.per_stream.entry(key.clone()).or_default();
+    stats.retained_count += 1;
+    stats.first_sequence.get_or_insert(entry.sequence_number);
+    stats.last_sequence = Some(entry.sequence_number);
 
     while inner.entries.len() > self.max_entries
       || inner
-        .per_stream_counts
+        .per_stream
         .get(&key)
-        .copied()
+        .map(|stats| stats.retained_count)
         .unwrap_or_default()
         > self.max_per_stream
     {
@@ -116,8 +127,11 @@ impl CaddyLogStore {
         break;
       };
       let removed_key = stream_key(&removed.stream);
-      if let Some(count) = inner.per_stream_counts.get_mut(&removed_key) {
-        *count = count.saturating_sub(1);
+      let first_retained = first_sequence_for_key(&inner.entries, &removed_key);
+      if let Some(stats) = inner.per_stream.get_mut(&removed_key) {
+        stats.retained_count = stats.retained_count.saturating_sub(1);
+        stats.dropped_count += 1;
+        stats.first_sequence = first_retained;
       }
     }
 
@@ -126,6 +140,18 @@ impl CaddyLogStore {
 
   pub fn query(&self, query: LogQuery, stream_is_active: bool) -> LogQueryResult {
     let inner = self.inner.lock().expect("log mutex poisoned");
+    let key = stream_key(&query.stream);
+    let retention = inner.per_stream.get(&key).cloned().unwrap_or_default();
+    let matching_retained_count = inner
+      .entries
+      .iter()
+      .filter(|entry| same_stream(&entry.stream, &query.stream))
+      .filter(|entry| {
+        query
+          .minimum_severity
+          .is_none_or(|min| entry.severity >= min)
+      })
+      .count();
     let mut entries: Vec<_> = inner
       .entries
       .iter()
@@ -143,17 +169,28 @@ impl CaddyLogStore {
       .cloned()
       .collect();
 
+    let matched_before_limit = entries.len();
     let has_more_before = entries.len() > query.limit;
     if entries.len() > query.limit {
       let split_at = entries.len() - query.limit;
       entries = entries.split_off(split_at);
     }
 
+    let retention_gap = query.after_sequence.is_some_and(|after_sequence| {
+      if let Some(first_sequence) = retention.first_sequence {
+        after_sequence.saturating_add(1) < first_sequence
+      } else {
+        retention
+          .last_sequence
+          .is_some_and(|last_sequence| after_sequence < last_sequence)
+      }
+    });
+    let tail_gap = query.after_sequence.is_some() && matched_before_limit > query.limit;
     let next_cursor = entries
       .last()
       .map(|entry| format!("seq:{}", entry.sequence_number));
 
-    let status = if entries.is_empty() {
+    let status = if matching_retained_count == 0 {
       if stream_is_active {
         LogStreamStatus::Empty
       } else {
@@ -169,9 +206,10 @@ impl CaddyLogStore {
       status,
       entries,
       next_cursor,
-      has_gap: false,
-      has_more_before,
-      truncated_by_retention: false,
+      has_gap: retention_gap || tail_gap,
+      has_more_before: has_more_before
+        || (query.after_sequence.is_none() && retention.dropped_count > 0),
+      truncated_by_retention: retention.dropped_count > 0,
     }
   }
 }
@@ -189,6 +227,13 @@ fn same_stream(left: &LogStreamIdentity, right: &LogStreamIdentity) -> bool {
   left.stream_id == right.stream_id
     && left.channel == right.channel
     && left.domain_key == right.domain_key
+}
+
+fn first_sequence_for_key(entries: &VecDeque<LogEntry>, key: &str) -> Option<u64> {
+  entries
+    .iter()
+    .find(|entry| stream_key(&entry.stream) == key)
+    .map(|entry| entry.sequence_number)
 }
 
 #[cfg(test)]
@@ -243,5 +288,114 @@ mod tests {
     assert_eq!(result.status, LogStreamStatus::Active);
     assert_eq!(result.entries.len(), 1);
     assert_eq!(result.entries[0].raw_message, "second");
+  }
+
+  #[test]
+  fn reports_tail_gap_when_more_new_entries_than_limit() {
+    let store = CaddyLogStore::new(10, 10);
+    let stream = LogStreamIdentity::domain("app.localhost");
+    let first = store.append(
+      stream.clone(),
+      LogSeverity::Info,
+      "first",
+      LogAttributionKind::Domain,
+      None,
+    );
+    store.append(
+      stream.clone(),
+      LogSeverity::Info,
+      "second",
+      LogAttributionKind::Domain,
+      None,
+    );
+    store.append(
+      stream.clone(),
+      LogSeverity::Info,
+      "third",
+      LogAttributionKind::Domain,
+      None,
+    );
+
+    let result = store.query(
+      LogQuery {
+        stream,
+        limit: 1,
+        after_sequence: Some(first.sequence_number),
+        minimum_severity: None,
+      },
+      true,
+    );
+
+    assert!(result.has_gap);
+    assert!(result.has_more_before);
+    assert_eq!(result.entries.len(), 1);
+    assert_eq!(result.entries[0].raw_message, "third");
+  }
+
+  #[test]
+  fn reports_retention_truncation_for_old_cursor() {
+    let store = CaddyLogStore::new(2, 2);
+    let stream = LogStreamIdentity::domain("app.localhost");
+    let first = store.append(
+      stream.clone(),
+      LogSeverity::Info,
+      "first",
+      LogAttributionKind::Domain,
+      None,
+    );
+    store.append(
+      stream.clone(),
+      LogSeverity::Info,
+      "second",
+      LogAttributionKind::Domain,
+      None,
+    );
+    store.append(
+      stream.clone(),
+      LogSeverity::Info,
+      "third",
+      LogAttributionKind::Domain,
+      None,
+    );
+
+    let result = store.query(
+      LogQuery {
+        stream,
+        limit: 10,
+        after_sequence: Some(first.sequence_number - 1),
+        minimum_severity: None,
+      },
+      true,
+    );
+
+    assert!(result.has_gap);
+    assert!(result.truncated_by_retention);
+    assert_eq!(result.entries.len(), 2);
+  }
+
+  #[test]
+  fn active_tail_query_stays_active_when_no_new_entries_arrive() {
+    let store = CaddyLogStore::new(10, 10);
+    let stream = LogStreamIdentity::domain("app.localhost");
+    let first = store.append(
+      stream.clone(),
+      LogSeverity::Info,
+      "first",
+      LogAttributionKind::Domain,
+      None,
+    );
+
+    let result = store.query(
+      LogQuery {
+        stream,
+        limit: 10,
+        after_sequence: Some(first.sequence_number),
+        minimum_severity: None,
+      },
+      true,
+    );
+
+    assert_eq!(result.status, LogStreamStatus::Active);
+    assert!(result.entries.is_empty());
   }
 }

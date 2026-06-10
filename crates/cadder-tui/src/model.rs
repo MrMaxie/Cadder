@@ -1,5 +1,6 @@
 use cadder_protocol::{
-  EntrypointRegistration, GuiStateSnapshot, LogSeverity, LogStreamIdentity, RegisteredDomain,
+  EntrypointRegistration, GuiStateSnapshot, LogEntry, LogSeverity, LogStreamIdentity,
+  LogStreamStatus, RegisteredDomain,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,9 +42,107 @@ pub struct TuiModel {
   pub search: String,
   pub search_mode: bool,
   pub selected: usize,
-  pub logs_paused: bool,
-  pub minimum_log_severity: Option<LogSeverity>,
+  pub logs: LogViewModel,
   snapshot: GuiStateSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogTarget {
+  pub registration_id: String,
+  pub domain_name: String,
+  pub stream: LogStreamIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogViewModel {
+  pub target: Option<LogTarget>,
+  pub entries: Vec<LogEntry>,
+  pub next_cursor: Option<String>,
+  pub loading: bool,
+  pub request_in_flight: bool,
+  pub paused: bool,
+  pub minimum_severity: Option<LogSeverity>,
+  pub status: LogStreamStatus,
+  pub has_gap: bool,
+  pub has_more_before: bool,
+  pub truncated_by_retention: bool,
+  pub read_error: Option<String>,
+}
+
+impl Default for LogViewModel {
+  fn default() -> Self {
+    Self {
+      target: None,
+      entries: Vec::new(),
+      next_cursor: None,
+      loading: false,
+      request_in_flight: false,
+      paused: false,
+      minimum_severity: None,
+      status: LogStreamStatus::Empty,
+      has_gap: false,
+      has_more_before: false,
+      truncated_by_retention: false,
+      read_error: None,
+    }
+  }
+}
+
+impl LogViewModel {
+  pub fn reset_for_target(&mut self, target: LogTarget) {
+    let paused = self.paused;
+    let minimum_severity = self.minimum_severity;
+    *self = Self {
+      target: Some(target),
+      paused,
+      minimum_severity,
+      loading: true,
+      request_in_flight: false,
+      ..Self::default()
+    };
+  }
+
+  pub fn reset_for_filter(&mut self, minimum_severity: Option<LogSeverity>) {
+    self.entries.clear();
+    self.next_cursor = None;
+    self.loading = self.target.is_some();
+    self.request_in_flight = false;
+    self.minimum_severity = minimum_severity;
+    self.status = LogStreamStatus::Empty;
+    self.has_gap = false;
+    self.has_more_before = false;
+    self.truncated_by_retention = false;
+    self.read_error = None;
+  }
+
+  pub fn mark_loading(&mut self) {
+    self.loading = true;
+    self.request_in_flight = true;
+    self.read_error = None;
+  }
+
+  pub fn apply_response(&mut self, response: cadder_protocol::QueryLogsResponse) {
+    self.loading = false;
+    self.request_in_flight = false;
+    self.status = response.stream_status;
+    self.has_gap = response.has_gap;
+    self.has_more_before = response.has_more_before;
+    self.truncated_by_retention = response.truncated_by_retention;
+    self.next_cursor = response.next_cursor;
+    self.read_error = None;
+    self.entries.extend(response.entries);
+  }
+
+  pub fn apply_read_error(&mut self, message: String) {
+    self.loading = false;
+    self.request_in_flight = false;
+    self.status = LogStreamStatus::ReadError;
+    self.read_error = Some(message);
+  }
+
+  pub fn active_stream(&self) -> Option<LogStreamIdentity> {
+    self.target.as_ref().map(|target| target.stream.clone())
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,8 +161,7 @@ impl Default for TuiModel {
       search: String::new(),
       search_mode: false,
       selected: 0,
-      logs_paused: false,
-      minimum_log_severity: None,
+      logs: LogViewModel::default(),
       snapshot: GuiStateSnapshot {
         captured_at_utc: chrono::Utc::now(),
         registrations: Vec::new(),
@@ -180,21 +278,29 @@ impl TuiModel {
       .map(|(registration, domain)| (registration.registration_id.clone(), (*domain).clone()))
   }
 
-  pub fn selected_log_stream(&self) -> Option<LogStreamIdentity> {
+  pub fn selected_log_target(&self) -> Option<LogTarget> {
     self
       .selected_domain()
-      .map(|(_, domain)| domain.log_stream)
-      .or_else(|| {
-        self
-          .selected_entrypoint()
-          .map(|registration| registration.log_stream.clone())
+      .map(|(registration_id, domain)| LogTarget {
+        registration_id,
+        domain_name: domain.name.canonical,
+        stream: domain.log_stream,
       })
+  }
+
+  pub fn open_selected_domain_logs(&mut self) -> bool {
+    let Some(target) = self.selected_log_target() else {
+      return false;
+    };
+    self.logs.reset_for_target(target);
+    self.view = View::Logs;
+    true
   }
 
   fn visible_len(&self) -> usize {
     match self.view {
       View::Entrypoints => self.filtered_registrations().len(),
-      View::Domains | View::Logs => self.filtered_domains().len(),
+      View::Domains => self.filtered_domains().len(),
       _ => 0,
     }
   }
@@ -269,5 +375,54 @@ mod tests {
 
     assert_eq!(domains.len(), 1);
     assert_eq!(domains[0].1.name.canonical, "api.localhost");
+  }
+
+  #[test]
+  fn opens_selected_domain_log_target() {
+    let mut model = TuiModel::default();
+    model.set_snapshot(snapshot());
+    model.view = View::Domains;
+
+    assert!(model.open_selected_domain_logs());
+
+    let target = model.logs.target.as_ref().unwrap();
+    assert_eq!(model.view, View::Logs);
+    assert_eq!(target.registration_id, "shim-1");
+    assert_eq!(target.domain_name, "app.localhost");
+    assert_eq!(target.stream, LogStreamIdentity::domain("app.localhost"));
+    assert!(model.logs.loading);
+  }
+
+  #[test]
+  fn severity_change_resets_log_cursor_and_entries() {
+    let mut logs = LogViewModel {
+      target: Some(LogTarget {
+        registration_id: "shim-1".to_string(),
+        domain_name: "app.localhost".to_string(),
+        stream: LogStreamIdentity::domain("app.localhost"),
+      }),
+      next_cursor: Some("seq:10".to_string()),
+      entries: vec![cadder_protocol::LogEntry {
+        sequence_number: 10,
+        timestamp_utc: Utc::now(),
+        severity: LogSeverity::Info,
+        stream: LogStreamIdentity::domain("app.localhost"),
+        attribution_kind: cadder_protocol::LogAttributionKind::Domain,
+        entry_kind: cadder_protocol::LogEntryKind::Normal,
+        raw_message: "first".to_string(),
+        domain_key: Some("app.localhost".to_string()),
+        source_registration_id: None,
+        source_instance_id: None,
+        operation: None,
+      }],
+      ..LogViewModel::default()
+    };
+
+    logs.reset_for_filter(Some(LogSeverity::Error));
+
+    assert!(logs.entries.is_empty());
+    assert_eq!(logs.next_cursor, None);
+    assert_eq!(logs.minimum_severity, Some(LogSeverity::Error));
+    assert!(logs.loading);
   }
 }

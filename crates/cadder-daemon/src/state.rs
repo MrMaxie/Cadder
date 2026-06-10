@@ -340,11 +340,11 @@ impl DaemonState {
       return true;
     }
     inner.registrations.values().any(|registration| {
-      registration.log_stream == *stream
+      (registration.log_stream == *stream && registration.activation_state.is_enabled())
         || registration
           .registered_domains
           .iter()
-          .any(|domain| domain.log_stream == *stream)
+          .any(|domain| domain.log_stream == *stream && domain.activation_state.is_enabled())
     })
   }
 }
@@ -362,8 +362,8 @@ mod tests {
     CaddyConfigAdapter, CaddyConfigCoordinator, ProcessRuntime, RealCaddyResolver, RuntimePaths,
   };
   use cadder_protocol::{
-    EntrypointInstanceIdentity, LogStreamIdentity, OwnerProcessIdentity, RegisteredDomain,
-    SourcePath,
+    EntrypointInstanceIdentity, LogAttributionKind, LogSeverity, LogStreamIdentity,
+    LogStreamStatus, OwnerProcessIdentity, QueryLogsRequest, RegisteredDomain, SourcePath,
   };
   use chrono::Utc;
 
@@ -420,5 +420,45 @@ mod tests {
       .await;
     assert!(right.accepted);
     assert!(state.snapshot().await.registrations.is_empty());
+  }
+
+  #[tokio::test]
+  async fn disabled_domain_log_stream_is_reported_stale() {
+    let state = state();
+    let response = state
+      .register("register".to_string(), registration("shim-1", "nonce-1"))
+      .await;
+    assert!(response.accepted);
+    let stream = LogStreamIdentity::domain("app.localhost");
+    state.logs().append(
+      stream.clone(),
+      LogSeverity::Info,
+      "domain log",
+      LogAttributionKind::Domain,
+      None,
+    );
+
+    let toggle = state
+      .set_domain_enabled(SetDomainEnabledRequest {
+        request_id: "toggle".to_string(),
+        registration_id: "shim-1".to_string(),
+        domain_key: "app.localhost".to_string(),
+        enabled: false,
+      })
+      .await;
+    assert!(toggle.accepted);
+
+    let logs = state
+      .query_logs(QueryLogsRequest {
+        request_id: "logs".to_string(),
+        stream,
+        limit: Some(10),
+        cursor: None,
+        minimum_severity: None,
+      })
+      .await;
+
+    assert_eq!(logs.stream_status, LogStreamStatus::Stale);
+    assert_eq!(logs.entries.len(), 1);
   }
 }

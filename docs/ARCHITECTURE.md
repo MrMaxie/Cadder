@@ -69,6 +69,16 @@ The adapted JSON is inspected for HTTP host matchers. The adapter resolves real 
 
 Runtime operations start the owned real Caddy process with the generated config and reload it on subsequent config changes. Captured stdout/stderr and control events are stored in a bounded log store with redaction for token-like values.
 
+## Domain Logs TUI
+
+`cadder-tui` exposes per-domain logs from the Domains view. Pressing `Enter` or `l` on a domain row opens a log-focused view bound to that domain's `LogStreamIdentity`; the view keeps the selected stream even if registrations change later, so it never silently falls back to an entrypoint or unrelated domain.
+
+The TUI loads a bounded page through `query-logs-request`, stores the returned cursor, and tails by issuing follow-up requests with that cursor. Auto-tail is enabled by default and can be paused with `p`; while paused, the TUI keeps keyboard handling responsive and avoids automatic refreshes until the user resumes or manually refreshes with `Enter`. Severity shortcuts reset the cursor before reloading so entries from different filters are not mixed.
+
+Log refresh, state refresh, activation toggles, and shutdown requests are dispatched as short background IPC tasks. The TUI accepts at most one active log refresh for the current stream and surfaces IPC failures as a read-error state rather than blocking terminal input.
+
+The log store reports stream status and retention metadata in `query-logs-response`, including active, empty, stale, removed, read-error, gap, more-before, and truncated-by-retention states. Diagnostic exports are timestamped text files in the caller's current working directory and contain only the daemon-redacted `LogEntry.raw_message` content plus stream metadata.
+
 ## Portable Packaging
 
 `cargo run -p xtask -- dist --out <dir>` builds release binaries and copies the current platform's executable names into a portable layout:
