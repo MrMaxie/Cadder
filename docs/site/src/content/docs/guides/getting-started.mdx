@@ -1,0 +1,65 @@
+---
+title: Getting started
+description: Build Cadder, choose a real Caddy command, run a project through the shim, and inspect it in the TUI.
+---
+
+## Prerequisites
+
+- Rust and Cargo for building Cadder.
+- A real Caddy binary available either on `PATH` or through Cadder configuration.
+- Bun only when working on this documentation site.
+
+## Build and validate the workspace
+
+From the repository root:
+
+```sh
+cargo run -p xtask -- check
+```
+
+`xtask check` runs:
+
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+## Create a portable layout
+
+```sh
+cargo run -p xtask -- dist --out .local/dist/cadder
+```
+
+The layout contains `cadderd`, `cadder-tui`, `caddy`, and `cadder.toml`. On Windows the executables use `.exe`.
+
+Cadder does not edit system state during this step. The command builds release binaries, copies them into the output directory, writes a sample `cadder.toml`, and verifies the copied shim with `caddy --cadder-shim-info`.
+
+## Configure real Caddy when needed
+
+If the first safe `caddy` on `PATH` is not the real Caddy binary, set it explicitly:
+
+```toml
+[caddy]
+real_command = "/absolute/path/to/caddy"
+```
+
+Place that file in the project working directory for project-specific behavior, or next to the Cadder executable for portable-layout defaults.
+
+## Run a project
+
+From a project directory with a `Caddyfile`:
+
+```sh
+.local/dist/cadder/caddy run
+```
+
+The shim starts or connects to `cadderd`, registers the project's config, and keeps the registration alive until the shim exits.
+
+## Inspect the daemon
+
+```sh
+.local/dist/cadder/cadder-tui
+```
+
+Use the TUI to inspect runtime state, registered entrypoints, domains, logs, diagnostics, activation toggles, and daemon shutdown.

@@ -1,0 +1,35 @@
+---
+title: Validation
+description: Repository and documentation checks for Cadder contributors.
+---
+
+Use Cargo from the repository root for Rust validation:
+
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p xtask -- check
+```
+
+`cargo run -p xtask -- check` is the single repository validation command. Focused commands are useful while iterating, but full validation should pass before closeout.
+
+## Documentation checks
+
+Run documentation checks from `docs/site`:
+
+```sh
+bun install --frozen-lockfile
+bun run check
+bun run build
+```
+
+`bun run build` writes `docs/site/dist`. The generated directory is ignored and should not be committed.
+
+## Manual TUI smoke check
+
+Use the repository file `docs/verification/tui-smoke.md` after lifecycle or TUI-facing changes. Record the platform, terminal backend, runtime directory, Caddy command, and any rendering or daemon issue.
+
+## Coverage
+
+The project target is at least 85% coverage. TASK-1.17 tracks defining and enforcing the coverage gate. Until that gate exists, record whether coverage was measured and avoid claiming the threshold was verified when only format, clippy, tests, or docs builds were run.

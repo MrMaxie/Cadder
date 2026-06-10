@@ -1,0 +1,35 @@
+---
+title: macOS
+description: macOS usage guidance for portable Cadder binaries and optional user-managed PATH setup.
+---
+
+## Direct portable use
+
+```sh
+./.local/dist/cadder/caddy run
+./.local/dist/cadder/cadder-tui
+```
+
+## Optional user PATH setup
+
+This example symlinks the Cadder shim into a user-owned directory and updates only the current shell:
+
+```sh
+mkdir -p "$HOME/bin"
+ln -sf "$PWD/.local/dist/cadder/caddy" "$HOME/bin/caddy"
+export PATH="$HOME/bin:$PATH"
+caddy run
+```
+
+Cadder does not edit shell profile files. Add the `PATH` entry to your own shell startup files only if you want it to persist.
+
+## Configure real Caddy
+
+When the Cadder shim is first on `PATH`, configure real Caddy explicitly:
+
+```toml
+[caddy]
+real_command = "/opt/homebrew/bin/caddy"
+```
+
+Use the path that matches your Caddy installation.

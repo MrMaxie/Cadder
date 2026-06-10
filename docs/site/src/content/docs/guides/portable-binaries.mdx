@@ -1,0 +1,44 @@
+---
+title: Portable binaries
+description: Build and verify the portable Cadder layout without mutating PATH, services, profiles, or package-manager state.
+---
+
+Cadder's portable layout is a directory of binaries plus a sample configuration file. It is designed for copying, zipping, unpacking, and running without an installer.
+
+## Build the layout
+
+From the repository root:
+
+```sh
+cargo run -p xtask -- dist --out .local/dist/cadder
+```
+
+The output contains:
+
+- `cadderd`
+- `cadder-tui`
+- `caddy`
+- `cadder.toml`
+
+On Windows the binaries are `cadderd.exe`, `cadder-tui.exe`, and `caddy.exe`.
+
+## Verify an existing layout
+
+```sh
+cargo run -p xtask -- verify-dist --dir .local/dist/cadder
+```
+
+`verify-dist` checks the expected files and runs the layout's `caddy --cadder-shim-info` command to confirm that the copied `caddy` executable is the Cadder shim.
+
+## What the build does not do
+
+The portable build does not:
+
+- edit `PATH`;
+- write shell profile files;
+- install OS services;
+- replace package-manager shims;
+- copy image assets into the runtime layout;
+- require `assets/banner.png` or `assets/logo.png` at runtime.
+
+The user or release package decides where the directory lives and whether any shim is placed in a user-controlled `PATH` directory.

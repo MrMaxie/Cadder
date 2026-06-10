@@ -1,0 +1,33 @@
+---
+title: Real Caddy resolution
+description: Exact precedence used when Cadder finds the real Caddy binary.
+---
+
+Cadder never embeds Caddy. It resolves the external real Caddy command in this order:
+
+1. CLI override: `--real-caddy-command` for `cadderd` and `cadder-tui` daemon launch, or `--cadder-real-caddy-command` for the shim.
+2. `[caddy].real_command` in `cadder.toml` in the current working directory.
+3. `[caddy].real_command` in `cadder.toml` next to the executable.
+4. Environment variables, including `CADDER_CADDY_REAL_COMMAND`.
+5. A safe real `caddy` executable on `PATH`.
+
+## TOML schema
+
+```toml
+[caddy]
+real_command = "/absolute/path/to/caddy"
+```
+
+The configured command can be:
+
+- an absolute path, such as `/opt/caddy/caddy` or `C:\Tools\Caddy\caddy.exe`;
+- a relative path with a path separator, such as `./tools/caddy`, resolved relative to the `cadder.toml` file that contains it;
+- a plain command, such as `caddy`, resolved through `PATH`.
+
+`caddy-real` is not a built-in default. It works only when you configure it explicitly through CLI, `cadder.toml`, or an environment variable.
+
+## Recursion safety
+
+PATH fallback excludes the current executable and the known shim path from `CADDER_CADDY_SHIM_PATH`. When the shim starts the daemon, it passes its own path through that environment variable so the daemon does not select the shim as real Caddy.
+
+If no safe binary can be found, Cadder prints resolution help and asks you to configure the real Caddy command through one of the precedence layers above.

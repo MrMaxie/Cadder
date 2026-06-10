@@ -130,3 +130,16 @@ You can also keep the shim under another name and call it directly. Cadder does 
 6. Stop the shim process with Ctrl+C when that project entrypoint should unregister.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for process boundaries, IPC shape, runtime ownership, and packaging details.
+
+## Documentation site
+
+The Astro Starlight documentation source lives in [docs/site](docs/site). Build it with Bun:
+
+```sh
+cd docs/site
+bun install --frozen-lockfile
+bun run check
+bun run build
+```
+
+Generated output is written to `docs/site/dist` and should not be committed.

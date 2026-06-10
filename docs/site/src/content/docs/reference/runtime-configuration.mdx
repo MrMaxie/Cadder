@@ -1,0 +1,47 @@
+---
+title: Runtime and configuration
+description: Runtime directories, daemon state files, configuration sources, and environment overrides.
+---
+
+Cadder keeps runtime state per user. By default it asks `directories::ProjectDirs` for the platform runtime directory and falls back to a local data `run` directory when the platform has no runtime directory.
+
+## Runtime override
+
+Set `CADDER_RUNTIME_DIR` or pass `--runtime-dir` to use a specific directory:
+
+```sh
+cadderd --runtime-dir .local/run/cadder
+cadder-tui --runtime-dir .local/run/cadder
+caddy --cadder-runtime-dir .local/run/cadder run
+```
+
+This is useful for tests, demos, isolated development environments, and portable layouts that should not share daemon state with the normal user runtime.
+
+## Runtime files
+
+The daemon runtime directory contains:
+
+- `cadder.lock`, the daemon ownership lock;
+- `daemon.json`, daemon metadata used by clients;
+- `effective-caddy.json`, the generated Caddy config applied to the owned real Caddy process.
+
+The IPC socket name is derived from the runtime directory, so separate runtime directories do not collide.
+
+## Configuration sources
+
+Cadder currently supports configuration for real Caddy resolution through:
+
+- CLI overrides;
+- `cadder.toml` in the project working directory;
+- `cadder.toml` next to the Cadder executable;
+- environment variables such as `CADDER_CADDY_REAL_COMMAND` and `CADDER_CADDY__REAL_COMMAND`;
+- safe `PATH` fallback.
+
+The only documented TOML section today is:
+
+```toml
+[caddy]
+real_command = "/absolute/path/to/caddy"
+```
+
+Other runtime behavior comes from daemon state and IPC requests rather than persistent user configuration.

@@ -1,0 +1,45 @@
+---
+title: Release process
+description: Portable layout expectations and documentation publishing handoff for CI.
+---
+
+Cadder releases should publish portable binaries and documentation generated from source.
+
+## Portable artifact
+
+Build the platform layout with:
+
+```sh
+cargo run -p xtask -- dist --out <output-dir>
+```
+
+The layout must include:
+
+- `cadderd`
+- `cadder-tui`
+- `caddy`
+- `cadder.toml`
+
+On Windows the executables include `.exe`.
+
+Verify the layout with:
+
+```sh
+cargo run -p xtask -- verify-dist --dir <output-dir>
+```
+
+The release process should not imply that Cadder edits `PATH`, installs services, writes shell profiles, or replaces package-manager shims.
+
+## Documentation build handoff
+
+CI for documentation publishing should:
+
+1. Run on `push` to `main`.
+2. Install Bun.
+3. Run `bun install --frozen-lockfile` in `docs/site`.
+4. Run `bun run check`.
+5. Run `bun run build`.
+6. Publish or upload `docs/site/dist`.
+7. Avoid committing generated documentation output back to the repository.
+
+TASK-1.15 owns the GitHub Actions implementation. This page records the expected contract without claiming that publishing already exists.

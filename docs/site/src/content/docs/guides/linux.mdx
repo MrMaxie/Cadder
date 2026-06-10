@@ -1,0 +1,43 @@
+---
+title: Linux
+description: Linux usage guidance for portable Cadder binaries, runtime directories, and optional user-managed PATH setup.
+---
+
+## Direct portable use
+
+```sh
+./.local/dist/cadder/caddy run
+./.local/dist/cadder/cadder-tui
+```
+
+## Optional user PATH setup
+
+This example symlinks the Cadder shim into a user-owned directory and updates only the current shell:
+
+```sh
+mkdir -p "$HOME/bin"
+ln -sf "$PWD/.local/dist/cadder/caddy" "$HOME/bin/caddy"
+export PATH="$HOME/bin:$PATH"
+caddy run
+```
+
+Cadder does not write shell profile files, systemd units, package-manager shims, or global directories.
+
+## Runtime directory
+
+By default Cadder uses a per-user runtime directory from `directories::ProjectDirs`. For isolated test runs:
+
+```sh
+CADDER_RUNTIME_DIR="$PWD/.local/run/cadder" ./.local/dist/cadder/cadderd
+```
+
+Use the same runtime directory for the shim and TUI when you want them to talk to that daemon.
+
+## Configure real Caddy
+
+```toml
+[caddy]
+real_command = "/usr/bin/caddy"
+```
+
+Set this when the first safe `caddy` on `PATH` is not the real Caddy binary.

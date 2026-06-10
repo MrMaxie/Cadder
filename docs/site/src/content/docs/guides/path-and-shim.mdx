@@ -1,0 +1,44 @@
+---
+title: PATH and shim strategy
+description: Use Cadder with direct paths, a user-managed PATH directory, or an explicit shim copy without implying automatic PATH mutation.
+---
+
+Cadder's `caddy` binary is a compatibility shim. It is useful when you want existing `caddy run` habits to register projects with Cadder.
+
+Cadder does not put the shim on `PATH` for you. It does not edit shell profiles, package-manager shims, OS services, or installer state.
+
+## Direct invocation
+
+You can run the portable binaries directly:
+
+```sh
+.local/dist/cadder/cadderd
+.local/dist/cadder/cadder-tui
+.local/dist/cadder/caddy run
+```
+
+This is the lowest-risk setup because command names are explicit.
+
+## User-managed PATH
+
+If you want `caddy run` to go through Cadder, copy or symlink the Cadder shim into a directory you control under the name `caddy`, then put that directory before the real Caddy directory on `PATH`.
+
+The real Caddy binary still needs to be resolvable by Cadder. If the shim shadows the only `caddy` on `PATH`, configure the real command with `--real-caddy-command`, `cadder.toml`, or `CADDER_CADDY_REAL_COMMAND`.
+
+## Keep a separate real Caddy path
+
+A practical layout is:
+
+```text
+/home/alice/bin/caddy          # Cadder shim
+/home/alice/tools/caddy/caddy  # real Caddy binary
+```
+
+Then configure:
+
+```toml
+[caddy]
+real_command = "/home/alice/tools/caddy/caddy"
+```
+
+Use an absolute path where possible. Cadder resolves the configured command directly; it does not perform shell expansion.

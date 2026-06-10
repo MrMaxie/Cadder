@@ -1,0 +1,40 @@
+---
+title: Windows
+description: Windows usage guidance for portable Cadder binaries and user-managed shim setup.
+---
+
+Cadder's Windows binaries use the normal `.exe` suffix: `cadderd.exe`, `cadder-tui.exe`, and `caddy.exe`.
+
+## Direct portable use
+
+```powershell
+.\.local\dist\cadder\caddy.exe run
+.\.local\dist\cadder\cadder-tui.exe
+```
+
+Run these from the repository root or adjust the path to the portable directory.
+
+## Optional user PATH setup
+
+This example copies only the Cadder shim into a user-owned directory and updates the current PowerShell session:
+
+```powershell
+$cadder = "$HOME\bin\cadder"
+New-Item -ItemType Directory -Force $cadder
+Copy-Item .local\dist\cadder\caddy.exe "$cadder\caddy.exe"
+$env:Path = "$cadder;$env:Path"
+caddy run
+```
+
+This does not persist `PATH` and does not change system settings. To make the setup permanent, edit your own user environment through your preferred Windows workflow.
+
+## Configure real Caddy
+
+If the shim shadows the real `caddy.exe`, put the real command in `cadder.toml`:
+
+```toml
+[caddy]
+real_command = "C:\\Tools\\Caddy\\caddy.exe"
+```
+
+Use a path outside the Cadder shim directory.

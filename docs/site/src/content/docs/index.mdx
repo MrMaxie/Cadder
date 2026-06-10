@@ -1,0 +1,23 @@
+---
+title: Cadder documentation
+description: Start here for the Cadder daemon, shim, TUI, portable binaries, and local Caddy coordination model.
+---
+
+Cadder is a cross-platform Rust coordinator for project-local Caddy development. It lets many project `caddy run` processes share one per-user daemon and one Cadder-owned real Caddy runtime.
+
+Cadder does not install global shims, edit `PATH`, create OS services, modify shell profiles, or change package-manager state. You choose how to run the binaries: directly from a portable directory, through a user-managed `PATH` entry, or through a copy or symlink in a directory you control.
+
+## Binaries
+
+- `cadderd` runs the per-user daemon. It owns IPC, registrations, adapted Caddy config, generated effective runtime config, the real Caddy process it starts, diagnostics, and bounded logs.
+- `caddy` is the Caddy-compatible shim. `caddy run` starts or connects to `cadderd`, registers the current project, heartbeats while the shim process is alive, and unregisters on exit. Other commands are delegated to a safely resolved real Caddy binary.
+- `cadder-tui` is the terminal UI. It connects to the daemon, can start it unless `--no-start` is used, and displays overview state, entrypoints, domains, per-domain logs, diagnostics, filters, toggles, log export, and daemon shutdown.
+
+Each binary supports `--help` and `--version`.
+
+## Good first reads
+
+- [Getting started](guides/getting-started/) for the first local workflow.
+- [Portable binaries](guides/portable-binaries/) for the layout produced by `xtask`.
+- [Real Caddy resolution](reference/real-caddy-resolution/) for the exact command precedence.
+- [Architecture](reference/architecture/) for process boundaries, IPC, runtime ownership, and Caddy integration.
