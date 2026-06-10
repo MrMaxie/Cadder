@@ -1,14 +1,24 @@
+![Cadder banner](assets/banner.png)
+
 # Cadder
 
-Cadder is a cross-platform Rust coordinator for project-local Caddy development. A PATH-facing `caddy` shim registers each `caddy run` invocation with one persistent per-user daemon, and `cadder-tui` provides a minimal terminal UI for state, domains, logs, and diagnostics.
+Cadder is a cross-platform Rust coordinator for project-local Caddy development. It lets many project `caddy run` invocations share one per-user daemon and one Cadder-owned real Caddy runtime, while keeping the Caddy-compatible shim portable and user-managed.
+
+Cadder does not install global shims, edit PATH, create services, or modify shell profiles. You decide whether to run the binaries directly, put the shim on PATH, or copy/symlink it into a directory you already control.
 
 ## Binaries
 
-- `cadderd`: owns registrations, IPC, effective Caddy config composition, the real Caddy process, and bounded log storage.
-- `caddy`: PATH shim for managed `caddy run` flows. Unsupported commands delegate to real Caddy after recursion-safe resolution.
-- `cadder-tui`: Ratatui/Crossterm terminal UI for overview, entrypoints, domains, logs, diagnostics, filtering, and toggles.
+Cadder builds three executables:
 
-## Build And Validate
+- `cadderd` is the per-user daemon. It owns local IPC, entrypoint registrations, adapted Caddy config composition, the generated effective runtime config, the real Caddy process it starts, diagnostics, and bounded log storage.
+- `caddy` is the Caddy-compatible shim. For `caddy run`, it starts or connects to `cadderd`, registers the current project's Caddyfile, keeps that registration alive while the shim process runs, and unregisters on exit. Other Caddy commands are delegated to the safely resolved real Caddy binary.
+- `cadder-tui` is the terminal UI. It connects to the daemon, can start it unless `--no-start` is used, and shows overview state, entrypoints, domains, per-domain logs, diagnostics, filters, toggles, log export, and daemon shutdown.
+
+The daemon owns only the real Caddy process it starts. It does not enumerate or kill unrelated Caddy processes.
+
+## Build and validate
+
+Use Cargo from the repository root:
 
 ```sh
 cargo fmt --check
@@ -17,7 +27,9 @@ cargo test --workspace
 cargo run -p xtask -- check
 ```
 
-## Portable Distribution
+`cargo run -p xtask -- check` runs the format, clippy, and workspace test checks above. Focused Cargo commands are useful while iterating, but `xtask check` is the single repository validation command for this workspace.
+
+## Portable distribution
 
 Build a portable layout for the current platform:
 
@@ -25,7 +37,16 @@ Build a portable layout for the current platform:
 cargo run -p xtask -- dist --out .local/dist/cadder
 ```
 
-The output contains `cadderd`, `cadder-tui`, the `caddy` shim, and a sample `cadder.toml`. The command only builds and copies files; it does not edit PATH, shell profiles, package-manager shims, services, or other system state. Users may place the shim on PATH themselves under any name.
+The output contains:
+
+- `cadderd`
+- `cadder-tui`
+- `caddy`
+- `cadder.toml`
+
+On Windows, executable files use the normal `.exe` suffix: `cadderd.exe`, `cadder-tui.exe`, and `caddy.exe`.
+
+The `dist` command builds release binaries, copies the platform executable names into the target directory, writes a sample `cadder.toml`, and verifies the layout. It does not edit PATH, shell profiles, package-manager shims, OS services, or other system state.
 
 Verify an existing portable layout:
 
@@ -33,15 +54,17 @@ Verify an existing portable layout:
 cargo run -p xtask -- verify-dist --dir .local/dist/cadder
 ```
 
-## Real Caddy Resolution
+`verify-dist` checks the expected files and runs the layout's `caddy --cadder-shim-info` command to confirm that the copied `caddy` executable is the Cadder shim.
 
-Cadder resolves the real Caddy command in this order:
+## Real Caddy resolution
 
-1. CLI override: `--real-caddy-command` for `cadderd`/`cadder-tui` daemon launch, or `--cadder-real-caddy-command` for the shim.
+Cadder never embeds Caddy. It resolves the real Caddy command in this order:
+
+1. CLI override: `--real-caddy-command` for `cadderd` and `cadder-tui` daemon launch, or `--cadder-real-caddy-command` for the shim.
 2. `[caddy].real_command` in `cadder.toml` in the current working directory.
 3. `[caddy].real_command` in `cadder.toml` next to the executable.
 4. Environment variables, including `CADDER_CADDY_REAL_COMMAND`.
-5. A real `caddy` executable on PATH.
+5. A safe real `caddy` executable on PATH.
 
 Example `cadder.toml`:
 
@@ -50,6 +73,54 @@ Example `cadder.toml`:
 real_command = "/absolute/path/to/caddy"
 ```
 
-Relative paths containing a path separator in `cadder.toml`, such as `./tools/caddy`, are resolved relative to that `cadder.toml`. A plain command such as `caddy` is resolved through PATH. `caddy-real` is supported only when configured explicitly through CLI, TOML, or environment variables.
+The configured command can be:
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the process boundaries and IPC shape.
+- an absolute path, such as `/opt/caddy/caddy` or `C:\Tools\Caddy\caddy.exe`;
+- a relative path with a path separator, such as `./tools/caddy`, resolved relative to the `cadder.toml` file that contains it;
+- a plain command, such as `caddy`, resolved through PATH.
+
+`caddy-real` is not a built-in default. It is supported only when you configure it explicitly through CLI, `cadder.toml`, or an environment variable.
+
+## Optional PATH or shim setup
+
+You can run the portable binaries directly:
+
+```sh
+.local/dist/cadder/cadderd
+.local/dist/cadder/cadder-tui
+.local/dist/cadder/caddy run
+```
+
+If you want existing `caddy run` habits to use Cadder, put the Cadder shim in a user-controlled PATH directory under the name `caddy`. These examples affect only the directories and shell state you choose.
+
+Windows PowerShell, user directory plus current shell PATH:
+
+```powershell
+$cadder = "$HOME\bin\cadder"
+New-Item -ItemType Directory -Force $cadder
+Copy-Item .local\dist\cadder\caddy.exe "$cadder\caddy.exe"
+$env:Path = "$cadder;$env:Path"
+caddy run
+```
+
+macOS or Linux, user directory plus current shell PATH:
+
+```sh
+mkdir -p "$HOME/bin"
+ln -sf "$PWD/.local/dist/cadder/caddy" "$HOME/bin/caddy"
+export PATH="$HOME/bin:$PATH"
+caddy run
+```
+
+You can also keep the shim under another name and call it directly. Cadder does not require a global install.
+
+## First run workflow
+
+1. Build from source or unpack a portable layout.
+2. Configure the real Caddy command if the first safe `caddy` on PATH is not the real Caddy binary.
+3. Optionally put the Cadder shim on PATH under the name `caddy`.
+4. From a project directory, run `caddy run` or the portable shim path with `run`.
+5. Open `cadder-tui` to inspect registrations, domains, logs, diagnostics, and toggles.
+6. Stop the shim process with Ctrl+C when that project entrypoint should unregister.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for process boundaries, IPC shape, runtime ownership, and packaging details.
