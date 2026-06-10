@@ -433,3 +433,32 @@ fn configure_background_daemon(command: &mut Command) {
     command.process_group(0);
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use cadder_protocol::{IpcEnvelope, QueryStateRequest};
+  use tokio::io::AsyncReadExt;
+
+  #[tokio::test]
+  async fn write_envelope_serializes_newline_delimited_json() {
+    let (mut reader, mut writer) = tokio::io::duplex(1024);
+    let payload = QueryStateRequest {
+      request_id: "state-1".to_string(),
+    };
+
+    write_envelope(&mut writer, message_types::QUERY_STATE_REQUEST, &payload)
+      .await
+      .unwrap();
+    drop(writer);
+
+    let mut rendered = String::new();
+    reader.read_to_string(&mut rendered).await.unwrap();
+    let envelope: IpcEnvelope = serde_json::from_str(rendered.trim_end()).unwrap();
+    let decoded: QueryStateRequest = envelope.decode().unwrap();
+
+    assert!(rendered.ends_with('\n'));
+    assert_eq!(envelope.message_type, message_types::QUERY_STATE_REQUEST);
+    assert_eq!(decoded.request_id, "state-1");
+  }
+}

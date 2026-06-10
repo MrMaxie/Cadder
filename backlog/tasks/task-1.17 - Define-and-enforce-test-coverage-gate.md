@@ -4,7 +4,9 @@ title: Define and enforce test coverage gate
 status: To Do
 assignee: []
 created_date: '2026-06-10 11:29'
+updated_date: '2026-06-10 14:47'
 labels: []
+milestone: m-1
 dependencies:
   - TASK-1.15
 references:

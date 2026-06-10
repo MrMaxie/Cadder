@@ -91,4 +91,29 @@ mod tests {
 
     assert_eq!(configured_real_caddy_command(&config), None);
   }
+
+  #[test]
+  fn trims_configured_real_command_values() {
+    let config = CadderConfig {
+      caddy: CaddyRuntimeConfig {
+        real_command: Some("  caddy-custom  ".to_string()),
+      },
+    };
+
+    assert_eq!(
+      configured_real_caddy_command(&config).as_deref(),
+      Some("caddy-custom")
+    );
+  }
+
+  #[test]
+  fn from_file_reports_invalid_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(CONFIG_FILE_NAME);
+    fs::write(&path, "[caddy\n").unwrap();
+
+    let error = CadderConfig::from_file(&path).unwrap_err();
+
+    assert!(error.to_string().contains("load Cadder configuration from"));
+  }
 }

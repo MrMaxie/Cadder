@@ -461,4 +461,180 @@ mod tests {
     assert_eq!(logs.stream_status, LogStreamStatus::Stale);
     assert_eq!(logs.entries.len(), 1);
   }
+
+  #[tokio::test]
+  async fn register_rejects_invalid_owner_identity() {
+    let state = state();
+    let mut registration = registration("shim-1", "nonce-1");
+    registration.owner_process.shim_session_nonce = "different".to_string();
+
+    let response = state.register("register".to_string(), registration).await;
+
+    assert!(!response.accepted);
+    assert!(response.message.contains("nonce values must match"));
+    assert!(state.snapshot().await.registrations.is_empty());
+  }
+
+  #[tokio::test]
+  async fn subscribe_receives_registration_change_event() {
+    let state = state();
+    let mut events = state.subscribe();
+
+    let response = state
+      .register("register".to_string(), registration("shim-1", "nonce-1"))
+      .await;
+    let event = events.recv().await.unwrap();
+
+    assert!(response.accepted);
+    assert_eq!(event.sequence_number, 1);
+    assert_eq!(event.change_kind, StateChangeKind::RegistrationsChanged);
+    assert_eq!(event.registration_id.as_deref(), Some("shim-1"));
+    assert_eq!(event.snapshot.registrations.len(), 1);
+  }
+
+  #[tokio::test]
+  async fn heartbeat_accepts_owner_and_rejects_wrong_nonce() {
+    let state = state();
+    state
+      .register("register".to_string(), registration("shim-1", "nonce-1"))
+      .await;
+
+    let accepted = state
+      .heartbeat(HeartbeatEntrypointRequest {
+        request_id: "heartbeat".to_string(),
+        registration_id: "shim-1".to_string(),
+        shim_session_nonce: "nonce-1".to_string(),
+      })
+      .await;
+    let rejected = state
+      .heartbeat(HeartbeatEntrypointRequest {
+        request_id: "heartbeat".to_string(),
+        registration_id: "shim-1".to_string(),
+        shim_session_nonce: "wrong".to_string(),
+      })
+      .await;
+
+    assert!(accepted.accepted);
+    assert_eq!(accepted.message, "Heartbeat accepted.");
+    assert!(!rejected.accepted);
+    assert_eq!(
+      rejected.message,
+      "Entrypoint was not found for the requested owner."
+    );
+  }
+
+  #[tokio::test]
+  async fn set_entrypoint_enabled_accepts_optional_owner_and_rejects_wrong_owner() {
+    let state = state();
+    state
+      .register("register".to_string(), registration("shim-1", "nonce-1"))
+      .await;
+
+    let accepted = state
+      .set_entrypoint_enabled(SetEntrypointEnabledRequest {
+        request_id: "disable".to_string(),
+        registration_id: "shim-1".to_string(),
+        shim_session_nonce: None,
+        enabled: false,
+      })
+      .await;
+    let rejected = state
+      .set_entrypoint_enabled(SetEntrypointEnabledRequest {
+        request_id: "enable".to_string(),
+        registration_id: "shim-1".to_string(),
+        shim_session_nonce: Some("wrong".to_string()),
+        enabled: true,
+      })
+      .await;
+    let snapshot = state.snapshot().await;
+
+    assert!(accepted.accepted);
+    assert_eq!(accepted.message, "Entrypoint activation updated.");
+    assert!(!rejected.accepted);
+    assert_eq!(
+      snapshot.registrations[0].activation_state,
+      ActivationState::Inactive
+    );
+  }
+
+  #[tokio::test]
+  async fn set_domain_enabled_rejects_unknown_domain() {
+    let state = state();
+    state
+      .register("register".to_string(), registration("shim-1", "nonce-1"))
+      .await;
+
+    let response = state
+      .set_domain_enabled(SetDomainEnabledRequest {
+        request_id: "toggle".to_string(),
+        registration_id: "shim-1".to_string(),
+        domain_key: "missing.localhost".to_string(),
+        enabled: false,
+      })
+      .await;
+
+    assert!(!response.accepted);
+    assert_eq!(response.message, "Domain was not found.");
+  }
+
+  #[tokio::test]
+  async fn query_state_returns_snapshot_with_request_id() {
+    let state = state();
+    state
+      .register("register".to_string(), registration("shim-1", "nonce-1"))
+      .await;
+
+    let response = state.query_state("state".to_string()).await;
+
+    assert!(response.accepted);
+    assert_eq!(response.request_id, "state");
+    assert_eq!(response.message, "State snapshot returned.");
+    assert_eq!(response.snapshot.unwrap().registrations.len(), 1);
+  }
+
+  #[tokio::test]
+  async fn runtime_control_logs_are_active_and_limit_is_clamped() {
+    let state = state();
+    let stream = LogStreamIdentity::runtime_control();
+    state.logs().append(
+      stream.clone(),
+      LogSeverity::Info,
+      "first",
+      LogAttributionKind::RuntimeControl,
+      Some("start".to_string()),
+    );
+    state.logs().append(
+      stream.clone(),
+      LogSeverity::Warn,
+      "second",
+      LogAttributionKind::RuntimeControl,
+      Some("reload".to_string()),
+    );
+
+    let response = state
+      .query_logs(QueryLogsRequest {
+        request_id: "logs".to_string(),
+        stream: stream.clone(),
+        limit: Some(0),
+        cursor: Some("not-a-sequence".to_string()),
+        minimum_severity: Some(LogSeverity::Info),
+      })
+      .await;
+
+    assert_eq!(response.stream, stream);
+    assert_eq!(response.stream_status, LogStreamStatus::Active);
+    assert_eq!(response.entries.len(), 1);
+    assert_eq!(response.entries[0].raw_message, "second");
+    assert!(response.next_cursor.is_some());
+  }
+
+  #[tokio::test]
+  async fn shutdown_returns_success_when_runtime_is_idle() {
+    let state = state();
+
+    let response = state.shutdown().await;
+
+    assert!(response.accepted);
+    assert_eq!(response.message, "Daemon shutdown requested.");
+  }
 }

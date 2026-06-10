@@ -173,4 +173,76 @@ mod tests {
   fn portable_layout_includes_expected_binaries() {
     assert_eq!(portable_binaries(), ["cadderd", "cadder-tui", "caddy"]);
   }
+
+  #[test]
+  fn parse_path_option_reads_value_after_unrelated_arguments() {
+    let path = parse_path_option(
+      vec![
+        "--verbose".to_string(),
+        "--dir".to_string(),
+        "target/dist".to_string(),
+      ],
+      "--dir",
+    )
+    .unwrap();
+
+    assert_eq!(path, PathBuf::from("target/dist"));
+  }
+
+  #[test]
+  fn parse_path_option_rejects_option_without_value() {
+    let error = parse_path_option(vec!["--dir".to_string()], "--dir").unwrap_err();
+
+    assert!(error.to_string().contains("--dir requires a path"));
+  }
+
+  #[test]
+  fn release_binary_path_uses_release_directory_and_executable_name() {
+    assert_eq!(
+      release_binary_path("cadderd"),
+      PathBuf::from("target")
+        .join("release")
+        .join(exe_name("cadderd"))
+    );
+  }
+
+  #[test]
+  fn verify_dist_rejects_missing_portable_files() {
+    let dir = unique_temp_dir("missing-portable-files");
+    fs::create_dir_all(&dir).unwrap();
+
+    let error = verify_dist(&dir).unwrap_err();
+
+    assert!(error.to_string().contains("portable binary missing"));
+    fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn verify_dist_rejects_missing_sample_config_after_binaries_exist() {
+    let dir = unique_temp_dir("missing-sample-config");
+    fs::create_dir_all(&dir).unwrap();
+    for binary in portable_binaries() {
+      fs::write(dir.join(exe_name(binary)), b"not executable").unwrap();
+    }
+
+    let error = verify_dist(&dir).unwrap_err();
+
+    assert!(
+      error
+        .to_string()
+        .contains("portable sample configuration missing")
+    );
+    fs::remove_dir_all(&dir).unwrap();
+  }
+
+  fn unique_temp_dir(name: &str) -> PathBuf {
+    let unique = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_nanos();
+    env::temp_dir().join(format!(
+      "cadder-xtask-{name}-{}-{unique}",
+      std::process::id()
+    ))
+  }
 }

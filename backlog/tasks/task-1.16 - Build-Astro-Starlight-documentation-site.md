@@ -1,12 +1,13 @@
 ---
 id: TASK-1.16
 title: Build Astro Starlight documentation site
-status: In Progress
+status: Done
 assignee:
   - '@agent'
 created_date: '2026-06-10 11:29'
-updated_date: '2026-06-10 14:44'
+updated_date: '2026-06-10 15:27'
 labels: []
+milestone: m-1
 dependencies: []
 references:
   - AGENTS.md
@@ -36,6 +37,15 @@ modified_files:
   - docs/site/src/content/docs/reference/architecture.mdx
   - docs/site/src/content/docs/reference/real-caddy-resolution.mdx
   - docs/site/src/content/docs/reference/runtime-configuration.mdx
+  - crates/cadder-daemon/src/config.rs
+  - crates/cadder-daemon/src/ipc.rs
+  - crates/cadder-daemon/src/paths.rs
+  - crates/cadder-daemon/src/state.rs
+  - crates/cadder-daemon/tests/ipc_lifecycle.rs
+  - crates/cadder-shim/src/main.rs
+  - crates/cadder-tui/src/main.rs
+  - crates/cadder-tui/src/model.rs
+  - xtask/src/main.rs
 parent_task_id: TASK-1
 priority: medium
 ordinal: 16000
@@ -133,6 +143,12 @@ When implemented in TASK-1.15, docs publishing should:
 - Starlight source can drift from Rust CLI behavior if examples duplicate too much detail.
 - Release-process docs must avoid claiming CI publishing exists before TASK-1.15 implements it.
 - Generated docs output must stay out of the repo, including local preview/build artifacts.
+
+## Coverage DoD blocker fix plan
+- Re-run workspace coverage locally with the same `cargo-llvm-cov` path used during closeout to get actionable per-file/module data instead of relying only on the previous 62.48% total.
+- Identify narrow, high-impact uncovered code paths already within TASK-1.16's validation/DoD scope, preferring tests over production refactors.
+- Add focused tests in the existing Rust crates without expanding TASK-1.16's documentation scope.
+- Run targeted tests first, then re-run coverage and the relevant workspace validation needed to prove DoD #2 is satisfied or document any remaining blocker.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
@@ -143,12 +159,16 @@ Plan approved by the user and recorded before implementation. User requested Bun
 Implemented the Astro Starlight documentation site under `docs/site` using Bun with exact dependency versions and source-only commits. Added pages for overview, getting started, architecture, portable binaries, real Caddy resolution, PATH/shim strategy, Windows/macOS/Linux usage, runtime configuration, TUI diagnostics, validation, and release-process CI handoff. Added `docs/site/.gitignore` entries for generated `dist`, `.astro`, and `node_modules`, updated root `README.md` with the docs workspace commands, and removed generated local artifacts after validation. Verification run: `cd docs/site && bun install --frozen-lockfile`, `bun run check`, `bun run build`; Playwright smoke check against `http://127.0.0.1:4321/` verified key pages and crawled 13 local links with HTTP 200; `cargo run -p xtask -- check` passed. Coverage was not measured because the repository coverage gate is tracked separately by TASK-1.17, so DoD coverage remains unchecked.
 
 Closeout attempt: coverage was measured with local `cargo-llvm-cov v0.8.7` installed under `.local/cargo-tools` and run via `cargo +stable-x86_64-pc-windows-msvc llvm-cov --workspace --summary-only`. The GNU toolchain attempt failed with `can't find crate for profiler_builtins`; the MSVC run succeeded but reported total line coverage `62.48%`, below the project threshold of 85%. TASK-1.16 remains In Progress because Definition of Done #2 is not satisfied.
+
+Coverage DoD blocker fix started. The previous measured result was total line coverage 62.48%, below the 85% project threshold, so the next step is to produce per-file coverage detail and add focused tests rather than changing task scope.
+
+Resolved the coverage DoD blocker by adding focused tests for existing Rust behavior rather than changing production behavior: TUI rendering/model/async response paths, daemon state owner and log query branches, IPC unsupported/unexpected response handling and envelope serialization, runtime path/config helpers, shim registration/delegation parsing, and xtask path/dist validation helpers. The prior blocker was total line coverage 62.48%; the final enforced run `cargo +stable-x86_64-pc-windows-msvc llvm-cov --workspace --json --summary-only --fail-under-lines 85 --output-path .local\coverage-summary.json` passed with total line coverage 85.28% (3621/4246 lines). Validation also passed: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo run -p xtask -- check`. Fresh-eyes/code simplification pass fixed two local test-quality issues: unique temporary directories for xtask tests and draining the TUI async log refresh response in the domain-log-opening test.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
 - [x] #1 Tests or explicit verification were run for the changed behavior
-- [ ] #2 Coverage was measured and remains at or above the project threshold
+- [x] #2 Coverage was measured and remains at or above the project threshold
 <!-- DOD:END -->
 
 ## Comments
@@ -159,3 +179,13 @@ created: 2026-06-10 12:04
 TASK-1.11 planning added the requirement for per-system usage docs around portable binaries, optional user-managed PATH/shim setup, and layered real Caddy configuration. The Starlight site should cover that durable guidance.
 ---
 <!-- COMMENTS:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Completed the Astro Starlight documentation site and resolved the task-level coverage blocker by adding focused Rust tests for existing behavior. The docs workspace lives under `docs/site` with Bun/Starlight source, contributor commands, platform guidance, architecture/runtime references, validation guidance, and release-process handoff notes; generated output remains untracked.
+
+Validation passed on the final tree: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo run -p xtask -- check`, and `cargo +stable-x86_64-pc-windows-msvc llvm-cov --workspace --json --summary-only --fail-under-lines 85 --output-path .local\coverage-summary.json`. Coverage passed at 85.28% line coverage (3621/4246 lines). No substantive fresh-eyes issues remained during final review.
+
+Risks/follow-ups: docs publishing belongs to TASK-1.15, and the reusable coverage workflow/gate remains tracked by TASK-1.17.
+<!-- SECTION:FINAL_SUMMARY:END -->

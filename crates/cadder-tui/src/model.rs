@@ -383,6 +383,38 @@ mod tests {
   }
 
   #[test]
+  fn view_titles_indices_and_wrapping_navigation_are_stable() {
+    assert_eq!(
+      View::ALL.map(|view| (view.title(), view.index())),
+      [
+        ("Overview", 0),
+        ("Entrypoints", 1),
+        ("Domains", 2),
+        ("Logs", 3),
+        ("Diagnostics", 4),
+      ]
+    );
+
+    let mut model = TuiModel::default();
+    model.previous_view();
+    assert_eq!(model.view, View::Diagnostics);
+    model.next_view();
+    assert_eq!(model.view, View::Overview);
+  }
+
+  #[test]
+  fn move_selection_clamps_to_visible_rows() {
+    let mut model = TuiModel::default();
+    model.set_snapshot(snapshot());
+    model.view = View::Domains;
+
+    model.move_selection(10);
+    assert_eq!(model.selected, 1);
+    model.move_selection(-10);
+    assert_eq!(model.selected, 0);
+  }
+
+  #[test]
   fn filters_domains_by_search() {
     let mut model = TuiModel::default();
     model.set_snapshot(snapshot());

@@ -736,7 +736,172 @@ fn _assert_snapshot_send_sync(_: &GuiStateSnapshot) {}
 #[cfg(test)]
 mod tests {
   use super::*;
+  use cadder_protocol::{
+    ActivationState, ConfigApplyStatus, ConfigDiagnostic, ConfigState, EntrypointInstanceIdentity,
+    EntrypointRegistration, LogAttributionKind, LogEntryKind, OwnerProcessIdentity,
+    RegisteredDomain, RuntimeDiagnostic, RuntimeState, RuntimeStatus, SourcePath,
+  };
+  use chrono::Utc;
   use clap::CommandFactory;
+  use ratatui::{Terminal, backend::TestBackend};
+
+  fn test_app() -> TuiApp {
+    let paths = RuntimePaths::resolve(Some(
+      std::env::temp_dir().join(format!("cadder-tui-test-{}", std::process::id())),
+    ))
+    .unwrap();
+    let (responses_tx, responses_rx) = mpsc::unbounded_channel();
+    let mut model = TuiModel::default();
+    model.set_snapshot(snapshot());
+    TuiApp {
+      client: CadderClient::new(paths),
+      model,
+      message: "ready".to_string(),
+      responses_tx,
+      responses_rx,
+      state_request_in_flight: false,
+      toggle_request_in_flight: false,
+      shutdown_request_in_flight: false,
+      last_log_refresh: Instant::now(),
+      log_request_serial: 0,
+    }
+  }
+
+  fn snapshot() -> GuiStateSnapshot {
+    let mut snapshot = GuiStateSnapshot {
+      captured_at_utc: Utc::now(),
+      registrations: vec![
+        registration(
+          "shim-1",
+          "D:/work/app",
+          vec![
+            RegisteredDomain::active("app.localhost"),
+            RegisteredDomain {
+              activation_state: ActivationState::Inactive,
+              ..RegisteredDomain::active("api.localhost")
+            },
+          ],
+        ),
+        registration(
+          "shim-2",
+          "D:/work/admin",
+          vec![RegisteredDomain::active("admin.localhost")],
+        ),
+      ],
+      runtime: RuntimeState {
+        status: RuntimeStatus::Unhealthy,
+        binary_path: Some("D:/tools/caddy.exe".to_string()),
+        version: Some("2.10.0".to_string()),
+        process_id: Some(4242),
+        admin_endpoint: Some("localhost:2019".to_string()),
+        diagnostics: vec![RuntimeDiagnostic {
+          code: "runtime-exited".to_string(),
+          message: "process exited".to_string(),
+          operation: Some("run".to_string()),
+        }],
+      },
+      config: ConfigState {
+        status: ConfigApplyStatus::Failed,
+        last_attempted_at_utc: Some(Utc::now()),
+        last_successful_reload_at_utc: None,
+        effective_config_hash: Some("hash".to_string()),
+        diagnostics: vec![ConfigDiagnostic {
+          code: "reload-failed".to_string(),
+          message: "reload failed".to_string(),
+          domain_key: Some("app.localhost".to_string()),
+          source_config_paths: vec!["D:/work/app/Caddyfile".to_string()],
+        }],
+      },
+    };
+    snapshot.registrations[0].shim_run = Some(cadder_protocol::ShimRunMetadata {
+      adapter: Some("caddyfile".to_string()),
+      raw_arguments: vec![
+        "run".to_string(),
+        "--adapter".to_string(),
+        "caddyfile".to_string(),
+      ],
+      command_line: "run --adapter caddyfile".to_string(),
+    });
+    snapshot
+  }
+
+  fn registration(
+    registration_id: &str,
+    working_directory: &str,
+    registered_domains: Vec<RegisteredDomain>,
+  ) -> EntrypointRegistration {
+    let now = Utc::now();
+    let identity = EntrypointInstanceIdentity {
+      instance_id: registration_id.to_string(),
+      started_at_utc: now,
+      shim_session_nonce: format!("{registration_id}-nonce"),
+    };
+    EntrypointRegistration {
+      registration_id: registration_id.to_string(),
+      entrypoint_instance: identity.clone(),
+      source_working_directory: SourcePath::new(working_directory, None),
+      source_config_path: SourcePath::new(format!("{working_directory}/Caddyfile"), None),
+      registered_domains,
+      activation_state: ActivationState::Active,
+      owner_process: OwnerProcessIdentity {
+        process_id: 42,
+        process_start_time_utc: now,
+        shim_session_nonce: identity.shim_session_nonce,
+        executable_path: Some("D:/bin/caddy.exe".to_string()),
+      },
+      log_stream: LogStreamIdentity::entrypoint(registration_id),
+      shim_run: None,
+      created_at_utc: now,
+      last_heartbeat_utc: now,
+    }
+  }
+
+  fn log_entry(sequence_number: u64, severity: LogSeverity, message: &str) -> LogEntry {
+    LogEntry {
+      sequence_number,
+      timestamp_utc: Utc::now(),
+      severity,
+      stream: LogStreamIdentity::domain("app.localhost"),
+      attribution_kind: LogAttributionKind::Domain,
+      entry_kind: LogEntryKind::Normal,
+      raw_message: message.to_string(),
+      domain_key: Some("app.localhost".to_string()),
+      source_registration_id: Some("shim-1".to_string()),
+      source_instance_id: Some("shim-1".to_string()),
+      operation: Some("run".to_string()),
+    }
+  }
+
+  fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+    terminal
+      .backend()
+      .buffer()
+      .content()
+      .iter()
+      .map(|cell| cell.symbol())
+      .collect()
+  }
+
+  fn render(app: &TuiApp) -> String {
+    let backend = TestBackend::new(120, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    buffer_text(&terminal)
+  }
+
+  async fn drain_until<F>(app: &mut TuiApp, mut done: F)
+  where
+    F: FnMut(&TuiApp) -> bool,
+  {
+    for _ in 0..50 {
+      app.drain_responses();
+      if done(app) {
+        return;
+      }
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for async TUI response");
+  }
 
   #[test]
   fn command_metadata_matches_release_identity() {
@@ -776,5 +941,360 @@ mod tests {
       help.contains("Connect to an existing daemon"),
       "long help output should describe --no-start: {help}"
     );
+  }
+
+  #[test]
+  fn draw_renders_each_view_with_snapshot_content() {
+    for view in View::ALL {
+      let mut app = test_app();
+      app.model.view = view;
+      if view == View::Logs {
+        app.model.logs.reset_for_target(model::LogTarget {
+          registration_id: "shim-1".to_string(),
+          domain_name: "app.localhost".to_string(),
+          stream: LogStreamIdentity::domain("app.localhost"),
+        });
+        app.model.logs.paused = true;
+        app.model.logs.status = LogStreamStatus::Stale;
+        app.model.logs.entries = vec![log_entry(1, LogSeverity::Warn, "upstream warning")];
+        app.model.logs.has_gap = true;
+        app.model.logs.has_more_before = true;
+        app.model.logs.truncated_by_retention = true;
+      }
+
+      let text = render(&app);
+
+      assert!(
+        text.contains(view.title()),
+        "rendered buffer should include the active view title {view:?}: {text}"
+      );
+      assert!(
+        text.contains("Cadder"),
+        "rendered buffer should include the app title: {text}"
+      );
+    }
+  }
+
+  #[test]
+  fn draw_includes_search_and_severity_status_context() {
+    let mut app = test_app();
+    app.model.view = View::Logs;
+    app.model.search_mode = true;
+    app.model.search = "api".to_string();
+    app.model.logs.minimum_severity = Some(LogSeverity::Error);
+
+    let text = render(&app);
+
+    assert!(text.contains("search: api"));
+    assert!(text.contains("severity: Error"));
+    assert!(text.contains("no domain selected"));
+  }
+
+  #[test]
+  fn log_state_lines_cover_empty_paused_error_and_retention_messages() {
+    let mut app = test_app();
+    app.model.view = View::Logs;
+
+    assert_eq!(
+      app.log_state_lines(),
+      vec!["Select a domain row and press Enter or l to view logs.".to_string()]
+    );
+
+    app.model.logs.reset_for_target(model::LogTarget {
+      registration_id: "shim-1".to_string(),
+      domain_name: "app.localhost".to_string(),
+      stream: LogStreamIdentity::domain("app.localhost"),
+    });
+    app.model.logs.loading = false;
+    app.model.logs.paused = true;
+    app.model.logs.read_error = Some("socket closed".to_string());
+    app.model.logs.status = LogStreamStatus::Removed;
+    app.model.logs.has_gap = true;
+    app.model.logs.has_more_before = true;
+    app.model.logs.truncated_by_retention = true;
+
+    let lines = app.log_state_lines();
+
+    assert!(lines.iter().any(|line| line.contains("Auto-scroll paused")));
+    assert!(lines.iter().any(|line| line.contains("Read error")));
+    assert!(lines.iter().any(|line| line.contains("domain was removed")));
+    assert!(
+      lines
+        .iter()
+        .any(|line| line.contains("entries were skipped"))
+    );
+    assert!(
+      lines
+        .iter()
+        .any(|line| line.contains("Older entries exist"))
+    );
+    assert!(
+      lines
+        .iter()
+        .any(|line| line.contains("truncated by daemon retention"))
+    );
+  }
+
+  #[test]
+  fn drain_responses_applies_matching_results_and_ignores_stale_logs() {
+    let mut app = test_app();
+    app.log_request_serial = 2;
+    app.model.open_selected_domain_logs();
+    app.model.logs.minimum_severity = Some(LogSeverity::Warn);
+    let stream = app.model.logs.active_stream().unwrap();
+
+    app
+      .responses_tx
+      .send(AppResponse::Logs {
+        serial: 1,
+        stream: stream.clone(),
+        minimum_severity: Some(LogSeverity::Warn),
+        result: Ok(QueryLogsResponse {
+          request_id: "old".to_string(),
+          accepted: true,
+          message: "old".to_string(),
+          stream: stream.clone(),
+          stream_status: LogStreamStatus::Active,
+          entries: vec![log_entry(1, LogSeverity::Info, "stale")],
+          next_cursor: Some("seq:1".to_string()),
+          has_gap: false,
+          has_more_before: false,
+          truncated_by_retention: false,
+        }),
+      })
+      .unwrap();
+    app
+      .responses_tx
+      .send(AppResponse::Logs {
+        serial: 2,
+        stream: stream.clone(),
+        minimum_severity: Some(LogSeverity::Warn),
+        result: Ok(QueryLogsResponse {
+          request_id: "current".to_string(),
+          accepted: true,
+          message: "loaded".to_string(),
+          stream: stream.clone(),
+          stream_status: LogStreamStatus::Active,
+          entries: vec![log_entry(2, LogSeverity::Warn, "current")],
+          next_cursor: Some("seq:2".to_string()),
+          has_gap: true,
+          has_more_before: false,
+          truncated_by_retention: false,
+        }),
+      })
+      .unwrap();
+    app
+      .responses_tx
+      .send(AppResponse::Shutdown(Err("denied".to_string())))
+      .unwrap();
+
+    app.drain_responses();
+
+    assert_eq!(app.model.logs.entries.len(), 1);
+    assert_eq!(app.model.logs.entries[0].raw_message, "current");
+    assert_eq!(app.model.logs.next_cursor.as_deref(), Some("seq:2"));
+    assert!(app.model.logs.has_gap);
+    assert_eq!(app.message, "Shutdown failed: denied");
+    assert!(!app.shutdown_request_in_flight);
+  }
+
+  #[test]
+  fn drain_responses_reports_state_toggle_and_log_errors() {
+    let mut app = test_app();
+    app.state_request_in_flight = true;
+    app.toggle_request_in_flight = true;
+    app.log_request_serial = 3;
+    app.model.open_selected_domain_logs();
+    let stream = app.model.logs.active_stream().unwrap();
+
+    app
+      .responses_tx
+      .send(AppResponse::State(Ok(QueryStateResponse {
+        request_id: "state".to_string(),
+        accepted: true,
+        message: "no snapshot".to_string(),
+        snapshot: None,
+      })))
+      .unwrap();
+    app
+      .responses_tx
+      .send(AppResponse::Toggle(Err("rejected".to_string())))
+      .unwrap();
+    app
+      .responses_tx
+      .send(AppResponse::Logs {
+        serial: 3,
+        stream,
+        minimum_severity: None,
+        result: Err("read failed".to_string()),
+      })
+      .unwrap();
+
+    app.drain_responses();
+
+    assert_eq!(app.message, "Log refresh failed: read failed");
+    assert_eq!(app.model.logs.status, LogStreamStatus::ReadError);
+    assert_eq!(app.model.logs.read_error.as_deref(), Some("read failed"));
+    assert!(!app.state_request_in_flight);
+    assert!(!app.toggle_request_in_flight);
+  }
+
+  #[tokio::test]
+  async fn start_state_refresh_reports_connection_error() {
+    let mut app = test_app();
+
+    app.start_state_refresh();
+    assert!(app.state_request_in_flight);
+    app.start_state_refresh();
+
+    drain_until(&mut app, |app| !app.state_request_in_flight).await;
+
+    assert!(app.message.starts_with("State refresh failed:"));
+  }
+
+  #[tokio::test]
+  async fn start_toggle_selected_reports_entrypoint_connection_error() {
+    let mut app = test_app();
+    app.model.view = View::Entrypoints;
+
+    app.start_toggle_selected();
+    assert!(app.toggle_request_in_flight);
+    app.start_toggle_selected();
+
+    drain_until(&mut app, |app| !app.toggle_request_in_flight).await;
+
+    assert!(app.message.starts_with("Toggle failed:"));
+  }
+
+  #[tokio::test]
+  async fn start_toggle_selected_reports_domain_connection_error() {
+    let mut app = test_app();
+    app.model.view = View::Domains;
+
+    app.start_toggle_selected();
+
+    drain_until(&mut app, |app| !app.toggle_request_in_flight).await;
+
+    assert!(app.message.starts_with("Toggle failed:"));
+  }
+
+  #[tokio::test]
+  async fn log_refresh_and_severity_filter_report_connection_error() {
+    let mut app = test_app();
+    app.model.view = View::Domains;
+    app.model.open_selected_domain_logs();
+
+    app.set_log_severity(Some(LogSeverity::Error));
+    assert_eq!(app.model.logs.minimum_severity, Some(LogSeverity::Error));
+    assert!(app.model.logs.request_in_flight);
+    app.start_log_refresh();
+
+    drain_until(&mut app, |app| !app.model.logs.request_in_flight).await;
+
+    assert_eq!(app.model.logs.status, LogStreamStatus::ReadError);
+    assert!(app.message.starts_with("Log refresh failed:"));
+  }
+
+  #[tokio::test]
+  async fn maybe_tail_logs_starts_refresh_when_interval_elapsed() {
+    let mut app = test_app();
+    app.model.view = View::Domains;
+    app.model.open_selected_domain_logs();
+    app.model.logs.request_in_flight = false;
+    app.last_log_refresh = Instant::now() - Duration::from_millis(800);
+
+    app.maybe_tail_logs();
+
+    assert!(app.model.logs.request_in_flight);
+    drain_until(&mut app, |app| !app.model.logs.request_in_flight).await;
+    assert!(app.model.logs.read_error.is_some());
+  }
+
+  #[tokio::test]
+  async fn start_shutdown_daemon_reports_connection_error() {
+    let mut app = test_app();
+
+    app.start_shutdown_daemon();
+    assert!(app.shutdown_request_in_flight);
+    app.start_shutdown_daemon();
+
+    drain_until(&mut app, |app| !app.shutdown_request_in_flight).await;
+
+    assert!(app.message.starts_with("Shutdown failed:"));
+  }
+
+  #[test]
+  fn apply_state_response_uses_snapshot_or_guidance_message() {
+    let mut app = test_app();
+
+    app.apply_state_response(QueryStateResponse {
+      request_id: "state".to_string(),
+      accepted: true,
+      message: "updated".to_string(),
+      snapshot: Some(snapshot()),
+    });
+    assert_eq!(app.message, "updated");
+    assert_eq!(app.model.summary().entrypoints, 2);
+
+    app.apply_state_response(QueryStateResponse {
+      request_id: "state".to_string(),
+      accepted: true,
+      message: "empty".to_string(),
+      snapshot: None,
+    });
+    assert_eq!(app.message, "Daemon returned no state snapshot.");
+  }
+
+  #[test]
+  fn start_log_refresh_without_target_sets_guidance_message() {
+    let mut app = test_app();
+    app.model.logs.target = None;
+
+    app.start_log_refresh();
+
+    assert_eq!(
+      app.message,
+      "Select a domain and press Enter or l to view logs."
+    );
+    assert_eq!(app.log_request_serial, 0);
+  }
+
+  #[tokio::test]
+  async fn open_selected_domain_logs_switches_view_and_marks_loading() {
+    let mut app = test_app();
+    app.model.view = View::Domains;
+
+    app.open_selected_domain_logs();
+
+    assert_eq!(app.model.view, View::Logs);
+    assert_eq!(app.message, "Loading domain logs.");
+    assert!(app.model.logs.loading);
+    drain_until(&mut app, |app| !app.model.logs.request_in_flight).await;
+  }
+
+  #[test]
+  fn safe_filename_replaces_shell_sensitive_characters() {
+    assert_eq!(
+      safe_filename("../app localhost:443?token=value"),
+      "..-app-localhost-443-token-value"
+    );
+    assert_eq!(safe_filename("app.localhost"), "app.localhost");
+  }
+
+  #[test]
+  fn format_log_excerpt_includes_redacted_export_context() {
+    let target = model::LogTarget {
+      registration_id: "shim-1".to_string(),
+      domain_name: "app.localhost".to_string(),
+      stream: LogStreamIdentity::domain("app.localhost"),
+    };
+
+    let excerpt = format_log_excerpt(&target, &[log_entry(7, LogSeverity::Error, "redacted")]);
+
+    assert!(excerpt.contains("Cadder diagnostic log excerpt for app.localhost"));
+    assert!(excerpt.contains("Registration: shim-1"));
+    assert!(excerpt.contains("Messages are daemon-redacted before export."));
+    assert!(excerpt.contains("Error domain=app.localhost"));
+    assert!(excerpt.contains("redacted"));
   }
 }

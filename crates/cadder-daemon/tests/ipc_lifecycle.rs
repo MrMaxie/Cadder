@@ -4,10 +4,11 @@ use cadder_daemon::{
 };
 use cadder_protocol::{
   ActivationState, BasicResponse, ConfigApplyStatus, EntrypointInstanceIdentity,
-  EntrypointRegistration, LogAttributionKind, LogSeverity, LogStreamIdentity, LogStreamStatus,
-  OwnerProcessIdentity, QueryLogsRequest, QueryLogsResponse, QueryStateRequest, QueryStateResponse,
-  RegisterEntrypointRequest, RegisterEntrypointResponse, SetDomainEnabledRequest, ShimRunMetadata,
-  SourcePath, UnregisterEntrypointRequest, message_types, new_request_id,
+  EntrypointRegistration, HeartbeatEntrypointRequest, LogAttributionKind, LogSeverity,
+  LogStreamIdentity, LogStreamStatus, OwnerProcessIdentity, QueryLogsRequest, QueryLogsResponse,
+  QueryStateRequest, QueryStateResponse, RegisterEntrypointRequest, RegisterEntrypointResponse,
+  SetDomainEnabledRequest, SetEntrypointEnabledRequest, ShimRunMetadata, SourcePath,
+  UnregisterEntrypointRequest, message_types, new_request_id,
 };
 use chrono::Utc;
 use std::{
@@ -314,6 +315,111 @@ async fn per_domain_log_queries_report_status_and_cursor() {
 
   assert_eq!(next_page.stream_status, LogStreamStatus::Active);
   assert!(next_page.entries.is_empty());
+  harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn ipc_heartbeat_and_entrypoint_toggle_update_registered_state() {
+  let fixture = include_str!("fixtures/SmarketingReverseProxy.Caddyfile");
+  let harness = Harness::start(FakeCaddy::new(fixture)).await;
+  let mut session = CadderSession::connect(&harness.paths).await.unwrap();
+  assert!(
+    register_on_session(
+      &mut session,
+      registration("shim-1", "nonce-1", &harness.config_path)
+    )
+    .await
+    .accepted
+  );
+
+  let heartbeat: BasicResponse = harness
+    .client
+    .request(
+      message_types::HEARTBEAT_ENTRYPOINT_REQUEST,
+      message_types::HEARTBEAT_ENTRYPOINT_RESPONSE,
+      &HeartbeatEntrypointRequest {
+        request_id: new_request_id("test-heartbeat"),
+        registration_id: "shim-1".to_string(),
+        shim_session_nonce: "nonce-1".to_string(),
+      },
+    )
+    .await
+    .unwrap();
+  let disabled: BasicResponse = harness
+    .client
+    .request(
+      message_types::SET_ENTRYPOINT_ENABLED_REQUEST,
+      message_types::SET_ENTRYPOINT_ENABLED_RESPONSE,
+      &SetEntrypointEnabledRequest {
+        request_id: new_request_id("test-entrypoint-toggle"),
+        registration_id: "shim-1".to_string(),
+        shim_session_nonce: Some("nonce-1".to_string()),
+        enabled: false,
+      },
+    )
+    .await
+    .unwrap();
+  let snapshot = query_state(&harness.client).await;
+
+  assert!(heartbeat.accepted);
+  assert_eq!(heartbeat.message, "Heartbeat accepted.");
+  assert!(disabled.accepted);
+  assert_eq!(
+    snapshot.registrations[0].activation_state,
+    ActivationState::Inactive
+  );
+  harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn ipc_reports_unsupported_message_type() {
+  let fixture = include_str!("fixtures/SmarketingReverseProxy.Caddyfile");
+  let harness = Harness::start(FakeCaddy::new(fixture)).await;
+  let mut session = CadderSession::connect(&harness.paths).await.unwrap();
+
+  let response: BasicResponse = session
+    .request(
+      "unknown-message",
+      "error-response",
+      &QueryStateRequest {
+        request_id: "unsupported".to_string(),
+      },
+    )
+    .await
+    .unwrap();
+
+  assert!(!response.accepted);
+  assert_eq!(response.request_id, "unsupported");
+  assert!(
+    response
+      .message
+      .contains("Unsupported IPC message type `unknown-message`")
+  );
+  harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_rejects_unexpected_response_type() {
+  let fixture = include_str!("fixtures/SmarketingReverseProxy.Caddyfile");
+  let harness = Harness::start(FakeCaddy::new(fixture)).await;
+  let mut session = CadderSession::connect(&harness.paths).await.unwrap();
+
+  let error = session
+    .request::<_, QueryStateResponse>(
+      message_types::QUERY_STATE_REQUEST,
+      message_types::QUERY_LOGS_RESPONSE,
+      &QueryStateRequest {
+        request_id: "wrong-response".to_string(),
+      },
+    )
+    .await
+    .unwrap_err();
+
+  assert!(
+    error
+      .to_string()
+      .contains("unexpected response type `query-state-response`")
+  );
   harness.shutdown().await;
 }
 

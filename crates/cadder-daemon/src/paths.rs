@@ -103,4 +103,33 @@ mod tests {
     let _first = DaemonLock::acquire(path.clone()).unwrap();
     assert!(DaemonLock::acquire(path).is_err());
   }
+
+  #[test]
+  fn resolve_override_derives_stable_socket_and_runtime_paths() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let first = RuntimePaths::resolve(Some(dir.path().to_path_buf())).unwrap();
+    let second = RuntimePaths::resolve(Some(dir.path().to_path_buf())).unwrap();
+
+    assert_eq!(first.runtime_dir(), dir.path());
+    assert_eq!(first.socket_name(), second.socket_name());
+    assert!(first.socket_name().starts_with("cadder-"));
+    assert_eq!(first.lock_path(), dir.path().join("cadder.lock"));
+    assert_eq!(first.metadata_path(), dir.path().join("daemon.json"));
+    assert_eq!(
+      first.effective_config_path(),
+      dir.path().join("effective-caddy.json")
+    );
+  }
+
+  #[test]
+  fn ensure_dirs_creates_runtime_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("nested").join("runtime");
+    let paths = RuntimePaths::resolve(Some(runtime_dir.clone())).unwrap();
+
+    paths.ensure_dirs().unwrap();
+
+    assert!(runtime_dir.is_dir());
+  }
 }

@@ -4,8 +4,9 @@ title: Add GitHub CI/CD for Rust portable binaries and release artifacts
 status: To Do
 assignee: []
 created_date: '2026-06-09 18:45'
-updated_date: '2026-06-10 12:04'
+updated_date: '2026-06-10 14:48'
 labels: []
+milestone: m-1
 dependencies:
   - TASK-1.11
   - TASK-1.16
