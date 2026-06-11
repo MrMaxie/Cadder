@@ -2,12 +2,14 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
 export default defineConfig({
+  site: 'https://maxie.dev',
+  base: '/Cadder',
   integrations: [
     starlight({
       title: 'Cadder',
       description:
         'Documentation for the Cadder cross-platform Rust Caddy coordinator.',
-      favicon: '/favicon.svg',
+      favicon: 'favicon.svg',
       sidebar: [
         {
           label: 'Start here',

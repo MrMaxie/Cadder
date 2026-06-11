@@ -7,7 +7,7 @@ Cadder releases publish portable binaries and documentation generated from sourc
 
 ## Rust CI
 
-`.github/workflows/ci.yml` runs on pushes to `main`, pull requests, and manual dispatch. It validates the Rust workspace on Windows, Linux, and macOS with:
+`.github/workflows/ci.yml` runs on pushes to `master`, pull requests targeting `master`, and manual dispatch. It validates the Rust workspace on Windows, Linux, and macOS with:
 
 ```sh
 cargo fmt --check
@@ -33,6 +33,12 @@ cargo run -p xtask -- coverage
 ```
 
 The coverage gate writes `target/llvm-cov/coverage-summary.json` and fails if total line coverage is below 85% or coverage cannot be measured.
+
+CI also runs the project-owned validation command on Ubuntu:
+
+```sh
+cargo run -p xtask -- check
+```
 
 ## Portable artifact
 
@@ -80,7 +86,9 @@ The release process does not edit `PATH`, install services, write shell profiles
 
 ## Release publishing
 
-`.github/workflows/release.yml` runs for tags that match `v*`. It builds native portable archives on these GitHub-hosted runners:
+`.github/workflows/release.yml` runs for tags that match `v*`. It rejects `v0.*` tags before publishing because Cadder does not publish GitHub Releases before 1.0.0. Manual dispatch runs package-only dry runs and does not create a GitHub Release.
+
+For accepted release tags, it builds native portable archives on these GitHub-hosted runners:
 
 - `windows-latest` for `x86_64-pc-windows-msvc`
 - `ubuntu-latest` for `x86_64-unknown-linux-gnu`
@@ -93,7 +101,7 @@ The workflow uploads the archives as workflow artifacts, then publishes the same
 
 ## Documentation publishing
 
-`.github/workflows/docs.yml` runs on pushes to `main` that affect documentation and on manual dispatch. It:
+`.github/workflows/docs.yml` runs on pushes to `master` that affect documentation, pull requests targeting `master` that affect documentation, and manual dispatch. It:
 
 1. Installs Bun.
 2. Runs `bun install --frozen-lockfile` in `docs/site`.
@@ -103,3 +111,5 @@ The workflow uploads the archives as workflow artifacts, then publishes the same
 6. Deploys the artifact to GitHub Pages.
 
 Repository Pages settings must use GitHub Actions as the publishing source. Generated documentation output remains outside git.
+
+Production documentation is configured for `https://maxie.dev/Cadder/`.

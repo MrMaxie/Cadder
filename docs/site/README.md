@@ -22,7 +22,7 @@ The durable architecture notes in `../ARCHITECTURE.md` remain the compact source
 
 ## CI handoff
 
-The repository CI should build documentation from source on `main` with Bun:
+The repository CI builds documentation from source on `master` with Bun:
 
 ```sh
 cd docs/site
@@ -32,3 +32,5 @@ bun run build
 ```
 
 CI may publish or upload `docs/site/dist`, but it should not write generated site output back to the repository.
+
+Production documentation is published below `https://maxie.dev/Cadder/`.

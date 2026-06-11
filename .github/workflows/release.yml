@@ -4,18 +4,65 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version string for package-only dry runs.
+        required: false
+        default: 0.0.0-dev
 
 permissions:
   contents: read
 
 jobs:
+  release-gate:
+    name: Validate release intent
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Validate version
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            version="$INPUT_VERSION"
+            publish="false"
+          else
+            version="${GITHUB_REF_NAME#v}"
+            publish="true"
+          fi
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release versions must use semantic versions like 1.0.0 or 1.0.0-rc.1."
+            exit 1
+          fi
+
+          major="${version%%.*}"
+          if [[ "$publish" == "true" && "$major" == "0" ]]; then
+            echo "::error::Cadder is pre-1.0. The release workflow will not publish GitHub Releases for v0.* tags."
+            exit 1
+          fi
+
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'publish=%s\n' "$publish" >> "$GITHUB_OUTPUT"
+
   docker-e2e:
     name: Docker E2E preflight
+    needs: release-gate
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.3
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2.9.1
 
       - name: Check Docker
         run: docker version
@@ -28,7 +75,9 @@ jobs:
 
   package:
     name: Package ${{ matrix.platform }}
-    needs: docker-e2e
+    needs:
+      - release-gate
+      - docker-e2e
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -49,23 +98,27 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.3
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2.9.1
+
       - name: Package portable archive
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.release-gate.outputs.version }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
           cargo run -p xtask -- package \
             --out artifacts \
-            --version "$version" \
+            --version "$RELEASE_VERSION" \
             --platform "${{ matrix.platform }}" \
             --target "${{ matrix.target }}"
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: cadder-${{ matrix.platform }}
           path: |
@@ -76,14 +129,17 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: package
+    needs:
+      - release-gate
+      - package
+    if: needs.release-gate.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
       - name: Download packaged artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8.0.1
         with:
           path: release-assets
           merge-multiple: true

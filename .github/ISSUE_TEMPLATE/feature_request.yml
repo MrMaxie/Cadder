@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest a focused Cadder improvement.
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow or limitation should this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the behavior you want Cadder to provide.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Mention any workaround or simpler approach you considered.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Daemon
+        - Shim
+        - TUI
+        - IPC protocol
+        - Packaging
+        - Documentation
+        - Other
+    validations:
+      required: true

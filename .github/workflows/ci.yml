@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches:
-      - main
+      - master
   pull_request:
+    branches:
+      - master
   workflow_dispatch:
 
 permissions:
@@ -24,7 +26,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.3
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2.9.1
 
       - name: Check formatting
         run: cargo fmt --check
@@ -35,13 +40,30 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  project-check:
+    name: Project validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Run project check
+        run: cargo run -p xtask -- check
+
   coverage:
     name: Coverage (Windows MSVC)
     runs-on: windows-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.3
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2.9.1
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --component llvm-tools-preview
@@ -52,13 +74,25 @@ jobs:
       - name: Run coverage gate
         run: cargo +stable-x86_64-pc-windows-msvc run -p xtask -- coverage
 
+      - name: Upload coverage summary
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: coverage-summary-windows-msvc
+          path: target/llvm-cov/coverage-summary.json
+          if-no-files-found: ignore
+          retention-days: 14
+
   docker-e2e:
     name: Docker E2E (Ubuntu)
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.3
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2.9.1
 
       - name: Check Docker
         run: docker version
