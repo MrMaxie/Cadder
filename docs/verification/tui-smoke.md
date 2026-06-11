@@ -21,13 +21,18 @@ Run the checklist on each backend available for the platform under test:
 
 - Launch `cargo run -p cadder-tui -- --runtime-dir <runtime-dir> --no-start` and confirm the Overview view renders without layout corruption.
 - Confirm Overview shows runtime status, config status, entrypoint count, domain count, and active domain count.
-- Press `Tab` to open Entrypoints and confirm each active shim registration is listed with ID, state, source path, and domain count.
-- Press `Tab` to open Domains and confirm domains remain associated with their source entrypoint in the first table column.
-- Select a domain with arrow keys, press `Space`, and confirm the domain activation state toggles after refresh.
+- Change daemon state from a shim session and confirm Overview updates automatically within a few seconds; press `r` and confirm manual refresh still works.
+- Press `Tab` or `Right` to open Entrypoints and confirm each active shim registration is listed with ID, state, source path, and domain count.
+- Press `Tab` or `Right` to open Domains, then use `Shift+Tab` or `Left` to navigate backward and confirm view navigation wraps cleanly.
+- Confirm domains remain associated with their source entrypoint in the first table column.
+- Confirm the selected Domains row is visibly highlighted, active domains show `[x]`, and disabled domains show `[ ]` with a lower-contrast disabled style.
+- Select a domain with arrow keys, press `Space`, and confirm the domain activation state toggles after the automatic or manual refresh.
 - Press `Enter` or `l` on a domain row and confirm Logs opens for that exact domain, not another entrypoint or domain.
-- In Logs, press `p` and confirm tailing pauses and resumes; press `i`, `w`, `e`, and `0` and confirm severity filter changes reset the displayed page instead of mixing entries.
+- In Logs, press `p` and confirm tailing pauses and resumes.
+- With the domain log stream still open, switch to Settings, use `Up` and `Down` to choose `All`, `Info and higher`, `Warnings and errors`, or `Errors only`, then press `Enter` or `Space`; return to Logs and confirm the severity label and displayed page reset without mixing entries from different filters.
 - Press `Enter` in Logs and confirm manual refresh remains responsive.
 - Press `Tab` to open Diagnostics and confirm config/runtime diagnostics are shown when a conflict or runtime reload failure exists; otherwise confirm the empty diagnostics message is shown.
+- Confirm the footer advertises `Tab`/`Shift+Tab`/`Left`/`Right`, manual refresh, Settings severity selection, log pause/refresh/export, daemon shutdown, and quit controls.
 - Press `d` and confirm the daemon shutdown request returns a status message and does not freeze terminal input.
 - Press `q` and confirm the terminal exits cleanly with normal echo/cursor behavior restored.
 

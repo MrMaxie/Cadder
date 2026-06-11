@@ -9,15 +9,17 @@ pub enum View {
   Entrypoints,
   Domains,
   Logs,
+  Settings,
   Diagnostics,
 }
 
 impl View {
-  pub const ALL: [Self; 5] = [
+  pub const ALL: [Self; 6] = [
     Self::Overview,
     Self::Entrypoints,
     Self::Domains,
     Self::Logs,
+    Self::Settings,
     Self::Diagnostics,
   ];
 
@@ -27,6 +29,7 @@ impl View {
       Self::Entrypoints => "Entrypoints",
       Self::Domains => "Domains",
       Self::Logs => "Logs",
+      Self::Settings => "Settings",
       Self::Diagnostics => "Diagnostics",
     }
   }
@@ -36,13 +39,109 @@ impl View {
   }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeverityFilter {
+  All,
+  Info,
+  Warn,
+  Error,
+}
+
+impl SeverityFilter {
+  pub const ALL: [Self; 4] = [Self::All, Self::Info, Self::Warn, Self::Error];
+
+  pub fn label(self) -> &'static str {
+    match self {
+      Self::All => "All",
+      Self::Info => "Info and higher",
+      Self::Warn => "Warnings and errors",
+      Self::Error => "Errors only",
+    }
+  }
+
+  pub fn description(self) -> &'static str {
+    match self {
+      Self::All => "Show every retained log entry",
+      Self::Info => "Hide trace and debug noise",
+      Self::Warn => "Show warnings and errors",
+      Self::Error => "Show errors and fatal entries",
+    }
+  }
+
+  pub fn minimum_severity(self) -> Option<LogSeverity> {
+    match self {
+      Self::All => None,
+      Self::Info => Some(LogSeverity::Info),
+      Self::Warn => Some(LogSeverity::Warn),
+      Self::Error => Some(LogSeverity::Error),
+    }
+  }
+
+  pub fn from_minimum_severity(minimum_severity: Option<LogSeverity>) -> Self {
+    match minimum_severity {
+      None => Self::All,
+      Some(LogSeverity::Info) => Self::Info,
+      Some(LogSeverity::Warn) => Self::Warn,
+      Some(LogSeverity::Error | LogSeverity::Fatal) => Self::Error,
+      Some(LogSeverity::Unknown | LogSeverity::Trace | LogSeverity::Debug) => Self::All,
+    }
+  }
+
+  pub fn index(self) -> usize {
+    Self::ALL
+      .iter()
+      .position(|filter| *filter == self)
+      .unwrap_or(0)
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsViewModel {
+  pub selected_severity: usize,
+}
+
+impl Default for SettingsViewModel {
+  fn default() -> Self {
+    Self {
+      selected_severity: SeverityFilter::All.index(),
+    }
+  }
+}
+
+impl SettingsViewModel {
+  pub fn selected_filter(&self) -> SeverityFilter {
+    SeverityFilter::ALL
+      .get(self.selected_severity)
+      .copied()
+      .unwrap_or(SeverityFilter::All)
+  }
+
+  pub fn select_filter(&mut self, filter: SeverityFilter) {
+    self.selected_severity = filter.index();
+  }
+
+  pub fn move_severity_selection(&mut self, delta: isize) {
+    move_index(
+      &mut self.selected_severity,
+      SeverityFilter::ALL.len(),
+      delta,
+    );
+  }
+
+  fn clamp(&mut self) {
+    clamp_index(&mut self.selected_severity, SeverityFilter::ALL.len());
+  }
+}
+
 #[derive(Debug, Clone)]
 pub struct TuiModel {
   pub view: View,
   pub search: String,
   pub search_mode: bool,
-  pub selected: usize,
+  pub entrypoint_selected: usize,
+  pub domain_selected: usize,
   pub logs: LogViewModel,
+  pub settings: SettingsViewModel,
   snapshot: GuiStateSnapshot,
 }
 
@@ -106,7 +205,6 @@ impl LogViewModel {
     self.entries.clear();
     self.next_cursor = None;
     self.loading = self.target.is_some();
-    self.request_in_flight = false;
     self.minimum_severity = minimum_severity;
     self.status = LogStreamStatus::Empty;
     self.has_gap = false;
@@ -160,8 +258,10 @@ impl Default for TuiModel {
       view: View::Overview,
       search: String::new(),
       search_mode: false,
-      selected: 0,
+      entrypoint_selected: 0,
+      domain_selected: 0,
       logs: LogViewModel::default(),
+      settings: SettingsViewModel::default(),
       snapshot: GuiStateSnapshot {
         captured_at_utc: chrono::Utc::now(),
         registrations: Vec::new(),
@@ -175,7 +275,7 @@ impl Default for TuiModel {
 impl TuiModel {
   pub fn set_snapshot(&mut self, snapshot: GuiStateSnapshot) {
     self.snapshot = snapshot;
-    self.selected = self.selected.min(self.visible_len().saturating_sub(1));
+    self.clamp_selections();
   }
 
   pub fn snapshot(&self) -> &GuiStateSnapshot {
@@ -185,23 +285,59 @@ impl TuiModel {
   pub fn next_view(&mut self) {
     let next = (self.view.index() + 1) % View::ALL.len();
     self.view = View::ALL[next];
-    self.selected = 0;
+    self.clamp_current_selection();
   }
 
   pub fn previous_view(&mut self) {
     let index = self.view.index();
     self.view = View::ALL[(index + View::ALL.len() - 1) % View::ALL.len()];
-    self.selected = 0;
+    self.clamp_current_selection();
   }
 
   pub fn move_selection(&mut self, delta: isize) {
-    let len = self.visible_len();
-    if len == 0 {
-      self.selected = 0;
-      return;
+    match self.view {
+      View::Entrypoints => {
+        let len = self.filtered_registrations().len();
+        move_index(&mut self.entrypoint_selected, len, delta);
+      }
+      View::Domains => {
+        let len = self.filtered_domains().len();
+        move_index(&mut self.domain_selected, len, delta);
+      }
+      View::Settings => self.settings.move_severity_selection(delta),
+      _ => {}
     }
-    self.selected =
-      (self.selected as isize + delta).clamp(0, len.saturating_sub(1) as isize) as usize;
+  }
+
+  pub fn clamp_current_selection(&mut self) {
+    match self.view {
+      View::Entrypoints => {
+        let len = self.filtered_registrations().len();
+        clamp_index(&mut self.entrypoint_selected, len);
+      }
+      View::Domains => {
+        let len = self.filtered_domains().len();
+        clamp_index(&mut self.domain_selected, len);
+      }
+      View::Settings => self.settings.clamp(),
+      _ => {}
+    }
+  }
+
+  pub fn clamp_selections(&mut self) {
+    let entrypoint_len = self.filtered_registrations().len();
+    let domain_len = self.filtered_domains().len();
+    clamp_index(&mut self.entrypoint_selected, entrypoint_len);
+    clamp_index(&mut self.domain_selected, domain_len);
+    self.settings.clamp();
+  }
+
+  pub fn sync_settings_severity_from_logs(&mut self) {
+    self
+      .settings
+      .select_filter(SeverityFilter::from_minimum_severity(
+        self.logs.minimum_severity,
+      ));
   }
 
   pub fn summary(&self) -> Summary {
@@ -268,13 +404,16 @@ impl TuiModel {
   }
 
   pub fn selected_entrypoint(&self) -> Option<&EntrypointRegistration> {
-    self.filtered_registrations().get(self.selected).copied()
+    self
+      .filtered_registrations()
+      .get(self.entrypoint_selected)
+      .copied()
   }
 
   pub fn selected_domain(&self) -> Option<(String, RegisteredDomain)> {
     self
       .filtered_domains()
-      .get(self.selected)
+      .get(self.domain_selected)
       .map(|(registration, domain)| (registration.registration_id.clone(), (*domain).clone()))
   }
 
@@ -296,14 +435,22 @@ impl TuiModel {
     self.view = View::Logs;
     true
   }
+}
 
-  fn visible_len(&self) -> usize {
-    match self.view {
-      View::Entrypoints => self.filtered_registrations().len(),
-      View::Domains => self.filtered_domains().len(),
-      _ => 0,
-    }
+fn move_index(index: &mut usize, len: usize, delta: isize) {
+  if len == 0 {
+    *index = 0;
+    return;
   }
+  *index = (*index as isize + delta).clamp(0, len.saturating_sub(1) as isize) as usize;
+}
+
+fn clamp_index(index: &mut usize, len: usize) {
+  if len == 0 {
+    *index = 0;
+    return;
+  }
+  *index = (*index).min(len.saturating_sub(1));
 }
 
 #[cfg(test)]
@@ -391,7 +538,8 @@ mod tests {
         ("Entrypoints", 1),
         ("Domains", 2),
         ("Logs", 3),
-        ("Diagnostics", 4),
+        ("Settings", 4),
+        ("Diagnostics", 5),
       ]
     );
 
@@ -409,9 +557,97 @@ mod tests {
     model.view = View::Domains;
 
     model.move_selection(10);
-    assert_eq!(model.selected, 1);
+    assert_eq!(model.domain_selected, 1);
     model.move_selection(-10);
-    assert_eq!(model.selected, 0);
+    assert_eq!(model.domain_selected, 0);
+  }
+
+  #[test]
+  fn top_level_navigation_preserves_per_view_selection() {
+    let mut model = TuiModel::default();
+    model.set_snapshot(snapshot_with_registrations(vec![
+      registration(
+        "shim-1",
+        "/work/app",
+        vec![RegisteredDomain::active("app.localhost")],
+      ),
+      registration(
+        "shim-2",
+        "/work/api",
+        vec![
+          RegisteredDomain::active("api.localhost"),
+          RegisteredDomain::active("admin.localhost"),
+        ],
+      ),
+    ]));
+
+    model.view = View::Entrypoints;
+    model.move_selection(1);
+    assert_eq!(model.entrypoint_selected, 1);
+
+    model.next_view();
+    model.move_selection(2);
+    assert_eq!(model.view, View::Domains);
+    assert_eq!(model.domain_selected, 2);
+
+    model.previous_view();
+    assert_eq!(model.view, View::Entrypoints);
+    assert_eq!(model.entrypoint_selected, 1);
+
+    model.next_view();
+    assert_eq!(model.view, View::Domains);
+    assert_eq!(model.domain_selected, 2);
+  }
+
+  #[test]
+  fn set_snapshot_clamps_all_row_selections() {
+    let mut model = TuiModel::default();
+    model.set_snapshot(snapshot_with_registrations(vec![
+      registration(
+        "shim-1",
+        "/work/app",
+        vec![RegisteredDomain::active("app.localhost")],
+      ),
+      registration(
+        "shim-2",
+        "/work/api",
+        vec![RegisteredDomain::active("api.localhost")],
+      ),
+    ]));
+    model.entrypoint_selected = 1;
+    model.domain_selected = 1;
+
+    model.set_snapshot(snapshot_with_registrations(vec![registration(
+      "shim-1",
+      "/work/app",
+      vec![RegisteredDomain::active("app.localhost")],
+    )]));
+
+    assert_eq!(model.entrypoint_selected, 0);
+    assert_eq!(model.domain_selected, 0);
+  }
+
+  #[test]
+  fn settings_severity_selection_maps_to_log_filter() {
+    let mut model = TuiModel {
+      view: View::Settings,
+      ..TuiModel::default()
+    };
+
+    assert_eq!(model.settings.selected_filter(), SeverityFilter::All);
+    assert_eq!(model.settings.selected_filter().minimum_severity(), None);
+
+    model.move_selection(2);
+    assert_eq!(model.settings.selected_filter(), SeverityFilter::Warn);
+    assert_eq!(
+      model.settings.selected_filter().minimum_severity(),
+      Some(LogSeverity::Warn)
+    );
+
+    model.logs.minimum_severity = Some(LogSeverity::Error);
+    model.sync_settings_severity_from_logs();
+
+    assert_eq!(model.settings.selected_filter(), SeverityFilter::Error);
   }
 
   #[test]
@@ -498,6 +734,26 @@ mod tests {
     assert_eq!(logs.next_cursor, None);
     assert_eq!(logs.minimum_severity, Some(LogSeverity::Error));
     assert!(logs.loading);
+  }
+
+  #[test]
+  fn severity_change_preserves_in_flight_log_request_state() {
+    let mut logs = LogViewModel {
+      target: Some(LogTarget {
+        registration_id: "shim-1".to_string(),
+        domain_name: "app.localhost".to_string(),
+        stream: LogStreamIdentity::domain("app.localhost"),
+      }),
+      loading: true,
+      request_in_flight: true,
+      ..LogViewModel::default()
+    };
+
+    logs.reset_for_filter(Some(LogSeverity::Warn));
+
+    assert!(logs.loading);
+    assert!(logs.request_in_flight);
+    assert_eq!(logs.minimum_severity, Some(LogSeverity::Warn));
   }
 
   #[test]

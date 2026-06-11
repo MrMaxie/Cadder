@@ -5,26 +5,29 @@ use cadder_daemon::{
   CadderClient, DaemonLaunchOptions, RuntimePaths, ensure_daemon_running_with_options,
 };
 use cadder_protocol::{
-  BasicResponse, GuiStateSnapshot, LogEntry, LogSeverity, LogStreamIdentity, LogStreamStatus,
-  QueryLogsRequest, QueryLogsResponse, QueryStateRequest, QueryStateResponse,
-  SetDomainEnabledRequest, SetEntrypointEnabledRequest, ShutdownDaemonRequest, message_types,
-  new_request_id,
+  ActivationState, BasicResponse, ConfigApplyStatus, GuiStateSnapshot, LogEntry, LogSeverity,
+  LogStreamIdentity, LogStreamStatus, QueryLogsRequest, QueryLogsResponse, QueryStateRequest,
+  QueryStateResponse, RuntimeStatus, SetDomainEnabledRequest, SetEntrypointEnabledRequest,
+  ShutdownDaemonRequest, message_types, new_request_id,
 };
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use model::{TuiModel, View};
+use model::{SeverityFilter, TuiModel, View};
 use ratatui::{
   DefaultTerminal, Frame,
   layout::{Constraint, Layout},
-  style::{Color, Modifier, Style, Stylize},
-  text::Line,
-  widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, Tabs, Wrap},
+  style::{Color, Modifier, Style},
+  text::{Line, Span},
+  widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, TableState, Tabs, Wrap},
 };
 use std::{
   path::PathBuf,
   time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
+
+const STATE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const LOG_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -81,9 +84,12 @@ async fn main() -> Result<()> {
     responses_tx,
     responses_rx,
     state_request_in_flight: false,
+    state_refresh_pending: false,
     toggle_request_in_flight: false,
     shutdown_request_in_flight: false,
+    last_state_refresh: Instant::now(),
     last_log_refresh: Instant::now(),
+    log_refresh_pending: false,
     log_request_serial: 0,
   };
   app.refresh().await?;
@@ -101,9 +107,12 @@ struct TuiApp {
   responses_tx: mpsc::UnboundedSender<AppResponse>,
   responses_rx: mpsc::UnboundedReceiver<AppResponse>,
   state_request_in_flight: bool,
+  state_refresh_pending: bool,
   toggle_request_in_flight: bool,
   shutdown_request_in_flight: bool,
+  last_state_refresh: Instant,
   last_log_refresh: Instant,
+  log_refresh_pending: bool,
   log_request_serial: u64,
 }
 
@@ -124,6 +133,7 @@ impl TuiApp {
   async fn run(&mut self, mut terminal: DefaultTerminal) -> Result<()> {
     loop {
       self.drain_responses();
+      self.maybe_refresh_state();
       self.maybe_tail_logs();
       terminal.draw(|frame| self.draw(frame))?;
       if event::poll(Duration::from_millis(200))?
@@ -132,60 +142,70 @@ impl TuiApp {
         if key.kind != KeyEventKind::Press {
           continue;
         }
-        if self.model.search_mode {
-          match key.code {
-            KeyCode::Esc => {
-              self.model.search_mode = false;
-              self.model.search.clear();
-            }
-            KeyCode::Backspace => {
-              self.model.search.pop();
-            }
-            KeyCode::Char(ch) => self.model.search.push(ch),
-            _ => {}
-          }
-          continue;
-        }
-        match key.code {
-          KeyCode::Char('q') => return Ok(()),
-          KeyCode::Char('r') => self.start_state_refresh(),
-          KeyCode::Tab => self.model.next_view(),
-          KeyCode::BackTab => self.model.previous_view(),
-          KeyCode::Down => self.model.move_selection(1),
-          KeyCode::Up => self.model.move_selection(-1),
-          KeyCode::Char('/') => self.model.search_mode = true,
-          KeyCode::Char(' ') => self.start_toggle_selected(),
-          KeyCode::Char('p') if self.model.view == View::Logs => {
-            self.model.logs.paused = !self.model.logs.paused;
-            self.message = if self.model.logs.paused {
-              "Log tailing paused.".to_string()
-            } else {
-              "Log tailing resumed.".to_string()
-            };
-          }
-          KeyCode::Char('0') if self.model.view == View::Logs => {
-            self.set_log_severity(None);
-          }
-          KeyCode::Char('i') if self.model.view == View::Logs => {
-            self.set_log_severity(Some(LogSeverity::Info));
-          }
-          KeyCode::Char('w') if self.model.view == View::Logs => {
-            self.set_log_severity(Some(LogSeverity::Warn));
-          }
-          KeyCode::Char('e') if self.model.view == View::Logs => {
-            self.set_log_severity(Some(LogSeverity::Error));
-          }
-          KeyCode::Char('x') if self.model.view == View::Logs => self.export_logs()?,
-          KeyCode::Char('d') => self.start_shutdown_daemon(),
-          KeyCode::Enter if self.model.view == View::Domains => self.open_selected_domain_logs(),
-          KeyCode::Char('l') if self.model.view == View::Domains => {
-            self.open_selected_domain_logs()
-          }
-          KeyCode::Enter if self.model.view == View::Logs => self.start_log_refresh(),
-          _ => {}
+        if self.handle_key_code(key.code)? {
+          return Ok(());
         }
       }
     }
+  }
+
+  fn handle_key_code(&mut self, code: KeyCode) -> Result<bool> {
+    if self.model.search_mode {
+      match code {
+        KeyCode::Esc => {
+          self.model.search_mode = false;
+          self.model.search.clear();
+        }
+        KeyCode::Backspace => {
+          self.model.search.pop();
+        }
+        KeyCode::Char(ch) => self.model.search.push(ch),
+        _ => {}
+      }
+      self.model.clamp_selections();
+      return Ok(false);
+    }
+
+    match code {
+      KeyCode::Char('q') => return Ok(true),
+      KeyCode::Char('r') => self.start_state_refresh(),
+      KeyCode::Tab | KeyCode::Right => self.model.next_view(),
+      KeyCode::BackTab | KeyCode::Left => self.model.previous_view(),
+      KeyCode::Down => self.model.move_selection(1),
+      KeyCode::Up => self.model.move_selection(-1),
+      KeyCode::Char('/') => self.model.search_mode = true,
+      KeyCode::Char(' ') if self.model.view == View::Settings => self.apply_settings_log_severity(),
+      KeyCode::Char(' ') => self.start_toggle_selected(),
+      KeyCode::Char('p') if self.model.view == View::Logs => {
+        self.model.logs.paused = !self.model.logs.paused;
+        self.message = if self.model.logs.paused {
+          "Log tailing paused.".to_string()
+        } else {
+          "Log tailing resumed.".to_string()
+        };
+      }
+      KeyCode::Char('0') if self.model.view == View::Logs => {
+        self.set_log_severity(None);
+      }
+      KeyCode::Char('i') if self.model.view == View::Logs => {
+        self.set_log_severity(Some(LogSeverity::Info));
+      }
+      KeyCode::Char('w') if self.model.view == View::Logs => {
+        self.set_log_severity(Some(LogSeverity::Warn));
+      }
+      KeyCode::Char('e') if self.model.view == View::Logs => {
+        self.set_log_severity(Some(LogSeverity::Error));
+      }
+      KeyCode::Char('x') if self.model.view == View::Logs => self.export_logs()?,
+      KeyCode::Char('d') => self.start_shutdown_daemon(),
+      KeyCode::Enter if self.model.view == View::Settings => self.apply_settings_log_severity(),
+      KeyCode::Enter if self.model.view == View::Domains => self.open_selected_domain_logs(),
+      KeyCode::Char('l') if self.model.view == View::Domains => self.open_selected_domain_logs(),
+      KeyCode::Enter if self.model.view == View::Logs => self.start_log_refresh(),
+      _ => {}
+    }
+
+    Ok(false)
   }
 
   fn drain_responses(&mut self) {
@@ -193,10 +213,12 @@ impl TuiApp {
       match response {
         AppResponse::State(result) => {
           self.state_request_in_flight = false;
+          self.last_state_refresh = Instant::now();
           match result {
             Ok(response) => self.apply_state_response(response),
             Err(error) => self.message = format!("State refresh failed: {error}"),
           }
+          self.start_pending_state_refresh();
         }
         AppResponse::Toggle(result) => {
           self.toggle_request_in_flight = false;
@@ -214,14 +236,18 @@ impl TuiApp {
           minimum_severity,
           result,
         } => {
-          let current_matches = serial == self.log_request_serial
+          let current_request = serial == self.log_request_serial
             && self
               .model
               .logs
               .active_stream()
-              .is_some_and(|active| active == stream)
-            && self.model.logs.minimum_severity == minimum_severity;
-          if !current_matches {
+              .is_some_and(|active| active == stream);
+          if !current_request {
+            continue;
+          }
+          if self.model.logs.minimum_severity != minimum_severity {
+            self.model.logs.request_in_flight = false;
+            self.finish_stale_log_response();
             continue;
           }
           match result {
@@ -234,6 +260,7 @@ impl TuiApp {
               self.model.logs.apply_read_error(error);
             }
           }
+          self.start_pending_log_refresh();
         }
         AppResponse::Shutdown(result) => {
           self.shutdown_request_in_flight = false;
@@ -251,11 +278,18 @@ impl TuiApp {
       || self.model.logs.paused
       || self.model.logs.request_in_flight
       || self.model.logs.target.is_none()
-      || self.last_log_refresh.elapsed() < Duration::from_millis(750)
+      || self.last_log_refresh.elapsed() < LOG_REFRESH_INTERVAL
     {
       return;
     }
     self.start_log_refresh();
+  }
+
+  fn maybe_refresh_state(&mut self) {
+    if self.state_request_in_flight || self.last_state_refresh.elapsed() < STATE_REFRESH_INTERVAL {
+      return;
+    }
+    self.start_state_refresh();
   }
 
   fn apply_state_response(&mut self, response: QueryStateResponse) {
@@ -279,14 +313,18 @@ impl TuiApp {
       )
       .await?;
     self.apply_state_response(response);
+    self.last_state_refresh = Instant::now();
     Ok(())
   }
 
   fn start_state_refresh(&mut self) {
     if self.state_request_in_flight {
+      self.state_refresh_pending = true;
       return;
     }
     self.state_request_in_flight = true;
+    self.state_refresh_pending = false;
+    self.last_state_refresh = Instant::now();
     let client = self.client.clone();
     let responses = self.responses_tx.clone();
     tokio::spawn(async move {
@@ -302,6 +340,14 @@ impl TuiApp {
         .map_err(|error| error.to_string());
       let _ = responses.send(AppResponse::State(result));
     });
+  }
+
+  fn start_pending_state_refresh(&mut self) {
+    if !self.state_refresh_pending {
+      return;
+    }
+    self.state_refresh_pending = false;
+    self.start_state_refresh();
   }
 
   fn start_toggle_selected(&mut self) {
@@ -372,18 +418,31 @@ impl TuiApp {
 
   fn set_log_severity(&mut self, severity: Option<LogSeverity>) {
     if self.model.logs.minimum_severity == severity {
+      self.message = format!(
+        "Log severity filter already set to {}.",
+        describe_log_severity(severity)
+      );
       return;
     }
     self.model.logs.reset_for_filter(severity);
+    self.model.sync_settings_severity_from_logs();
     self.message = match severity {
       Some(severity) => format!("Log severity filter set to {severity:?}."),
       None => "Log severity filter cleared.".to_string(),
     };
-    self.start_log_refresh();
+    if self.model.logs.target.is_some() {
+      self.start_log_refresh();
+    }
+  }
+
+  fn apply_settings_log_severity(&mut self) {
+    let filter = self.model.settings.selected_filter();
+    self.set_log_severity(filter.minimum_severity());
   }
 
   fn start_log_refresh(&mut self) {
     if self.model.logs.request_in_flight {
+      self.log_refresh_pending = true;
       return;
     }
     let Some(stream) = self.model.logs.active_stream() else {
@@ -393,6 +452,7 @@ impl TuiApp {
     let cursor = self.model.logs.next_cursor.clone();
     let minimum_severity = self.model.logs.minimum_severity;
     self.model.logs.mark_loading();
+    self.log_refresh_pending = false;
     self.last_log_refresh = Instant::now();
     self.log_request_serial += 1;
     let serial = self.log_request_serial;
@@ -421,6 +481,22 @@ impl TuiApp {
         result,
       });
     });
+  }
+
+  fn start_pending_log_refresh(&mut self) {
+    if !self.log_refresh_pending {
+      return;
+    }
+    self.log_refresh_pending = false;
+    self.start_log_refresh();
+  }
+
+  fn finish_stale_log_response(&mut self) {
+    if self.log_refresh_pending {
+      self.start_pending_log_refresh();
+    } else {
+      self.model.logs.loading = false;
+    }
   }
 
   fn start_shutdown_daemon(&mut self) {
@@ -477,6 +553,15 @@ enum ToggleRequest {
   Domain(SetDomainEnabledRequest),
 }
 
+fn describe_log_severity(severity: Option<LogSeverity>) -> &'static str {
+  match severity {
+    Some(LogSeverity::Info) => "Info and higher",
+    Some(LogSeverity::Warn) => "Warnings and errors",
+    Some(LogSeverity::Error | LogSeverity::Fatal) => "Errors only",
+    _ => "All",
+  }
+}
+
 fn safe_filename(input: &str) -> String {
   let mut output = String::with_capacity(input.len());
   for ch in input.chars() {
@@ -514,12 +599,115 @@ fn format_log_excerpt(target: &model::LogTarget, entries: &[LogEntry]) -> String
   lines.join("\n")
 }
 
+struct UiStyles;
+
+impl UiStyles {
+  fn tab_selected() -> Style {
+    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+  }
+
+  fn block_border() -> Style {
+    Style::new().fg(Color::Blue)
+  }
+
+  fn title() -> Style {
+    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+  }
+
+  fn header() -> Style {
+    Style::new()
+      .fg(Color::LightCyan)
+      .add_modifier(Modifier::BOLD)
+  }
+
+  fn selected_row() -> Style {
+    Style::new()
+      .fg(Color::White)
+      .bg(Color::Blue)
+      .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+  }
+
+  fn active() -> Style {
+    Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+  }
+
+  fn disabled() -> Style {
+    Style::new().fg(Color::DarkGray)
+  }
+
+  fn warning() -> Style {
+    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+  }
+
+  fn error() -> Style {
+    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+  }
+
+  fn info() -> Style {
+    Style::new().fg(Color::LightBlue)
+  }
+
+  fn muted() -> Style {
+    Style::new().fg(Color::DarkGray)
+  }
+}
+
+fn app_block(title: impl Into<String>) -> Block<'static> {
+  Block::bordered()
+    .title(title.into())
+    .border_style(UiStyles::block_border())
+    .title_style(UiStyles::title())
+}
+
+fn activation_marker(state: ActivationState) -> String {
+  let marker = if state.is_enabled() { "[x]" } else { "[ ]" };
+  format!("{marker} {state:?}")
+}
+
+fn activation_style(state: ActivationState) -> Style {
+  match state {
+    ActivationState::Active | ActivationState::Registered | ActivationState::Activating => {
+      UiStyles::active()
+    }
+    ActivationState::Faulted => UiStyles::error(),
+    ActivationState::Unknown => UiStyles::warning(),
+    ActivationState::Inactive => UiStyles::disabled(),
+  }
+}
+
+fn runtime_status_style(status: RuntimeStatus) -> Style {
+  match status {
+    RuntimeStatus::Running | RuntimeStatus::Resolved => UiStyles::active(),
+    RuntimeStatus::Idle => UiStyles::muted(),
+    RuntimeStatus::Unhealthy | RuntimeStatus::NotResolved => UiStyles::error(),
+    RuntimeStatus::Unknown => UiStyles::warning(),
+  }
+}
+
+fn config_status_style(status: ConfigApplyStatus) -> Style {
+  match status {
+    ConfigApplyStatus::Applied => UiStyles::active(),
+    ConfigApplyStatus::Idle | ConfigApplyStatus::NotApplied => UiStyles::muted(),
+    ConfigApplyStatus::Failed => UiStyles::error(),
+    ConfigApplyStatus::Unknown => UiStyles::warning(),
+  }
+}
+
+fn severity_style(severity: LogSeverity) -> Style {
+  match severity {
+    LogSeverity::Warn => UiStyles::warning(),
+    LogSeverity::Error | LogSeverity::Fatal => UiStyles::error(),
+    LogSeverity::Info => UiStyles::info(),
+    LogSeverity::Unknown | LogSeverity::Trace | LogSeverity::Debug => UiStyles::muted(),
+  }
+}
+
 impl TuiApp {
   fn draw(&self, frame: &mut Frame<'_>) {
     let [tabs_area, body_area, status_area] = Layout::vertical([
       Constraint::Length(3),
       Constraint::Min(3),
-      Constraint::Length(2),
+      Constraint::Length(3),
     ])
     .areas(frame.area());
 
@@ -530,8 +718,14 @@ impl TuiApp {
         .collect::<Vec<_>>(),
     )
     .select(self.model.view.index())
-    .block(Block::new().borders(Borders::BOTTOM).title("Cadder"))
-    .highlight_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    .block(
+      Block::new()
+        .borders(Borders::BOTTOM)
+        .title("Cadder")
+        .border_style(UiStyles::block_border())
+        .title_style(UiStyles::title()),
+    )
+    .highlight_style(UiStyles::tab_selected());
     frame.render_widget(tabs, tabs_area);
 
     match self.model.view {
@@ -539,6 +733,7 @@ impl TuiApp {
       View::Entrypoints => self.draw_entrypoints(frame, body_area),
       View::Domains => self.draw_domains(frame, body_area),
       View::Logs => self.draw_logs(frame, body_area),
+      View::Settings => self.draw_settings(frame, body_area),
       View::Diagnostics => self.draw_diagnostics(frame, body_area),
     }
 
@@ -549,38 +744,56 @@ impl TuiApp {
     } else {
       format!(" filter: {}", self.model.search)
     };
-    let status = format!(
-      "{}{}{}  |  Tab view  r refresh  space toggle  / search  p pause logs  i/w/e/0 severity  x export  d shutdown  q quit",
+    let status_context = format!(
+      "{}{}  severity: {}",
       self.message,
       search,
-      self
-        .model
-        .logs
-        .minimum_severity
-        .map(|severity| format!(" severity: {severity:?}"))
-        .unwrap_or_default()
+      describe_log_severity(self.model.logs.minimum_severity)
     );
-    frame.render_widget(Paragraph::new(status), status_area);
+    let navigation_help = "Tab/Shift+Tab/Left/Right views  r refresh  / search  Space toggle/apply";
+    let action_help = "Settings: Up/Down severity Enter apply  Logs: p pause Enter refresh x export  d shutdown  q quit";
+    frame.render_widget(
+      Paragraph::new(vec![
+        Line::from(status_context),
+        Line::styled(navigation_help, UiStyles::muted()),
+        Line::styled(action_help, UiStyles::muted()),
+      ])
+      .wrap(Wrap { trim: true }),
+      status_area,
+    );
   }
 
   fn draw_overview(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
     let summary = self.model.summary();
+    let snapshot = self.model.snapshot();
     let lines = vec![
-      Line::from(vec!["Runtime: ".bold(), summary.runtime.into()]),
-      Line::from(vec!["Config: ".bold(), summary.config.into()]),
       Line::from(vec![
-        "Entrypoints: ".bold(),
-        summary.entrypoints.to_string().into(),
+        Span::styled("Runtime: ", UiStyles::header()),
+        Span::styled(
+          summary.runtime,
+          runtime_status_style(snapshot.runtime.status),
+        ),
       ]),
-      Line::from(vec!["Domains: ".bold(), summary.domains.to_string().into()]),
       Line::from(vec![
-        "Active domains: ".bold(),
-        summary.active_domains.to_string().into(),
+        Span::styled("Config: ", UiStyles::header()),
+        Span::styled(summary.config, config_status_style(snapshot.config.status)),
+      ]),
+      Line::from(vec![
+        Span::styled("Entrypoints: ", UiStyles::header()),
+        Span::styled(summary.entrypoints.to_string(), UiStyles::info()),
+      ]),
+      Line::from(vec![
+        Span::styled("Domains: ", UiStyles::header()),
+        Span::styled(summary.domains.to_string(), UiStyles::info()),
+      ]),
+      Line::from(vec![
+        Span::styled("Active domains: ", UiStyles::header()),
+        Span::styled(summary.active_domains.to_string(), UiStyles::active()),
       ]),
     ];
     frame.render_widget(
       Paragraph::new(lines)
-        .block(Block::bordered().title("Overview"))
+        .block(app_block("Overview"))
         .wrap(Wrap { trim: true }),
       area,
     );
@@ -594,23 +807,27 @@ impl TuiApp {
       .map(|registration| {
         Row::new(vec![
           Cell::from(registration.registration_id.clone()),
-          Cell::from(format!("{:?}", registration.activation_state)),
+          Cell::from(activation_marker(registration.activation_state)),
           Cell::from(registration.source_working_directory.raw.clone()),
           Cell::from(registration.registered_domains.len().to_string()),
         ])
+        .style(activation_style(registration.activation_state))
       });
     let table = Table::new(
       rows,
       [
         Constraint::Length(24),
-        Constraint::Length(12),
+        Constraint::Length(16),
         Constraint::Percentage(60),
         Constraint::Length(8),
       ],
     )
-    .header(Row::new(["ID", "State", "Source", "Domains"]).style(Style::new().bold()))
-    .block(Block::bordered().title("Entrypoints"));
-    frame.render_widget(table, area);
+    .header(Row::new(["ID", "State", "Source", "Domains"]).style(UiStyles::header()))
+    .block(app_block("Entrypoints"))
+    .row_highlight_style(UiStyles::selected_row())
+    .highlight_symbol(">> ");
+    let mut state = TableState::default().with_selected(Some(self.model.entrypoint_selected));
+    frame.render_stateful_widget(table, area, &mut state);
   }
 
   fn draw_domains(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
@@ -622,20 +839,24 @@ impl TuiApp {
         Row::new(vec![
           Cell::from(registration.registration_id.clone()),
           Cell::from(domain.name.canonical.clone()),
-          Cell::from(format!("{:?}", domain.activation_state)),
+          Cell::from(activation_marker(domain.activation_state)),
         ])
+        .style(activation_style(domain.activation_state))
       });
     let table = Table::new(
       rows,
       [
         Constraint::Length(24),
         Constraint::Percentage(60),
-        Constraint::Length(12),
+        Constraint::Length(16),
       ],
     )
-    .header(Row::new(["Entrypoint", "Domain", "State"]).style(Style::new().bold()))
-    .block(Block::bordered().title("Domains"));
-    frame.render_widget(table, area);
+    .header(Row::new(["Entrypoint", "Domain", "State"]).style(UiStyles::header()))
+    .block(app_block("Domains"))
+    .row_highlight_style(UiStyles::selected_row())
+    .highlight_symbol(">> ");
+    let mut state = TableState::default().with_selected(Some(self.model.domain_selected));
+    frame.render_stateful_widget(table, area, &mut state);
   }
 
   fn draw_logs(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
@@ -647,24 +868,33 @@ impl TuiApp {
       .unwrap_or("no domain selected");
     let mode = if logs.paused { "paused" } else { "tailing" };
     let title = format!(
-      "Logs: {target} | {mode} | {:?}{}",
+      "Logs: {target} | {mode} | {:?} | {}",
       logs.status,
-      logs
-        .minimum_severity
-        .map(|severity| format!(" | min {severity:?}"))
-        .unwrap_or_default()
+      describe_log_severity(logs.minimum_severity)
     );
     let mut items = Vec::new();
-    items.extend(self.log_state_lines().into_iter().map(ListItem::new));
+    items.extend(
+      self
+        .log_state_lines()
+        .into_iter()
+        .map(|line| ListItem::new(Line::styled(line, UiStyles::muted()))),
+    );
     items.extend(logs.entries.iter().map(|entry| {
-      ListItem::new(format!(
-        "{} {:?} {}",
-        entry.timestamp_utc.format("%H:%M:%S"),
-        entry.severity,
-        entry.raw_message
-      ))
+      ListItem::new(Line::from(vec![
+        Span::styled(
+          entry.timestamp_utc.format("%H:%M:%S").to_string(),
+          UiStyles::muted(),
+        ),
+        Span::raw(" "),
+        Span::styled(
+          format!("{:?}", entry.severity),
+          severity_style(entry.severity),
+        ),
+        Span::raw(" "),
+        Span::raw(entry.raw_message.clone()),
+      ]))
     }));
-    frame.render_widget(List::new(items).block(Block::bordered().title(title)), area);
+    frame.render_widget(List::new(items).block(app_block(title)), area);
   }
 
   fn log_state_lines(&self) -> Vec<String> {
@@ -708,25 +938,65 @@ impl TuiApp {
     lines
   }
 
+  fn draw_settings(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+    let active_filter = SeverityFilter::from_minimum_severity(self.model.logs.minimum_severity);
+    let rows = SeverityFilter::ALL.into_iter().map(|filter| {
+      let applied = if filter == active_filter {
+        "[x]"
+      } else {
+        "[ ]"
+      };
+      let style = if filter == active_filter {
+        UiStyles::active()
+      } else {
+        Style::new()
+      };
+      Row::new(vec![
+        Cell::from(applied),
+        Cell::from(filter.label()),
+        Cell::from(filter.description()),
+      ])
+      .style(style)
+    });
+    let table = Table::new(
+      rows,
+      [
+        Constraint::Length(8),
+        Constraint::Length(24),
+        Constraint::Percentage(68),
+      ],
+    )
+    .header(Row::new(["Applied", "Severity", "Effect"]).style(UiStyles::header()))
+    .block(app_block("Settings"))
+    .row_highlight_style(UiStyles::selected_row())
+    .highlight_symbol(">> ");
+    let mut state =
+      TableState::default().with_selected(Some(self.model.settings.selected_severity));
+    frame.render_stateful_widget(table, area, &mut state);
+  }
+
   fn draw_diagnostics(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
     let snapshot = self.model.snapshot();
     let mut lines = Vec::new();
     lines.extend(snapshot.config.diagnostics.iter().map(|diagnostic| {
-      ListItem::new(format!("config:{} {}", diagnostic.code, diagnostic.message))
+      ListItem::new(Line::styled(
+        format!("config:{} {}", diagnostic.code, diagnostic.message),
+        UiStyles::error(),
+      ))
     }));
     lines.extend(snapshot.runtime.diagnostics.iter().map(|diagnostic| {
-      ListItem::new(format!(
-        "runtime:{} {}",
-        diagnostic.code, diagnostic.message
+      ListItem::new(Line::styled(
+        format!("runtime:{} {}", diagnostic.code, diagnostic.message),
+        UiStyles::warning(),
       ))
     }));
     if lines.is_empty() {
-      lines.push(ListItem::new("No diagnostics."));
+      lines.push(ListItem::new(Line::styled(
+        "No diagnostics.",
+        UiStyles::muted(),
+      )));
     }
-    frame.render_widget(
-      List::new(lines).block(Block::bordered().title("Diagnostics")),
-      area,
-    );
+    frame.render_widget(List::new(lines).block(app_block("Diagnostics")), area);
   }
 }
 
@@ -760,9 +1030,12 @@ mod tests {
       responses_tx,
       responses_rx,
       state_request_in_flight: false,
+      state_refresh_pending: false,
       toggle_request_in_flight: false,
       shutdown_request_in_flight: false,
+      last_state_refresh: Instant::now(),
       last_log_refresh: Instant::now(),
+      log_refresh_pending: false,
       log_request_serial: 0,
     }
   }
@@ -986,8 +1259,107 @@ mod tests {
     let text = render(&app);
 
     assert!(text.contains("search: api"));
-    assert!(text.contains("severity: Error"));
+    assert!(text.contains("severity: Errors only"));
+    assert!(text.contains("Left/Right"));
+    assert!(text.contains("Settings: Up/Down severity Enter apply"));
+    assert!(!text.contains("i/w/e/0"));
     assert!(text.contains("no domain selected"));
+  }
+
+  #[test]
+  fn draw_domains_includes_selection_and_activation_markers() {
+    let mut app = test_app();
+    app.model.view = View::Domains;
+    app.model.domain_selected = 1;
+
+    let text = render(&app);
+
+    assert!(text.contains(">>"));
+    assert!(text.contains("app.localhost"));
+    assert!(text.contains("[x] Active"));
+    assert!(text.contains("api.localhost"));
+    assert!(text.contains("[ ] Inactive"));
+  }
+
+  #[test]
+  fn draw_settings_shows_applied_filter_and_choices() {
+    let mut app = test_app();
+    app.model.view = View::Settings;
+    app.model.logs.minimum_severity = Some(LogSeverity::Warn);
+    app.model.sync_settings_severity_from_logs();
+
+    let text = render(&app);
+
+    assert!(text.contains("Settings"));
+    assert!(text.contains("[x]"));
+    assert!(text.contains("Warnings and errors"));
+    assert!(text.contains("Errors only"));
+  }
+
+  #[test]
+  fn style_helpers_use_high_contrast_terminal_styles() {
+    assert_eq!(activation_marker(ActivationState::Active), "[x] Active");
+    assert_eq!(activation_marker(ActivationState::Inactive), "[ ] Inactive");
+    assert_eq!(
+      activation_style(ActivationState::Active).fg,
+      Some(Color::Green)
+    );
+    assert_eq!(
+      activation_style(ActivationState::Inactive).fg,
+      Some(Color::DarkGray)
+    );
+    assert_eq!(severity_style(LogSeverity::Error).fg, Some(Color::Red));
+    assert!(
+      UiStyles::selected_row()
+        .add_modifier
+        .contains(Modifier::REVERSED)
+    );
+  }
+
+  #[test]
+  fn keyboard_navigation_supports_tabs_arrows_and_selection_preservation() {
+    let mut app = test_app();
+
+    app.handle_key_code(KeyCode::Left).unwrap();
+    assert_eq!(app.model.view, View::Diagnostics);
+    app.handle_key_code(KeyCode::Right).unwrap();
+    assert_eq!(app.model.view, View::Overview);
+    app.handle_key_code(KeyCode::Tab).unwrap();
+    assert_eq!(app.model.view, View::Entrypoints);
+    app.handle_key_code(KeyCode::BackTab).unwrap();
+    assert_eq!(app.model.view, View::Overview);
+
+    app.model.view = View::Domains;
+    app.handle_key_code(KeyCode::Down).unwrap();
+    assert_eq!(app.model.domain_selected, 1);
+    app.handle_key_code(KeyCode::Right).unwrap();
+    app.handle_key_code(KeyCode::Right).unwrap();
+    assert_eq!(app.model.view, View::Settings);
+    app.handle_key_code(KeyCode::Left).unwrap();
+    app.handle_key_code(KeyCode::Left).unwrap();
+    assert_eq!(app.model.view, View::Domains);
+    assert_eq!(app.model.domain_selected, 1);
+  }
+
+  #[test]
+  fn settings_keyboard_applies_selected_log_severity() {
+    let mut app = test_app();
+    app.model.view = View::Settings;
+
+    app.handle_key_code(KeyCode::Down).unwrap();
+    app.handle_key_code(KeyCode::Down).unwrap();
+    app.handle_key_code(KeyCode::Enter).unwrap();
+
+    assert_eq!(app.model.logs.minimum_severity, Some(LogSeverity::Warn));
+    assert_eq!(app.model.settings.selected_filter(), SeverityFilter::Warn);
+    assert_eq!(app.message, "Log severity filter set to Warn.");
+    assert!(!app.model.logs.request_in_flight);
+
+    app.handle_key_code(KeyCode::Char(' ')).unwrap();
+    assert_eq!(
+      app.message,
+      "Log severity filter already set to Warnings and errors."
+    );
   }
 
   #[test]
@@ -1140,6 +1512,37 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn toggle_success_queues_state_refresh_when_poll_is_in_flight() {
+    let mut app = test_app();
+    app.state_request_in_flight = true;
+
+    app
+      .responses_tx
+      .send(AppResponse::Toggle(Ok(BasicResponse {
+        request_id: "toggle".to_string(),
+        accepted: true,
+        message: "domain toggled".to_string(),
+      })))
+      .unwrap();
+    app
+      .responses_tx
+      .send(AppResponse::State(Ok(QueryStateResponse {
+        request_id: "state".to_string(),
+        accepted: true,
+        message: "old snapshot".to_string(),
+        snapshot: Some(snapshot()),
+      })))
+      .unwrap();
+
+    app.drain_responses();
+
+    assert!(app.state_request_in_flight);
+    assert!(!app.state_refresh_pending);
+    drain_until(&mut app, |app| !app.state_request_in_flight).await;
+    assert!(app.message.starts_with("State refresh failed:"));
+  }
+
+  #[tokio::test]
   async fn start_state_refresh_reports_connection_error() {
     let mut app = test_app();
 
@@ -1149,6 +1552,28 @@ mod tests {
 
     drain_until(&mut app, |app| !app.state_request_in_flight).await;
 
+    assert!(app.message.starts_with("State refresh failed:"));
+  }
+
+  #[tokio::test]
+  async fn maybe_refresh_state_starts_after_interval_without_overlap() {
+    let mut app = test_app();
+    let elapsed_refresh = Instant::now() - STATE_REFRESH_INTERVAL - Duration::from_millis(10);
+
+    app.state_request_in_flight = true;
+    app.last_state_refresh = elapsed_refresh;
+    app.maybe_refresh_state();
+    assert_eq!(app.last_state_refresh, elapsed_refresh);
+
+    app.state_request_in_flight = false;
+    app.maybe_refresh_state();
+    assert!(app.state_request_in_flight);
+    let dispatched_at = app.last_state_refresh;
+
+    app.maybe_refresh_state();
+    assert_eq!(app.last_state_refresh, dispatched_at);
+
+    drain_until(&mut app, |app| !app.state_request_in_flight).await;
     assert!(app.message.starts_with("State refresh failed:"));
   }
 
@@ -1196,12 +1621,100 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn severity_change_waits_for_in_flight_log_request_before_refreshing() {
+    let mut app = test_app();
+    app.model.view = View::Domains;
+    app.model.open_selected_domain_logs();
+    let stream = app.model.logs.active_stream().unwrap();
+    app.log_request_serial = 1;
+    app.model.logs.request_in_flight = true;
+    app.model.logs.loading = true;
+
+    app.set_log_severity(Some(LogSeverity::Warn));
+
+    assert_eq!(app.log_request_serial, 1);
+    assert!(app.model.logs.request_in_flight);
+    assert!(app.log_refresh_pending);
+    assert_eq!(app.model.logs.minimum_severity, Some(LogSeverity::Warn));
+
+    app
+      .responses_tx
+      .send(AppResponse::Logs {
+        serial: 1,
+        stream,
+        minimum_severity: None,
+        result: Ok(QueryLogsResponse {
+          request_id: "old".to_string(),
+          accepted: true,
+          message: "old".to_string(),
+          stream: LogStreamIdentity::domain("app.localhost"),
+          stream_status: LogStreamStatus::Active,
+          entries: vec![log_entry(1, LogSeverity::Info, "old info")],
+          next_cursor: Some("seq:1".to_string()),
+          has_gap: false,
+          has_more_before: false,
+          truncated_by_retention: false,
+        }),
+      })
+      .unwrap();
+
+    app.drain_responses();
+
+    assert_eq!(app.log_request_serial, 2);
+    assert!(!app.log_refresh_pending);
+    assert!(app.model.logs.entries.is_empty());
+    assert_eq!(app.model.logs.minimum_severity, Some(LogSeverity::Warn));
+    drain_until(&mut app, |app| !app.model.logs.request_in_flight).await;
+  }
+
+  #[test]
+  fn stale_log_response_without_pending_refresh_clears_loading_state() {
+    let mut app = test_app();
+    app.model.view = View::Domains;
+    app.model.open_selected_domain_logs();
+    let stream = app.model.logs.active_stream().unwrap();
+    app.log_request_serial = 1;
+    app.model.logs.minimum_severity = Some(LogSeverity::Warn);
+    app.model.logs.request_in_flight = true;
+    app.model.logs.loading = true;
+
+    app
+      .responses_tx
+      .send(AppResponse::Logs {
+        serial: 1,
+        stream: stream.clone(),
+        minimum_severity: None,
+        result: Ok(QueryLogsResponse {
+          request_id: "stale".to_string(),
+          accepted: true,
+          message: "stale".to_string(),
+          stream,
+          stream_status: LogStreamStatus::Active,
+          entries: vec![log_entry(1, LogSeverity::Info, "old info")],
+          next_cursor: Some("seq:1".to_string()),
+          has_gap: false,
+          has_more_before: false,
+          truncated_by_retention: false,
+        }),
+      })
+      .unwrap();
+
+    app.drain_responses();
+
+    assert_eq!(app.log_request_serial, 1);
+    assert!(!app.log_refresh_pending);
+    assert!(!app.model.logs.request_in_flight);
+    assert!(!app.model.logs.loading);
+    assert!(app.model.logs.entries.is_empty());
+  }
+
+  #[tokio::test]
   async fn maybe_tail_logs_starts_refresh_when_interval_elapsed() {
     let mut app = test_app();
     app.model.view = View::Domains;
     app.model.open_selected_domain_logs();
     app.model.logs.request_in_flight = false;
-    app.last_log_refresh = Instant::now() - Duration::from_millis(800);
+    app.last_log_refresh = Instant::now() - LOG_REFRESH_INTERVAL - Duration::from_millis(10);
 
     app.maybe_tail_logs();
 
