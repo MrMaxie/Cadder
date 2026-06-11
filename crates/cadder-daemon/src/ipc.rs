@@ -429,7 +429,6 @@ fn configure_background_daemon(command: &mut Command) {
 
   #[cfg(unix)]
   {
-    use std::os::unix::process::CommandExt;
     command.process_group(0);
   }
 }
