@@ -61,8 +61,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
 
-      - name: Cache Rust build outputs
-        uses: Swatinem/rust-cache@v2.9.1
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v5.0.5
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-${{ runner.os }}-release-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-release-e2e-
+            cargo-${{ runner.os }}-
 
       - name: Check Docker
         run: docker version
@@ -103,8 +112,17 @@ jobs:
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
-      - name: Cache Rust build outputs
-        uses: Swatinem/rust-cache@v2.9.1
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v5.0.5
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ matrix.target }}-
+            cargo-${{ runner.os }}-
 
       - name: Package portable archive
         shell: bash

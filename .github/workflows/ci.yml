@@ -28,8 +28,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
 
-      - name: Cache Rust build outputs
-        uses: Swatinem/rust-cache@v2.9.1
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v5.0.5
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-${{ runner.os }}-rust-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-rust-
+            cargo-${{ runner.os }}-
 
       - name: Check formatting
         run: cargo fmt --check
@@ -48,8 +57,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
 
-      - name: Cache Rust build outputs
-        uses: Swatinem/rust-cache@v2.9.1
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v5.0.5
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-${{ runner.os }}-project-check-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-project-check-
+            cargo-${{ runner.os }}-
 
       - name: Run project check
         run: cargo run -p xtask -- check
@@ -62,8 +80,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
 
-      - name: Cache Rust build outputs
-        uses: Swatinem/rust-cache@v2.9.1
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v5.0.5
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-${{ runner.os }}-msvc-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-msvc-
+            cargo-${{ runner.os }}-
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --component llvm-tools-preview
@@ -91,8 +118,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
 
-      - name: Cache Rust build outputs
-        uses: Swatinem/rust-cache@v2.9.1
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v5.0.5
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-${{ runner.os }}-docker-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-docker-e2e-
+            cargo-${{ runner.os }}-
 
       - name: Check Docker
         run: docker version
