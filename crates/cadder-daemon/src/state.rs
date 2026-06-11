@@ -1,15 +1,26 @@
 use crate::{
   CaddyConfigCoordinator,
+  iis::{
+    IisBindingRecord, IisMetadataStore, IisProvider, IisRestoreRecord, binding_to_view,
+    unsupported_binding_issue,
+  },
   logs::{CaddyLogStore, LogQuery},
+  paths::RuntimePaths,
 };
+use anyhow::Result;
 use cadder_protocol::{
-  ActivationState, BasicResponse, ConfigState, EntrypointRegistration, GuiStateSnapshot,
-  HeartbeatEntrypointRequest, LogStreamIdentity, QueryLogsResponse, QueryStateResponse,
+  ActivationState, BasicResponse, ConfigApplyStatus, ConfigState, EntrypointRegistration,
+  GuiStateSnapshot, HeartbeatEntrypointRequest, IisBinding, IisHandoffState, IisIssue,
+  IisIssueKind, LogStreamIdentity, QueryIisBindingsResponse, QueryLogsResponse, QueryStateResponse,
   RegisterEntrypointResponse, RuntimeState, SetDomainEnabledRequest, SetEntrypointEnabledRequest,
-  StateChangeKind, StateChangedEvent,
+  SetIisHandoffRequest, SetIisHandoffResponse, StateChangeKind, StateChangedEvent,
+  canonicalize_domain,
 };
 use chrono::Utc;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+  collections::{BTreeMap, BTreeSet},
+  sync::Arc,
+};
 use tokio::sync::{Mutex, broadcast};
 
 #[derive(Debug, Clone)]
@@ -17,6 +28,9 @@ pub struct DaemonState {
   inner: Arc<Mutex<DaemonInner>>,
   events: broadcast::Sender<StateChangedEvent>,
   logs: CaddyLogStore,
+  iis_provider: IisProvider,
+  iis_store: IisMetadataStore,
+  iis_operation: Arc<Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -37,7 +51,45 @@ impl DaemonState {
       })),
       events,
       logs: CaddyLogStore::default(),
+      iis_provider: IisProvider::system(),
+      iis_store: IisMetadataStore::memory(),
+      iis_operation: Arc::new(Mutex::new(())),
     }
+  }
+
+  pub async fn with_runtime_paths(
+    mut coordinator: CaddyConfigCoordinator,
+    paths: RuntimePaths,
+  ) -> Result<Self> {
+    let iis_store = IisMetadataStore::load(paths.metadata_path()).await?;
+    let handoffs = iis_store.snapshot().await;
+    for (binding_id, restore) in &handoffs {
+      let backend_binding = restore.backend_binding.clone().unwrap_or_else(|| {
+        restore.binding.backend_http_binding(
+          backend_port_for_binding(&restore.binding),
+          &restore.domain_key,
+        )
+      });
+      coordinator.set_iis_proxy_route(
+        binding_id.clone(),
+        restore.domain_key.clone(),
+        format!("127.0.0.1:{}", backend_binding.port),
+      );
+    }
+    let mut state = Self::new(coordinator);
+    state.iis_store = iis_store;
+    if !handoffs.is_empty() {
+      let mut inner = state.inner.lock().await;
+      inner.coordinator.apply(&[], &state.logs).await;
+    }
+    Ok(state)
+  }
+
+  #[cfg(test)]
+  fn with_iis_provider(coordinator: CaddyConfigCoordinator, iis_provider: IisProvider) -> Self {
+    let mut state = Self::new(coordinator);
+    state.iis_provider = iis_provider;
+    state
   }
 
   pub fn subscribe(&self) -> broadcast::Receiver<StateChangedEvent> {
@@ -253,6 +305,47 @@ impl DaemonState {
     }
   }
 
+  pub async fn query_iis_bindings(&self, request_id: String) -> QueryIisBindingsResponse {
+    let records = match self.iis_provider.discover().await {
+      Ok(records) => records,
+      Err(issue) => {
+        return QueryIisBindingsResponse {
+          request_id,
+          accepted: false,
+          message: issue.message.clone(),
+          bindings: Vec::new(),
+          issue: Some(issue),
+        };
+      }
+    };
+    let handoffs = self.iis_store.snapshot().await;
+    let inner = self.inner.lock().await;
+    QueryIisBindingsResponse {
+      request_id,
+      accepted: true,
+      message: "IIS bindings returned.".to_string(),
+      bindings: self.iis_binding_views_locked(&inner, &records, &handoffs),
+      issue: None,
+    }
+  }
+
+  pub async fn set_iis_handoff(&self, request: SetIisHandoffRequest) -> SetIisHandoffResponse {
+    let request_id = request.request_id.clone();
+    let Ok(_operation) = self.iis_operation.try_lock() else {
+      let issue = IisIssue::new(
+        IisIssueKind::Busy,
+        "Another IIS handoff operation is already running.",
+      );
+      return iis_response(request_id, false, issue.message.clone(), None, issue);
+    };
+
+    if request.enabled {
+      self.enable_iis_handoff(request).await
+    } else {
+      self.disable_iis_handoff(request).await
+    }
+  }
+
   pub async fn query_logs(&self, request: cadder_protocol::QueryLogsRequest) -> QueryLogsResponse {
     let active = self.stream_is_active(&request.stream).await;
     let result = self.logs.query(
@@ -347,11 +440,609 @@ impl DaemonState {
           .any(|domain| domain.log_stream == *stream && domain.activation_state.is_enabled())
     })
   }
+
+  async fn enable_iis_handoff(&self, request: SetIisHandoffRequest) -> SetIisHandoffResponse {
+    let records = match self.iis_provider.discover().await {
+      Ok(records) => records,
+      Err(issue) => {
+        return iis_response(
+          request.request_id,
+          false,
+          issue.message.clone(),
+          None,
+          issue,
+        );
+      }
+    };
+    let Some(binding) = records
+      .iter()
+      .find(|binding| binding.binding_id() == request.binding_id)
+      .cloned()
+    else {
+      return iis_response(
+        request.request_id,
+        false,
+        "IIS binding was not found.",
+        None,
+        IisIssue::new(IisIssueKind::MissingBinding, "IIS binding was not found."),
+      );
+    };
+
+    if let Some(issue) = unsupported_binding_issue(&binding) {
+      let view = binding_to_view(
+        &binding,
+        IisHandoffState::Unsupported,
+        Some(issue.clone()),
+        None,
+      );
+      return iis_response(
+        request.request_id,
+        false,
+        issue.message.clone(),
+        Some(view),
+        issue,
+      );
+    }
+
+    let domain_key = match route_host_for_binding(&binding, request.route_host.as_deref()) {
+      Ok(domain_key) => domain_key,
+      Err(issue) => {
+        let view = binding_to_view(
+          &binding,
+          IisHandoffState::MissingRoute,
+          Some(issue.clone()),
+          None,
+        );
+        return iis_response(
+          request.request_id,
+          false,
+          issue.message.clone(),
+          Some(view),
+          issue,
+        );
+      }
+    };
+    if iis_route_host_conflicts(&records, &binding.binding_id(), &domain_key) {
+      let issue = IisIssue::new(
+        IisIssueKind::Conflict,
+        format!("IIS host `{domain_key}` appears on multiple bindings."),
+      );
+      let view = binding_to_view(
+        &binding,
+        IisHandoffState::Conflict,
+        Some(issue.clone()),
+        None,
+      );
+      return iis_response(
+        request.request_id,
+        false,
+        issue.message.clone(),
+        Some(view),
+        issue,
+      );
+    }
+
+    let registration_conflict = {
+      let inner = self.inner.lock().await;
+      active_registration_conflict(&inner.registrations, &domain_key)
+    };
+    if let Some(issue) = registration_conflict {
+      let view = binding_to_view(
+        &binding,
+        IisHandoffState::Conflict,
+        Some(issue.clone()),
+        None,
+      );
+      return iis_response(
+        request.request_id,
+        false,
+        issue.message.clone(),
+        Some(view),
+        issue,
+      );
+    }
+
+    let backend_binding =
+      binding.backend_http_binding(backend_port_for_binding(&binding), &domain_key);
+    let restore = IisRestoreRecord {
+      binding: binding.clone(),
+      domain_key: domain_key.clone(),
+      registration_id: None,
+      backend_binding: Some(backend_binding.clone()),
+    };
+    if let Err(error) = self
+      .iis_store
+      .insert(binding.binding_id(), restore.clone())
+      .await
+    {
+      let issue = IisIssue::new(
+        IisIssueKind::ProviderError,
+        format!("Could not persist IIS restore metadata: {error}"),
+      );
+      return iis_response(
+        request.request_id,
+        false,
+        issue.message.clone(),
+        None,
+        issue,
+      );
+    }
+
+    if let Err(issue) = self.iis_provider.add_binding(&backend_binding).await {
+      let _ = self.iis_store.remove(&binding.binding_id()).await;
+      let view = binding_to_view(
+        &binding,
+        IisHandoffState::Available,
+        Some(issue.clone()),
+        None,
+      );
+      return iis_response(
+        request.request_id,
+        false,
+        issue.message.clone(),
+        Some(view),
+        issue,
+      );
+    }
+
+    if let Err(issue) = self.iis_provider.remove_binding(&binding).await {
+      let _ = self.iis_provider.remove_binding(&backend_binding).await;
+      let _ = self.iis_store.remove(&binding.binding_id()).await;
+      let view = binding_to_view(
+        &binding,
+        IisHandoffState::Available,
+        Some(issue.clone()),
+        None,
+      );
+      return iis_response(
+        request.request_id,
+        false,
+        issue.message.clone(),
+        Some(view),
+        issue,
+      );
+    }
+
+    let apply_state = {
+      let mut inner = self.inner.lock().await;
+      inner.coordinator.set_iis_proxy_route(
+        binding.binding_id(),
+        domain_key.clone(),
+        format!("127.0.0.1:{}", backend_binding.port),
+      );
+      let registrations = inner.registrations.values().cloned().collect::<Vec<_>>();
+      let apply_state = inner.coordinator.apply(&registrations, &self.logs).await;
+      self
+        .publish_locked(&mut inner, StateChangeKind::RegistrationsChanged, None)
+        .await;
+      apply_state
+    };
+
+    if apply_state.status == ConfigApplyStatus::Failed {
+      {
+        let mut inner = self.inner.lock().await;
+        inner.coordinator.remove_iis_proxy_route(&domain_key);
+        let registrations = inner.registrations.values().cloned().collect::<Vec<_>>();
+        inner.coordinator.apply(&registrations, &self.logs).await;
+        self
+          .publish_locked(&mut inner, StateChangeKind::RegistrationsChanged, None)
+          .await;
+      }
+      let rollback = self.iis_provider.restore_binding(&binding).await;
+      let (issue, view) = match rollback {
+        Ok(()) => {
+          let _ = self.iis_provider.remove_binding(&backend_binding).await;
+          let _ = self.iis_store.remove(&binding.binding_id()).await;
+          let issue = IisIssue::new(
+            IisIssueKind::RollbackSucceeded,
+            "Cadder could not apply the IIS proxy route; original IIS binding was restored.",
+          );
+          let view = binding_to_view(
+            &binding,
+            IisHandoffState::Available,
+            Some(issue.clone()),
+            None,
+          );
+          (issue, view)
+        }
+        Err(error) => {
+          let issue = IisIssue::new(
+            IisIssueKind::RollbackFailed,
+            format!(
+              "Cadder could not apply the IIS proxy route and IIS rollback failed: {}",
+              error.message
+            ),
+          );
+          let view = handoff_binding_to_view(&binding, Some(issue.clone()), &restore);
+          (issue, view)
+        }
+      };
+      return iis_response(
+        request.request_id,
+        false,
+        issue.message.clone(),
+        Some(view),
+        issue,
+      );
+    }
+
+    let view = binding_to_view(
+      &binding,
+      IisHandoffState::HandedOff,
+      None,
+      Some(binding.restore_summary()),
+    );
+    let mut view = view;
+    view.domain_key = Some(domain_key.clone());
+    SetIisHandoffResponse {
+      request_id: request.request_id,
+      accepted: true,
+      message: format!(
+        "IIS binding `{domain_key}` is proxied through Cadder to 127.0.0.1:{}.",
+        backend_binding.port
+      ),
+      binding: Some(view),
+      issue: None,
+    }
+  }
+
+  async fn disable_iis_handoff(&self, request: SetIisHandoffRequest) -> SetIisHandoffResponse {
+    let handoffs = self.iis_store.snapshot().await;
+    let Some(restore) = handoffs.get(&request.binding_id).cloned() else {
+      return iis_response(
+        request.request_id,
+        false,
+        "IIS handoff restore metadata was not found.",
+        None,
+        IisIssue::new(
+          IisIssueKind::MissingBinding,
+          "IIS handoff restore metadata was not found.",
+        ),
+      );
+    };
+    let backend_binding = restore.backend_binding.clone().unwrap_or_else(|| {
+      restore.binding.backend_http_binding(
+        backend_port_for_binding(&restore.binding),
+        &restore.domain_key,
+      )
+    });
+
+    {
+      let inner = self.inner.lock().await;
+      if caddy_front_door_needed(&inner.registrations, &restore.domain_key)
+        || inner
+          .coordinator
+          .has_iis_proxy_routes_except(&restore.domain_key)
+      {
+        let issue = IisIssue::new(
+          IisIssueKind::Conflict,
+          format!(
+            "Cannot restore IIS binding `{}` while other Cadder routes still need the front-door port.",
+            restore.domain_key
+          ),
+        );
+        let view = binding_to_view(
+          &restore.binding,
+          IisHandoffState::HandedOff,
+          Some(issue.clone()),
+          Some(restore.binding.restore_summary()),
+        );
+        return iis_response(
+          request.request_id,
+          false,
+          issue.message.clone(),
+          Some(view),
+          issue,
+        );
+      }
+    }
+
+    {
+      let mut inner = self.inner.lock().await;
+      inner
+        .coordinator
+        .remove_iis_proxy_route(&restore.domain_key);
+      let registrations = inner.registrations.values().cloned().collect::<Vec<_>>();
+      inner.coordinator.apply(&registrations, &self.logs).await;
+      self
+        .publish_locked(&mut inner, StateChangeKind::RegistrationsChanged, None)
+        .await;
+    }
+
+    if let Err(issue) = self.iis_provider.restore_binding(&restore.binding).await {
+      let mut inner = self.inner.lock().await;
+      inner.coordinator.set_iis_proxy_route(
+        request.binding_id.clone(),
+        restore.domain_key.clone(),
+        format!("127.0.0.1:{}", backend_binding.port),
+      );
+      let registrations = inner.registrations.values().cloned().collect::<Vec<_>>();
+      inner.coordinator.apply(&registrations, &self.logs).await;
+      self
+        .publish_locked(&mut inner, StateChangeKind::RegistrationsChanged, None)
+        .await;
+      let view = binding_to_view(
+        &restore.binding,
+        IisHandoffState::HandedOff,
+        Some(issue.clone()),
+        Some(restore.binding.restore_summary()),
+      );
+      let issue = IisIssue::new(
+        IisIssueKind::RestoreFailed,
+        format!(
+          "Cadder disabled the route but could not restore IIS binding: {}",
+          issue.message
+        ),
+      );
+      return iis_response(
+        request.request_id,
+        false,
+        issue.message.clone(),
+        Some(view),
+        issue,
+      );
+    }
+
+    if let Err(issue) = self.iis_provider.remove_binding(&backend_binding).await {
+      let issue = IisIssue::new(
+        IisIssueKind::RestoreFailed,
+        format!(
+          "IIS binding was restored but loopback backend binding could not be removed: {}",
+          issue.message
+        ),
+      );
+      let view = handoff_binding_to_view(&restore.binding, Some(issue.clone()), &restore);
+      return iis_response(
+        request.request_id,
+        false,
+        issue.message.clone(),
+        Some(view),
+        issue,
+      );
+    }
+    if let Err(error) = self.iis_store.remove(&request.binding_id).await {
+      let issue = IisIssue::new(
+        IisIssueKind::ProviderError,
+        format!("IIS binding was restored but restore metadata could not be cleared: {error}"),
+      );
+      return iis_response(
+        request.request_id,
+        false,
+        issue.message.clone(),
+        None,
+        issue,
+      );
+    }
+
+    let view = binding_to_view(&restore.binding, IisHandoffState::Available, None, None);
+    SetIisHandoffResponse {
+      request_id: request.request_id,
+      accepted: true,
+      message: format!("IIS binding `{}` restored to IIS.", restore.domain_key),
+      binding: Some(view),
+      issue: None,
+    }
+  }
+
+  fn iis_binding_views_locked(
+    &self,
+    inner: &DaemonInner,
+    records: &[IisBindingRecord],
+    handoffs: &BTreeMap<String, IisRestoreRecord>,
+  ) -> Vec<IisBinding> {
+    let backend_binding_ids = handoffs
+      .values()
+      .filter_map(|restore| restore.backend_binding.as_ref())
+      .map(IisBindingRecord::binding_id)
+      .collect::<BTreeSet<_>>();
+    let public_records = records
+      .iter()
+      .filter(|binding| !backend_binding_ids.contains(&binding.binding_id()))
+      .cloned()
+      .collect::<Vec<_>>();
+    let duplicate_hosts = duplicate_iis_hosts(&public_records);
+    let mut seen = BTreeSet::new();
+    let mut bindings = public_records
+      .iter()
+      .map(|binding| {
+        let binding_id = binding.binding_id();
+        seen.insert(binding_id.clone());
+        if let Some(restore) = handoffs.get(&binding_id) {
+          return handoff_binding_to_view(binding, None, restore);
+        }
+        if let Some(issue) = unsupported_binding_issue(binding) {
+          return binding_to_view(binding, IisHandoffState::Unsupported, Some(issue), None);
+        }
+        let domain_key = match route_host_for_binding(binding, None) {
+          Ok(domain_key) => domain_key,
+          Err(issue) => {
+            return binding_to_view(binding, IisHandoffState::MissingRoute, Some(issue), None);
+          }
+        };
+        if duplicate_hosts.contains(&domain_key) {
+          return binding_to_view(
+            binding,
+            IisHandoffState::Conflict,
+            Some(IisIssue::new(
+              IisIssueKind::Conflict,
+              format!("IIS host `{domain_key}` appears on multiple bindings."),
+            )),
+            None,
+          );
+        }
+        if let Some(issue) = active_registration_conflict(&inner.registrations, &domain_key) {
+          binding_to_view(binding, IisHandoffState::Conflict, Some(issue), None)
+        } else {
+          binding_to_view(binding, IisHandoffState::Available, None, None)
+        }
+      })
+      .collect::<Vec<_>>();
+
+    bindings.extend(
+      handoffs
+        .iter()
+        .filter(|(binding_id, _)| !seen.contains(*binding_id))
+        .map(|(_, restore)| handoff_binding_to_view(&restore.binding, None, restore)),
+    );
+    bindings
+  }
 }
 
 impl DaemonInner {
   async fn coordinator_runtime_state(&self) -> RuntimeState {
     self.coordinator.runtime_state().await
+  }
+}
+
+fn handoff_binding_to_view(
+  binding: &IisBindingRecord,
+  issue: Option<IisIssue>,
+  restore: &IisRestoreRecord,
+) -> IisBinding {
+  let mut view = binding_to_view(
+    binding,
+    IisHandoffState::HandedOff,
+    issue,
+    Some(restore.binding.restore_summary()),
+  );
+  view.domain_key = Some(restore.domain_key.clone());
+  view
+}
+
+fn duplicate_iis_hosts(records: &[IisBindingRecord]) -> BTreeSet<String> {
+  let mut counts = BTreeMap::<String, usize>::new();
+  for binding in records {
+    if unsupported_binding_issue(binding).is_none()
+      && let Ok(domain_key) = route_host_for_binding(binding, None)
+    {
+      *counts.entry(domain_key).or_default() += 1;
+    }
+  }
+  counts
+    .into_iter()
+    .filter_map(|(host, count)| (count > 1).then_some(host))
+    .collect()
+}
+
+fn iis_route_host_conflicts(
+  records: &[IisBindingRecord],
+  selected_binding_id: &str,
+  domain_key: &str,
+) -> bool {
+  duplicate_iis_hosts(records).contains(domain_key)
+    || records.iter().any(|binding| {
+      binding.binding_id() != selected_binding_id
+        && unsupported_binding_issue(binding).is_none()
+        && route_host_for_binding(binding, None)
+          .is_ok_and(|host| host.eq_ignore_ascii_case(domain_key))
+    })
+}
+
+fn route_host_for_binding(
+  binding: &IisBindingRecord,
+  route_host: Option<&str>,
+) -> std::result::Result<String, IisIssue> {
+  let binding_host = binding.host_header.trim();
+  let selected = if binding_host.is_empty() || binding_host == "*" {
+    route_host.unwrap_or_default()
+  } else {
+    binding_host
+  };
+  let candidate = extract_host_candidate(selected);
+  let domain_key = canonicalize_domain(candidate);
+  if domain_key.is_empty() || domain_key == "*" {
+    return Err(IisIssue::new(
+      IisIssueKind::MissingRoute,
+      "Wildcard IIS bindings need a route host. In the TUI, enter the host with `/` before pressing Space.",
+    ));
+  }
+  if domain_key.contains('/') || domain_key.contains('\\') || domain_key.contains(' ') {
+    return Err(IisIssue::new(
+      IisIssueKind::UnsupportedBindingShape,
+      format!("IIS route host `{selected}` is not a valid DNS host."),
+    ));
+  }
+  Ok(domain_key)
+}
+
+fn extract_host_candidate(raw: &str) -> &str {
+  let without_scheme = raw
+    .split_once("://")
+    .map(|(_, rest)| rest)
+    .unwrap_or(raw)
+    .trim();
+  let without_path = without_scheme
+    .split(['/', '?', '#'])
+    .next()
+    .unwrap_or(without_scheme)
+    .trim();
+  if let Some((host, port)) = without_path.rsplit_once(':')
+    && !host.is_empty()
+    && port.chars().all(|ch| ch.is_ascii_digit())
+  {
+    return host;
+  }
+  without_path
+}
+
+fn backend_port_for_binding(binding: &IisBindingRecord) -> u16 {
+  let hash = binding.binding_id().bytes().fold(0_u32, |hash, byte| {
+    hash.wrapping_mul(33).wrapping_add(byte as u32)
+  });
+  41000 + (hash % 8000) as u16
+}
+
+fn active_registration_conflict(
+  registrations: &BTreeMap<String, EntrypointRegistration>,
+  domain_key: &str,
+) -> Option<IisIssue> {
+  let matches = registrations
+    .values()
+    .filter(|registration| registration.activation_state.is_enabled())
+    .filter(|registration| {
+      registration
+        .registered_domains
+        .iter()
+        .filter(|domain| domain.activation_state.is_enabled())
+        .any(|domain| domain.name.canonical.eq_ignore_ascii_case(domain_key))
+    })
+    .map(|registration| registration.registration_id.clone())
+    .collect::<Vec<_>>();
+  (!matches.is_empty()).then(|| {
+    IisIssue::new(
+      IisIssueKind::Conflict,
+      format!("Cadder already has an active route for IIS host `{domain_key}`."),
+    )
+  })
+}
+
+fn caddy_front_door_needed(
+  registrations: &BTreeMap<String, EntrypointRegistration>,
+  restoring_domain: &str,
+) -> bool {
+  registrations
+    .values()
+    .filter(|registration| registration.activation_state.is_enabled())
+    .flat_map(|registration| &registration.registered_domains)
+    .any(|domain| {
+      domain.activation_state.is_enabled()
+        && !domain.name.canonical.eq_ignore_ascii_case(restoring_domain)
+    })
+}
+
+fn iis_response(
+  request_id: String,
+  accepted: bool,
+  message: impl Into<String>,
+  binding: Option<IisBinding>,
+  issue: IisIssue,
+) -> SetIisHandoffResponse {
+  SetIisHandoffResponse {
+    request_id,
+    accepted,
+    message: message.into(),
+    binding,
+    issue: Some(issue),
   }
 }
 
@@ -366,6 +1057,7 @@ mod tests {
     LogStreamStatus, OwnerProcessIdentity, QueryLogsRequest, RegisteredDomain, SourcePath,
   };
   use chrono::Utc;
+  use std::{fs, path::Path};
 
   fn state() -> DaemonState {
     let paths = RuntimePaths::resolve(Some(tempfile::tempdir().unwrap().keep())).unwrap();
@@ -373,6 +1065,82 @@ mod tests {
     let adapter = CaddyConfigAdapter::new(resolver.clone());
     let runtime = ProcessRuntime::new(resolver, paths);
     DaemonState::new(CaddyConfigCoordinator::new(adapter, runtime))
+  }
+
+  fn state_with_iis(provider: IisProvider) -> DaemonState {
+    let paths = RuntimePaths::resolve(Some(tempfile::tempdir().unwrap().keep())).unwrap();
+    let resolver = RealCaddyResolver::new(Some("definitely-missing-caddy".to_string()));
+    let adapter = CaddyConfigAdapter::new(resolver.clone());
+    let runtime = ProcessRuntime::new(resolver, paths);
+    DaemonState::with_iis_provider(CaddyConfigCoordinator::new(adapter, runtime), provider)
+  }
+
+  fn state_with_fake_caddy(provider: IisProvider, caddy: &Path) -> DaemonState {
+    let (state, _) = state_with_fake_caddy_paths(provider, caddy);
+    state
+  }
+
+  fn state_with_fake_caddy_paths(
+    provider: IisProvider,
+    caddy: &Path,
+  ) -> (DaemonState, RuntimePaths) {
+    let paths = RuntimePaths::resolve(Some(tempfile::tempdir().unwrap().keep())).unwrap();
+    let resolver = RealCaddyResolver::new(Some(caddy.display().to_string()));
+    let adapter = CaddyConfigAdapter::new(resolver.clone());
+    let runtime = ProcessRuntime::new(resolver, paths.clone());
+    (
+      DaemonState::with_iis_provider(CaddyConfigCoordinator::new(adapter, runtime), provider),
+      paths,
+    )
+  }
+
+  fn iis_binding(site: &str, protocol: &str, binding: &str) -> IisBindingRecord {
+    IisBindingRecord::from_binding_information(site, protocol, binding).unwrap()
+  }
+
+  fn write_fake_caddy(path: &Path) {
+    #[cfg(windows)]
+    fs::write(
+      path,
+      r#"@echo off
+if "%1"=="adapt" (
+  echo {"apps":{"http":{"servers":{"srv0":{"routes":[{"match":[{"host":["app.localhost"]}],"handle":[{"handler":"static_response","body":"ok"}],"terminal":true}]}}}}}
+  exit /b 0
+)
+if "%1"=="reload" exit /b 0
+if "%1"=="stop" exit /b 0
+if "%1"=="run" exit /b 0
+exit /b 1
+"#,
+    )
+    .unwrap();
+
+    #[cfg(not(windows))]
+    {
+      use std::os::unix::fs::PermissionsExt;
+      fs::write(
+        path,
+        r#"#!/usr/bin/env sh
+case "$1" in
+  adapt)
+    printf '%s\n' '{"apps":{"http":{"servers":{"srv0":{"routes":[{"match":[{"host":["app.localhost"]}],"handle":[{"handler":"static_response","body":"ok"}],"terminal":true}]}}}}}'
+    exit 0
+    ;;
+  reload|stop)
+    exit 0
+    ;;
+  run)
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+      )
+      .unwrap();
+      let mut permissions = fs::metadata(path).unwrap().permissions();
+      permissions.set_mode(0o755);
+      fs::set_permissions(path, permissions).unwrap();
+    }
   }
 
   fn registration(id: &str, nonce: &str) -> EntrypointRegistration {
@@ -460,6 +1228,394 @@ mod tests {
 
     assert_eq!(logs.stream_status, LogStreamStatus::Stale);
     assert_eq!(logs.entries.len(), 1);
+  }
+
+  #[tokio::test]
+  async fn query_iis_bindings_reports_safety_states_from_fake_provider() {
+    let provider = IisProvider::fake(vec![
+      iis_binding("Default Web Site", "http", "*:80:app.localhost"),
+      iis_binding("Default Web Site", "http", "127.0.0.1:80:app.localhost"),
+      iis_binding("Default Web Site", "https", "*:443:secure.localhost"),
+      iis_binding("Other", "http", "*:80:missing.localhost"),
+      iis_binding("Default Web Site", "https", "*:443:"),
+    ]);
+    let state = state_with_iis(provider);
+    state
+      .register("register".to_string(), registration("shim-1", "nonce-1"))
+      .await;
+
+    let response = state.query_iis_bindings("iis".to_string()).await;
+
+    assert!(response.accepted);
+    assert_eq!(response.bindings.len(), 5);
+    assert_eq!(
+      response.bindings[0].handoff_state,
+      IisHandoffState::Conflict
+    );
+    assert_eq!(
+      response.bindings[2].handoff_state,
+      IisHandoffState::Available
+    );
+    assert_eq!(
+      response.bindings[3].handoff_state,
+      IisHandoffState::Available
+    );
+    assert_eq!(
+      response.bindings[4].handoff_state,
+      IisHandoffState::MissingRoute
+    );
+  }
+
+  #[tokio::test]
+  async fn iis_handoff_proxies_wildcard_https_binding_with_route_host() {
+    let temp = tempfile::tempdir().unwrap();
+    let caddy = temp.path().join(if cfg!(windows) {
+      "fake-caddy.cmd"
+    } else {
+      "fake-caddy"
+    });
+    write_fake_caddy(&caddy);
+    let binding = iis_binding("Default Web Site", "https", "*:443:");
+    let provider = IisProvider::fake(vec![binding.clone()]);
+    let (state, paths) = state_with_fake_caddy_paths(provider, &caddy);
+    let backend_port = backend_port_for_binding(&binding);
+    let expected_backend_dial = format!("127.0.0.1:{backend_port}");
+    assert!((41000..49000).contains(&backend_port));
+
+    let enabled = state
+      .set_iis_handoff(SetIisHandoffRequest {
+        request_id: "iis-on".to_string(),
+        binding_id: binding.binding_id(),
+        enabled: true,
+        route_host: Some("https://iis-app.localhost/legacy/status".to_string()),
+      })
+      .await;
+    let handed_off = state.query_iis_bindings("iis-handed-off".to_string()).await;
+    let rendered = fs::read_to_string(paths.effective_config_path()).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let routes = config
+      .pointer("/apps/http/servers/cadder_https/routes")
+      .and_then(serde_json::Value::as_array)
+      .unwrap();
+    let iis_route = routes
+      .iter()
+      .find(|route| {
+        route
+          .pointer("/match/0/host/0")
+          .and_then(serde_json::Value::as_str)
+          == Some("iis-app.localhost")
+      })
+      .unwrap();
+    let _ = state.shutdown().await;
+
+    assert!(enabled.accepted, "{enabled:?}");
+    assert_eq!(
+      enabled
+        .binding
+        .as_ref()
+        .and_then(|binding| binding.domain_key.as_deref()),
+      Some("iis-app.localhost")
+    );
+    assert_eq!(handed_off.bindings.len(), 1);
+    assert_eq!(
+      handed_off.bindings[0].identity.binding_id,
+      "Default Web Site|https|*:443:"
+    );
+    assert_eq!(
+      handed_off.bindings[0].handoff_state,
+      IisHandoffState::HandedOff
+    );
+    assert_eq!(
+      handed_off.bindings[0].domain_key.as_deref(),
+      Some("iis-app.localhost")
+    );
+    assert_eq!(
+      iis_route
+        .pointer("/handle/0/upstreams/0/dial")
+        .and_then(serde_json::Value::as_str),
+      Some(expected_backend_dial.as_str())
+    );
+  }
+
+  #[tokio::test]
+  async fn iis_handoff_rejects_explicit_route_host_used_by_another_binding() {
+    let selected = iis_binding("Default Web Site", "https", "*:443:");
+    let existing = iis_binding("Default Web Site", "https", "*:443:iis-app.localhost");
+    let provider = IisProvider::fake(vec![selected.clone(), existing]);
+    let state = state_with_iis(provider);
+
+    let response = state
+      .set_iis_handoff(SetIisHandoffRequest {
+        request_id: "iis-on".to_string(),
+        binding_id: selected.binding_id(),
+        enabled: true,
+        route_host: Some("iis-app.localhost".to_string()),
+      })
+      .await;
+
+    assert!(!response.accepted);
+    assert_eq!(
+      response.issue.as_ref().map(|issue| issue.kind),
+      Some(IisIssueKind::Conflict)
+    );
+  }
+
+  #[tokio::test]
+  async fn runtime_paths_hydrate_iis_proxy_routes_from_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let caddy = temp.path().join(if cfg!(windows) {
+      "fake-caddy.cmd"
+    } else {
+      "fake-caddy"
+    });
+    write_fake_caddy(&caddy);
+    let paths = RuntimePaths::resolve(Some(temp.path().join("runtime"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let binding = iis_binding("Default Web Site", "https", "*:443:");
+    let domain_key = "iis-app.localhost".to_string();
+    let backend_binding =
+      binding.backend_http_binding(backend_port_for_binding(&binding), &domain_key);
+    let store = IisMetadataStore::load(paths.metadata_path()).await.unwrap();
+    store
+      .insert(
+        binding.binding_id(),
+        IisRestoreRecord {
+          binding: binding.clone(),
+          domain_key: domain_key.clone(),
+          registration_id: None,
+          backend_binding: Some(backend_binding.clone()),
+        },
+      )
+      .await
+      .unwrap();
+    let resolver = RealCaddyResolver::new(Some(caddy.display().to_string()));
+    let adapter = CaddyConfigAdapter::new(resolver.clone());
+    let runtime = ProcessRuntime::new(resolver, paths.clone());
+    let state =
+      DaemonState::with_runtime_paths(CaddyConfigCoordinator::new(adapter, runtime), paths.clone())
+        .await
+        .unwrap();
+
+    let rendered = fs::read_to_string(paths.effective_config_path()).unwrap();
+    let _ = state.shutdown().await;
+
+    assert!(rendered.contains("iis-app.localhost"));
+    assert!(rendered.contains(&format!("127.0.0.1:{}", backend_binding.port)));
+  }
+
+  #[tokio::test]
+  async fn iis_handoff_rolls_back_when_caddy_apply_fails() {
+    let binding = iis_binding("Default Web Site", "http", "*:80:iis.localhost");
+    let provider = IisProvider::fake(vec![binding.clone()]);
+    let state = state_with_iis(provider);
+    state
+      .register("register".to_string(), registration("shim-1", "nonce-1"))
+      .await;
+
+    let response = state
+      .set_iis_handoff(SetIisHandoffRequest {
+        request_id: "iis-on".to_string(),
+        binding_id: binding.binding_id(),
+        enabled: true,
+        route_host: None,
+      })
+      .await;
+    let rediscovered = state.query_iis_bindings("iis".to_string()).await;
+
+    assert!(!response.accepted);
+    assert_eq!(
+      response.issue.as_ref().map(|issue| issue.kind),
+      Some(IisIssueKind::RollbackSucceeded)
+    );
+    assert_eq!(rediscovered.bindings.len(), 1);
+    assert_eq!(
+      rediscovered.bindings[0].handoff_state,
+      IisHandoffState::Available
+    );
+    assert!(state.iis_store.snapshot().await.is_empty());
+  }
+
+  #[tokio::test]
+  async fn iis_handoff_keeps_restore_metadata_when_caddy_apply_and_rollback_fail() {
+    let binding = iis_binding("Default Web Site", "http", "*:80:iis.localhost");
+    let provider = IisProvider::fake(vec![binding.clone()]);
+    provider
+      .set_fail_restore(IisIssue::new(IisIssueKind::ProviderError, "restore denied"))
+      .await;
+    let state = state_with_iis(provider);
+    state
+      .register("register".to_string(), registration("shim-1", "nonce-1"))
+      .await;
+
+    let response = state
+      .set_iis_handoff(SetIisHandoffRequest {
+        request_id: "iis-on".to_string(),
+        binding_id: binding.binding_id(),
+        enabled: true,
+        route_host: None,
+      })
+      .await;
+    let rediscovered = state.query_iis_bindings("iis".to_string()).await;
+    let handoffs = state.iis_store.snapshot().await;
+
+    assert!(!response.accepted);
+    assert_eq!(
+      response.issue.as_ref().map(|issue| issue.kind),
+      Some(IisIssueKind::RollbackFailed)
+    );
+    assert!(handoffs.contains_key(&binding.binding_id()));
+    assert_eq!(rediscovered.bindings.len(), 1);
+    assert_eq!(
+      rediscovered.bindings[0].handoff_state,
+      IisHandoffState::HandedOff
+    );
+    assert_eq!(
+      rediscovered.bindings[0].domain_key.as_deref(),
+      Some("iis.localhost")
+    );
+  }
+
+  #[tokio::test]
+  async fn iis_handoff_reports_busy_when_another_operation_is_running() {
+    let binding = iis_binding("Default Web Site", "http", "*:80:iis.localhost");
+    let provider = IisProvider::fake(vec![binding.clone()]);
+    let state = state_with_iis(provider);
+    let _operation = state.iis_operation.try_lock().unwrap();
+
+    let response = state
+      .set_iis_handoff(SetIisHandoffRequest {
+        request_id: "iis-on".to_string(),
+        binding_id: binding.binding_id(),
+        enabled: true,
+        route_host: None,
+      })
+      .await;
+
+    assert!(!response.accepted);
+    assert_eq!(
+      response.issue.as_ref().map(|issue| issue.kind),
+      Some(IisIssueKind::Busy)
+    );
+  }
+
+  #[tokio::test]
+  async fn iis_handoff_success_and_restore_use_fake_provider() {
+    let temp = tempfile::tempdir().unwrap();
+    let caddy = temp.path().join(if cfg!(windows) {
+      "fake-caddy.cmd"
+    } else {
+      "fake-caddy"
+    });
+    write_fake_caddy(&caddy);
+    let binding = iis_binding("Default Web Site", "http", "*:80:app.localhost");
+    let provider = IisProvider::fake(vec![binding.clone()]);
+    let state = state_with_fake_caddy(provider, &caddy);
+    state
+      .register("register".to_string(), registration("shim-1", "nonce-1"))
+      .await;
+    state
+      .set_domain_enabled(SetDomainEnabledRequest {
+        request_id: "disable".to_string(),
+        registration_id: "shim-1".to_string(),
+        domain_key: "app.localhost".to_string(),
+        enabled: false,
+      })
+      .await;
+
+    let enabled = state
+      .set_iis_handoff(SetIisHandoffRequest {
+        request_id: "iis-on".to_string(),
+        binding_id: binding.binding_id(),
+        enabled: true,
+        route_host: None,
+      })
+      .await;
+    let handed_off = state.query_iis_bindings("iis-handed-off".to_string()).await;
+    let restored = state
+      .set_iis_handoff(SetIisHandoffRequest {
+        request_id: "iis-off".to_string(),
+        binding_id: binding.binding_id(),
+        enabled: false,
+        route_host: None,
+      })
+      .await;
+    let rediscovered = state.query_iis_bindings("iis".to_string()).await;
+    let _ = state.shutdown().await;
+
+    assert!(enabled.accepted, "{enabled:?}");
+    assert_eq!(
+      enabled
+        .binding
+        .as_ref()
+        .map(|binding| binding.handoff_state),
+      Some(IisHandoffState::HandedOff)
+    );
+    assert_eq!(handed_off.bindings.len(), 1);
+    assert_eq!(
+      handed_off.bindings[0].handoff_state,
+      IisHandoffState::HandedOff
+    );
+    assert!(restored.accepted, "{restored:?}");
+    assert_eq!(rediscovered.bindings.len(), 1);
+    assert_eq!(
+      rediscovered.bindings[0].handoff_state,
+      IisHandoffState::Available
+    );
+  }
+
+  #[tokio::test]
+  async fn iis_restore_keeps_metadata_when_backend_cleanup_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let caddy = temp.path().join(if cfg!(windows) {
+      "fake-caddy.cmd"
+    } else {
+      "fake-caddy"
+    });
+    write_fake_caddy(&caddy);
+    let binding = iis_binding("Default Web Site", "http", "*:80:app.localhost");
+    let provider = IisProvider::fake(vec![binding.clone()]);
+    let state = state_with_fake_caddy(provider.clone(), &caddy);
+    state
+      .register("register".to_string(), registration("shim-1", "nonce-1"))
+      .await;
+    state
+      .set_domain_enabled(SetDomainEnabledRequest {
+        request_id: "disable".to_string(),
+        registration_id: "shim-1".to_string(),
+        domain_key: "app.localhost".to_string(),
+        enabled: false,
+      })
+      .await;
+
+    let enabled = state
+      .set_iis_handoff(SetIisHandoffRequest {
+        request_id: "iis-on".to_string(),
+        binding_id: binding.binding_id(),
+        enabled: true,
+        route_host: None,
+      })
+      .await;
+    provider
+      .set_fail_remove(IisIssue::new(IisIssueKind::ProviderError, "cleanup failed"))
+      .await;
+    let restored = state
+      .set_iis_handoff(SetIisHandoffRequest {
+        request_id: "iis-off".to_string(),
+        binding_id: binding.binding_id(),
+        enabled: false,
+        route_host: None,
+      })
+      .await;
+    let handoffs = state.iis_store.snapshot().await;
+    let _ = state.shutdown().await;
+
+    assert!(enabled.accepted, "{enabled:?}");
+    assert!(!restored.accepted);
+    assert_eq!(
+      restored.issue.as_ref().map(|issue| issue.kind),
+      Some(IisIssueKind::RestoreFailed)
+    );
+    assert!(handoffs.contains_key(&binding.binding_id()));
   }
 
   #[tokio::test]

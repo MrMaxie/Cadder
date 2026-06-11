@@ -6,9 +6,10 @@ use cadder_daemon::{
 };
 use cadder_protocol::{
   ActivationState, BasicResponse, ConfigApplyStatus, GuiStateSnapshot, LogEntry, LogSeverity,
-  LogStreamIdentity, LogStreamStatus, QueryLogsRequest, QueryLogsResponse, QueryStateRequest,
-  QueryStateResponse, RuntimeStatus, SetDomainEnabledRequest, SetEntrypointEnabledRequest,
-  ShutdownDaemonRequest, message_types, new_request_id,
+  LogStreamIdentity, LogStreamStatus, QueryIisBindingsRequest, QueryIisBindingsResponse,
+  QueryLogsRequest, QueryLogsResponse, QueryStateRequest, QueryStateResponse, RuntimeStatus,
+  SetDomainEnabledRequest, SetEntrypointEnabledRequest, SetIisHandoffRequest,
+  SetIisHandoffResponse, ShutdownDaemonRequest, message_types, new_request_id,
 };
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -93,6 +94,8 @@ async fn main() -> Result<()> {
     log_request_serial: 0,
   };
   app.refresh().await?;
+  #[cfg(windows)]
+  app.refresh_iis().await;
 
   let terminal = ratatui::init();
   let result = app.run(terminal).await;
@@ -120,6 +123,10 @@ struct TuiApp {
 enum AppResponse {
   State(Result<QueryStateResponse, String>),
   Toggle(Result<BasicResponse, String>),
+  #[cfg(windows)]
+  IisBindings(Result<QueryIisBindingsResponse, String>),
+  #[cfg(windows)]
+  IisHandoff(Result<SetIisHandoffResponse, String>),
   Logs {
     serial: u64,
     stream: LogStreamIdentity,
@@ -150,11 +157,26 @@ impl TuiApp {
   }
 
   fn handle_key_code(&mut self, code: KeyCode) -> Result<bool> {
+    #[cfg(windows)]
+    if self.model.iis.route_host_input_mode {
+      match code {
+        KeyCode::Esc => self.model.iis.finish_route_host_input(),
+        KeyCode::Enter => self.model.iis.finish_route_host_input(),
+        KeyCode::Backspace => self.model.iis.pop_route_host_char(),
+        KeyCode::Char(ch) => self.model.iis.push_route_host_char(ch),
+        _ => {}
+      }
+      return Ok(false);
+    }
+
     if self.model.search_mode {
       match code {
         KeyCode::Esc => {
           self.model.search_mode = false;
           self.model.search.clear();
+        }
+        KeyCode::Enter => {
+          self.model.search_mode = false;
         }
         KeyCode::Backspace => {
           self.model.search.pop();
@@ -168,13 +190,27 @@ impl TuiApp {
 
     match code {
       KeyCode::Char('q') => return Ok(true),
-      KeyCode::Char('r') => self.start_state_refresh(),
+      KeyCode::Char('r') => {
+        self.start_state_refresh();
+        #[cfg(windows)]
+        if self.model.view == View::IisHandoff {
+          self.start_iis_refresh();
+        }
+      }
       KeyCode::Tab | KeyCode::Right => self.model.next_view(),
       KeyCode::BackTab | KeyCode::Left => self.model.previous_view(),
       KeyCode::Down => self.model.move_selection(1),
       KeyCode::Up => self.model.move_selection(-1),
+      #[cfg(windows)]
+      KeyCode::Char('/') if self.model.view == View::IisHandoff => {
+        self.model.iis.begin_route_host_input();
+      }
       KeyCode::Char('/') => self.model.search_mode = true,
       KeyCode::Char(' ') if self.model.view == View::Settings => self.apply_settings_log_severity(),
+      #[cfg(windows)]
+      KeyCode::Char(' ') if self.model.view == View::IisHandoff => self.start_iis_handoff_toggle(),
+      #[cfg(windows)]
+      KeyCode::Enter if self.model.view == View::IisHandoff => self.start_iis_refresh(),
       KeyCode::Char(' ') => self.start_toggle_selected(),
       KeyCode::Char('p') if self.model.view == View::Logs => {
         self.model.logs.paused = !self.model.logs.paused;
@@ -228,6 +264,37 @@ impl TuiApp {
               self.start_state_refresh();
             }
             Err(error) => self.message = format!("Toggle failed: {error}"),
+          }
+        }
+        #[cfg(windows)]
+        AppResponse::IisBindings(result) => {
+          self.model.iis.request_in_flight = false;
+          match result {
+            Ok(response) => {
+              let message = response.message.clone();
+              self.model.iis.apply_response(response);
+              self.message = if let Some(error) = &self.model.iis.last_error {
+                format!("IIS discovery warning: {error}")
+              } else {
+                message
+              };
+            }
+            Err(error) => {
+              self.model.iis.apply_error(error.clone());
+              self.message = format!("IIS discovery failed: {error}");
+            }
+          }
+        }
+        #[cfg(windows)]
+        AppResponse::IisHandoff(result) => {
+          self.model.iis.action_in_flight = false;
+          match result {
+            Ok(response) => {
+              self.message = response.message;
+              self.start_iis_refresh();
+              self.start_state_refresh();
+            }
+            Err(error) => self.message = format!("IIS handoff failed: {error}"),
           }
         }
         AppResponse::Logs {
@@ -317,6 +384,25 @@ impl TuiApp {
     Ok(())
   }
 
+  #[cfg(windows)]
+  async fn refresh_iis(&mut self) {
+    match self
+      .client
+      .request(
+        message_types::QUERY_IIS_BINDINGS_REQUEST,
+        message_types::QUERY_IIS_BINDINGS_RESPONSE,
+        &QueryIisBindingsRequest {
+          request_id: new_request_id("tui-iis"),
+        },
+      )
+      .await
+      .map_err(|error| error.to_string())
+    {
+      Ok(response) => self.model.iis.apply_response(response),
+      Err(error) => self.model.iis.apply_error(error),
+    }
+  }
+
   fn start_state_refresh(&mut self) {
     if self.state_request_in_flight {
       self.state_refresh_pending = true;
@@ -348,6 +434,89 @@ impl TuiApp {
     }
     self.state_refresh_pending = false;
     self.start_state_refresh();
+  }
+
+  #[cfg(windows)]
+  fn start_iis_refresh(&mut self) {
+    if self.model.iis.request_in_flight {
+      return;
+    }
+    self.model.iis.mark_loading();
+    let client = self.client.clone();
+    let responses = self.responses_tx.clone();
+    tokio::spawn(async move {
+      let result = client
+        .request(
+          message_types::QUERY_IIS_BINDINGS_REQUEST,
+          message_types::QUERY_IIS_BINDINGS_RESPONSE,
+          &QueryIisBindingsRequest {
+            request_id: new_request_id("tui-iis"),
+          },
+        )
+        .await
+        .map_err(|error| error.to_string());
+      let _ = responses.send(AppResponse::IisBindings(result));
+    });
+  }
+
+  #[cfg(windows)]
+  fn start_iis_handoff_toggle(&mut self) {
+    if self.model.iis.action_in_flight {
+      return;
+    }
+    let Some(binding) = self.model.iis.selected_binding() else {
+      self.message = "No IIS binding selected.".to_string();
+      return;
+    };
+    let enabled = binding.handoff_state != cadder_protocol::IisHandoffState::HandedOff;
+    let route_host = if enabled && binding.domain_key.is_none() {
+      let host = self.model.iis.route_host_input.trim();
+      (!host.is_empty()).then(|| host.to_string())
+    } else {
+      None
+    };
+    if matches!(
+      binding.handoff_state,
+      cadder_protocol::IisHandoffState::Unsupported
+        | cadder_protocol::IisHandoffState::Conflict
+        | cadder_protocol::IisHandoffState::Unavailable
+        | cadder_protocol::IisHandoffState::Busy
+    ) && enabled
+    {
+      self.message = binding
+        .issue
+        .map(|issue| issue.message)
+        .unwrap_or_else(|| "Selected IIS binding cannot be handed off safely.".to_string());
+      return;
+    }
+    if binding.handoff_state == cadder_protocol::IisHandoffState::MissingRoute
+      && enabled
+      && route_host.is_none()
+    {
+      self.message = binding.issue.map(|issue| issue.message).unwrap_or_else(|| {
+        "Enter a route host with / before handing off this IIS binding.".to_string()
+      });
+      return;
+    }
+    self.model.iis.action_in_flight = true;
+    let client = self.client.clone();
+    let responses = self.responses_tx.clone();
+    tokio::spawn(async move {
+      let result = client
+        .request(
+          message_types::SET_IIS_HANDOFF_REQUEST,
+          message_types::SET_IIS_HANDOFF_RESPONSE,
+          &SetIisHandoffRequest {
+            request_id: new_request_id("tui-iis-handoff"),
+            binding_id: binding.identity.binding_id,
+            enabled,
+            route_host,
+          },
+        )
+        .await
+        .map_err(|error| error.to_string());
+      let _ = responses.send(AppResponse::IisHandoff(result));
+    });
   }
 
   fn start_toggle_selected(&mut self) {
@@ -702,6 +871,19 @@ fn severity_style(severity: LogSeverity) -> Style {
   }
 }
 
+#[cfg(windows)]
+fn iis_state_style(state: cadder_protocol::IisHandoffState) -> Style {
+  match state {
+    cadder_protocol::IisHandoffState::Available => UiStyles::active(),
+    cadder_protocol::IisHandoffState::HandedOff => UiStyles::info(),
+    cadder_protocol::IisHandoffState::Unsupported
+    | cadder_protocol::IisHandoffState::MissingRoute
+    | cadder_protocol::IisHandoffState::Unavailable => UiStyles::warning(),
+    cadder_protocol::IisHandoffState::Conflict => UiStyles::error(),
+    cadder_protocol::IisHandoffState::Busy => UiStyles::muted(),
+  }
+}
+
 impl TuiApp {
   fn draw(&self, frame: &mut Frame<'_>) {
     let [tabs_area, body_area, status_area] = Layout::vertical([
@@ -732,11 +914,27 @@ impl TuiApp {
       View::Overview => self.draw_overview(frame, body_area),
       View::Entrypoints => self.draw_entrypoints(frame, body_area),
       View::Domains => self.draw_domains(frame, body_area),
+      #[cfg(windows)]
+      View::IisHandoff => self.draw_iis_handoff(frame, body_area),
       View::Logs => self.draw_logs(frame, body_area),
       View::Settings => self.draw_settings(frame, body_area),
       View::Diagnostics => self.draw_diagnostics(frame, body_area),
     }
 
+    #[cfg(windows)]
+    let iis_route_host = if self.model.view == View::IisHandoff {
+      if self.model.iis.route_host_input_mode {
+        format!(" IIS route host: {}", self.model.iis.route_host_input)
+      } else if self.model.iis.route_host_input.is_empty() {
+        String::new()
+      } else {
+        format!(" IIS route host set: {}", self.model.iis.route_host_input)
+      }
+    } else {
+      String::new()
+    };
+    #[cfg(not(windows))]
+    let iis_route_host = String::new();
     let search = if self.model.search_mode {
       format!(" search: {}", self.model.search)
     } else if self.model.search.is_empty() {
@@ -745,12 +943,16 @@ impl TuiApp {
       format!(" filter: {}", self.model.search)
     };
     let status_context = format!(
-      "{}{}  severity: {}",
+      "{}{}{}  severity: {}",
       self.message,
       search,
+      iis_route_host,
       describe_log_severity(self.model.logs.minimum_severity)
     );
     let navigation_help = "Tab/Shift+Tab/Left/Right views  r refresh  / search  Space toggle/apply";
+    #[cfg(windows)]
+    let action_help = "IIS: / route host Enter refresh Space handoff/restore  Settings: Up/Down severity Enter apply  Logs: p pause Enter refresh x export  d shutdown  q quit";
+    #[cfg(not(windows))]
     let action_help = "Settings: Up/Down severity Enter apply  Logs: p pause Enter refresh x export  d shutdown  q quit";
     frame.render_widget(
       Paragraph::new(vec![
@@ -856,6 +1058,61 @@ impl TuiApp {
     .row_highlight_style(UiStyles::selected_row())
     .highlight_symbol(">> ");
     let mut state = TableState::default().with_selected(Some(self.model.domain_selected));
+    frame.render_stateful_widget(table, area, &mut state);
+  }
+
+  #[cfg(windows)]
+  fn draw_iis_handoff(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+    let rows = self.model.iis.bindings.iter().map(|binding| {
+      let issue = binding
+        .issue
+        .as_ref()
+        .map(|issue| issue.message.clone())
+        .unwrap_or_else(|| {
+          if binding.handoff_state == cadder_protocol::IisHandoffState::HandedOff {
+            "Space restores the original IIS binding.".to_string()
+          } else {
+            "Space hands this host to Cadder.".to_string()
+          }
+        });
+      Row::new(vec![
+        Cell::from(binding.identity.site_name.clone()),
+        Cell::from(binding.identity.protocol.clone()),
+        Cell::from(binding.ip_address.clone()),
+        Cell::from(binding.port.to_string()),
+        Cell::from(binding.host_header.clone()),
+        Cell::from(format!("{:?}", binding.handoff_state)),
+        Cell::from(issue),
+      ])
+      .style(iis_state_style(binding.handoff_state))
+    });
+    let title = if self.model.iis.loading {
+      "IIS Handoff: loading"
+    } else if self.model.iis.last_error.is_some() {
+      "IIS Handoff: unavailable"
+    } else {
+      "IIS Handoff"
+    };
+    let table = Table::new(
+      rows,
+      [
+        Constraint::Length(22),
+        Constraint::Length(8),
+        Constraint::Length(12),
+        Constraint::Length(6),
+        Constraint::Length(28),
+        Constraint::Length(14),
+        Constraint::Percentage(40),
+      ],
+    )
+    .header(
+      Row::new(["Site", "Protocol", "IP", "Port", "Host", "State", "Safety"])
+        .style(UiStyles::header()),
+    )
+    .block(app_block(title))
+    .row_highlight_style(UiStyles::selected_row())
+    .highlight_symbol(">> ");
+    let mut state = TableState::default().with_selected(Some(self.model.iis.selected));
     frame.render_stateful_widget(table, area, &mut state);
   }
 
@@ -1145,6 +1402,34 @@ mod tests {
     }
   }
 
+  #[cfg(windows)]
+  fn iis_binding(
+    id: &str,
+    host: &str,
+    state: cadder_protocol::IisHandoffState,
+    issue: Option<cadder_protocol::IisIssue>,
+  ) -> cadder_protocol::IisBinding {
+    cadder_protocol::IisBinding {
+      identity: cadder_protocol::IisBindingIdentity {
+        binding_id: id.to_string(),
+        site_name: "Default Web Site".to_string(),
+        protocol: if host.starts_with("secure") {
+          "https".to_string()
+        } else {
+          "http".to_string()
+        },
+        binding_information: format!("*:80:{host}"),
+      },
+      ip_address: "*".to_string(),
+      port: 80,
+      host_header: host.to_string(),
+      domain_key: Some(host.to_string()),
+      handoff_state: state,
+      issue,
+      restore_metadata: None,
+    }
+  }
+
   fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
     terminal
       .backend()
@@ -1296,6 +1581,56 @@ mod tests {
     assert!(text.contains("Errors only"));
   }
 
+  #[cfg(windows)]
+  #[test]
+  fn draw_iis_handoff_shows_rows_and_safety_reasons() {
+    let mut app = test_app();
+    app.model.view = View::IisHandoff;
+    app.model.iis.bindings = vec![
+      iis_binding(
+        "available",
+        "app.localhost",
+        cadder_protocol::IisHandoffState::Available,
+        None,
+      ),
+      iis_binding(
+        "unsupported",
+        "secure.localhost",
+        cadder_protocol::IisHandoffState::Unsupported,
+        Some(cadder_protocol::IisIssue::new(
+          cadder_protocol::IisIssueKind::UnsupportedBindingShape,
+          "HTTPS unsupported.",
+        )),
+      ),
+      iis_binding(
+        "restore-failed",
+        "restore.localhost",
+        cadder_protocol::IisHandoffState::HandedOff,
+        Some(cadder_protocol::IisIssue::new(
+          cadder_protocol::IisIssueKind::RestoreFailed,
+          "Restore failed.",
+        )),
+      ),
+      iis_binding(
+        "rollback-failed",
+        "rollback.localhost",
+        cadder_protocol::IisHandoffState::Conflict,
+        Some(cadder_protocol::IisIssue::new(
+          cadder_protocol::IisIssueKind::RollbackFailed,
+          "Rollback failed.",
+        )),
+      ),
+    ];
+
+    let text = render(&app);
+
+    assert!(text.contains("IIS Handoff"));
+    assert!(text.contains("app.localhost"));
+    assert!(text.contains("HTTPS unsupported."));
+    assert!(text.contains("Restore failed."));
+    assert!(text.contains("Rollback failed."));
+  }
+
   #[test]
   fn style_helpers_use_high_contrast_terminal_styles() {
     assert_eq!(activation_marker(ActivationState::Active), "[x] Active");
@@ -1334,8 +1669,12 @@ mod tests {
     assert_eq!(app.model.domain_selected, 1);
     app.handle_key_code(KeyCode::Right).unwrap();
     app.handle_key_code(KeyCode::Right).unwrap();
+    #[cfg(windows)]
+    app.handle_key_code(KeyCode::Right).unwrap();
     assert_eq!(app.model.view, View::Settings);
     app.handle_key_code(KeyCode::Left).unwrap();
+    app.handle_key_code(KeyCode::Left).unwrap();
+    #[cfg(windows)]
     app.handle_key_code(KeyCode::Left).unwrap();
     assert_eq!(app.model.view, View::Domains);
     assert_eq!(app.model.domain_selected, 1);
@@ -1509,6 +1848,92 @@ mod tests {
     assert_eq!(app.model.logs.read_error.as_deref(), Some("read failed"));
     assert!(!app.state_request_in_flight);
     assert!(!app.toggle_request_in_flight);
+  }
+
+  #[cfg(windows)]
+  #[tokio::test]
+  async fn drain_responses_applies_iis_discovery_and_handoff_results() {
+    let mut app = test_app();
+    app.model.view = View::IisHandoff;
+    app.model.iis.request_in_flight = true;
+    app.model.iis.action_in_flight = true;
+
+    app
+      .responses_tx
+      .send(AppResponse::IisBindings(Ok(QueryIisBindingsResponse {
+        request_id: "iis".to_string(),
+        accepted: true,
+        message: "IIS bindings returned.".to_string(),
+        bindings: vec![iis_binding(
+          "available",
+          "app.localhost",
+          cadder_protocol::IisHandoffState::Available,
+          None,
+        )],
+        issue: None,
+      })))
+      .unwrap();
+    app
+      .responses_tx
+      .send(AppResponse::IisHandoff(Ok(SetIisHandoffResponse {
+        request_id: "handoff".to_string(),
+        accepted: true,
+        message: "IIS binding `app.localhost` handed off to Cadder.".to_string(),
+        binding: None,
+        issue: None,
+      })))
+      .unwrap();
+
+    app.drain_responses();
+
+    assert_eq!(app.model.iis.bindings.len(), 1);
+    assert!(app.model.iis.request_in_flight);
+    assert!(!app.model.iis.action_in_flight);
+    assert_eq!(
+      app.message,
+      "IIS binding `app.localhost` handed off to Cadder."
+    );
+  }
+
+  #[cfg(windows)]
+  #[tokio::test]
+  async fn iis_missing_route_requires_search_host_before_handoff() {
+    let mut app = test_app();
+    app.model.view = View::IisHandoff;
+    app.model.iis.bindings = vec![cadder_protocol::IisBinding {
+      identity: cadder_protocol::IisBindingIdentity {
+        binding_id: "Default Web Site|https|*:443:".to_string(),
+        site_name: "Default Web Site".to_string(),
+        protocol: "https".to_string(),
+        binding_information: "*:443:".to_string(),
+      },
+      ip_address: "*".to_string(),
+      port: 443,
+      host_header: String::new(),
+      domain_key: None,
+      handoff_state: cadder_protocol::IisHandoffState::MissingRoute,
+      issue: Some(cadder_protocol::IisIssue::new(
+        cadder_protocol::IisIssueKind::MissingRoute,
+        "Wildcard IIS bindings need a route host.",
+      )),
+      restore_metadata: None,
+    }];
+
+    app.handle_key_code(KeyCode::Char(' ')).unwrap();
+    assert!(!app.model.iis.action_in_flight);
+    assert_eq!(app.message, "Wildcard IIS bindings need a route host.");
+
+    app.handle_key_code(KeyCode::Char('/')).unwrap();
+    for ch in "iis-app.localhost".chars() {
+      app.handle_key_code(KeyCode::Char(ch)).unwrap();
+    }
+    app.handle_key_code(KeyCode::Enter).unwrap();
+    app.handle_key_code(KeyCode::Char(' ')).unwrap();
+
+    assert!(app.model.search.is_empty());
+    assert_eq!(app.model.iis.route_host_input, "iis-app.localhost");
+    assert!(!app.model.iis.route_host_input_mode);
+    assert!(app.model.iis.action_in_flight);
   }
 
   #[tokio::test]

@@ -1,0 +1,67 @@
+---
+title: Windows IIS handoff
+description: Move a local Windows IIS binding behind Cadder and restore it later.
+---
+
+Cadder can proxy a local IIS site through its Caddy front door. This is useful when a project already depends on IIS, but you still want Cadder to coordinate the local HTTPS host with the rest of your Caddy-backed projects.
+
+Use a disposable IIS binding first. Do not test this on a production IIS site.
+
+## Requirements
+
+- Windows with IIS and the PowerShell `WebAdministration` module available.
+- A shell that can manage IIS bindings. In practice, start Windows Terminal as Administrator.
+- `cadderd`, `cadder-tui`, and any `caddy` shim process used for the smoke test running from the same elevated context.
+- A supported IIS binding: `http` on port `80` or `https` on port `443`.
+- One route host for the binding. Cadder can use a concrete IIS host header directly. For wildcard or empty-host bindings, you must type the host or full URL in the TUI.
+
+## Hand off a binding
+
+1. Start `cadderd` from the elevated shell, or start a shim command that connects to the elevated daemon.
+2. Run `cadder-tui`.
+3. Open the IIS Handoff view with `Tab` or `Right`.
+4. Select the IIS row with `Up` and `Down`.
+5. If the IIS row has an empty or wildcard host header, press `/`, type the intended host or full URL, then press `Enter`. Cadder keeps only the DNS host. For example, `https://iis-app.localhost/legacy/status` becomes `iis-app.localhost`.
+6. Press `Space` to hand off the binding.
+
+Cadder stores restore metadata before it changes IIS. It then creates a loopback HTTP backend binding on the same IIS site, removes the public IIS binding, adds a Caddy reverse-proxy route for the route host, and applies the generated Caddy config.
+
+The backend binding uses `127.0.0.1:<port>`. Cadder chooses a deterministic port below the default Windows dynamic TCP range, which avoids common HTTP.sys excluded-port failures.
+
+## Verify routing
+
+Use the original host or URL through Caddy:
+
+```powershell
+curl.exe -k -I https://iis-app.localhost/legacy/status
+```
+
+A routing smoke passes when the response goes through Caddy and reaches IIS. For an IIS application that is missing local configuration, an application-level `4xx` or `5xx` can still be a valid routing result. Check headers such as:
+
+- `Via: 1.1 Caddy`
+- `Server: Microsoft-IIS/...`
+
+If the TUI status line shows the backend port, you can also check IIS directly:
+
+```powershell
+$backendPort = 41043
+curl.exe -I "http://127.0.0.1:$backendPort/legacy/status"
+```
+
+Set `$backendPort` to the port shown by your TUI.
+
+## Restore a binding
+
+In the IIS Handoff view, select a handed-off row and press `Space` again.
+
+Restore removes the Caddy IIS proxy route, recreates the original IIS binding from stored metadata, removes the loopback backend binding, and clears the metadata after the restore succeeds. Cadder rejects restore while other active Cadder routes still need the front-door port, because giving that port back to IIS would break those routes.
+
+If Caddy apply fails during handoff, Cadder tries to roll IIS back to the original binding. If rollback fails, Cadder keeps the restore metadata so the binding can still be recovered from the TUI after the underlying IIS problem is fixed.
+
+## Troubleshooting
+
+- `Insufficient privileges`: restart Windows Terminal as Administrator and retry with a disposable binding.
+- `Missing route host`: press `/`, enter the intended host or URL, press `Enter`, then press `Space` again.
+- `Unsupported binding shape`: leave the binding under IIS, or change it to a supported `http:80` or `https:443` binding before handing it off.
+- `Conflict`: another IIS binding or active Cadder domain already uses the same route host. Resolve that conflict before handing off the row.
+- `Rollback failed` or `Restore failed`: do not delete the runtime metadata. Fix the IIS permission or binding problem, then retry restore from the TUI.

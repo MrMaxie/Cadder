@@ -325,8 +325,15 @@ pub struct CaddyConfigCoordinator {
   adapter: CaddyConfigAdapter,
   runtime: ProcessRuntime,
   routes: BTreeMap<String, Vec<Value>>,
+  iis_routes: BTreeMap<String, IisProxyRoute>,
   registration_diagnostics: BTreeMap<String, Vec<ConfigDiagnostic>>,
   current: ConfigState,
+}
+
+#[derive(Debug, Clone)]
+struct IisProxyRoute {
+  domain_key: String,
+  route: Value,
 }
 
 impl CaddyConfigCoordinator {
@@ -335,6 +342,7 @@ impl CaddyConfigCoordinator {
       adapter,
       runtime,
       routes: BTreeMap::new(),
+      iis_routes: BTreeMap::new(),
       registration_diagnostics: BTreeMap::new(),
       current: ConfigState::idle(),
     }
@@ -346,6 +354,40 @@ impl CaddyConfigCoordinator {
 
   pub async fn runtime_state(&self) -> cadder_protocol::RuntimeState {
     self.runtime.inspect().await
+  }
+
+  pub fn set_iis_proxy_route(
+    &mut self,
+    binding_id: impl Into<String>,
+    domain_key: impl Into<String>,
+    backend_dial: impl Into<String>,
+  ) {
+    let binding_id = binding_id.into();
+    let domain_key = domain_key.into();
+    let backend_dial = backend_dial.into();
+    let route = json!({
+        "@id": format!("iis_handoff_{}", route_id_fragment(&binding_id)),
+        "match": [{ "host": [domain_key.clone()] }],
+        "handle": [{
+            "handler": "reverse_proxy",
+            "upstreams": [{ "dial": backend_dial }]
+        }],
+        "terminal": true
+    });
+    self
+      .iis_routes
+      .insert(domain_key.clone(), IisProxyRoute { domain_key, route });
+  }
+
+  pub fn remove_iis_proxy_route(&mut self, domain_key: &str) {
+    self.iis_routes.remove(domain_key);
+  }
+
+  pub fn has_iis_proxy_routes_except(&self, domain_key: &str) -> bool {
+    self
+      .iis_routes
+      .values()
+      .any(|route| !route.domain_key.eq_ignore_ascii_case(domain_key))
   }
 
   pub async fn prepare_registration(
@@ -417,6 +459,7 @@ impl CaddyConfigCoordinator {
       .flat_map(|(_, diagnostics)| diagnostics.iter().cloned())
       .collect::<Vec<_>>();
     diagnostics.extend(detect_conflicts(registrations));
+    diagnostics.extend(detect_iis_route_conflicts(registrations, &self.iis_routes));
     let attempted = Utc::now();
     if !diagnostics.is_empty() {
       self.current = ConfigState {
@@ -434,9 +477,10 @@ impl CaddyConfigCoordinator {
       .filter(|registration| registration.activation_state.is_enabled())
       .cloned()
       .collect();
-    if active
-      .iter()
-      .all(|registration| active_domains(registration).is_empty())
+    if self.iis_routes.is_empty()
+      && active
+        .iter()
+        .all(|registration| active_domains(registration).is_empty())
     {
       if let Err(error) = self.runtime.stop().await {
         logs.append(
@@ -457,7 +501,7 @@ impl CaddyConfigCoordinator {
       return self.current.clone();
     }
 
-    let config = compose_config(&active, &self.routes);
+    let config = compose_config(&active, &self.routes, &self.iis_routes);
     let rendered = serde_json::to_vec_pretty(&config).expect("config serialization");
     let hash = hex::encode(Sha256::digest(&rendered));
 
@@ -500,13 +544,16 @@ impl CaddyConfigCoordinator {
 fn compose_config(
   registrations: &[EntrypointRegistration],
   routes_by_registration: &BTreeMap<String, Vec<Value>>,
+  iis_routes: &BTreeMap<String, IisProxyRoute>,
 ) -> Value {
   let mut routes = Vec::new();
+  let mut tls_subjects = BTreeSet::new();
   for registration in registrations {
     let enabled_hosts = active_domains(registration);
     if enabled_hosts.is_empty() {
       continue;
     }
+    tls_subjects.extend(enabled_hosts.iter().cloned());
 
     if let Some(source_routes) = routes_by_registration.get(&registration.registration_id) {
       for route in source_routes {
@@ -524,20 +571,50 @@ fn compose_config(
       }
     }
   }
+  tls_subjects.extend(iis_routes.keys().cloned());
+  routes.extend(iis_routes.values().map(|route| route.route.clone()));
+  let tls_subjects = tls_subjects.into_iter().collect::<Vec<_>>();
+  let http_routes = routes.clone();
 
   json!({
       "admin": { "listen": "localhost:2019" },
       "apps": {
           "http": {
               "servers": {
-                  "cadder": {
-                      "listen": [":80", ":443"],
+                  "cadder_http": {
+                      "listen": [":80"],
+                      "routes": http_routes
+                  },
+                  "cadder_https": {
+                      "listen": [":443"],
+                      "tls_connection_policies": [{}],
                       "routes": routes
                   }
+              }
+          },
+          "tls": {
+              "automation": {
+                  "policies": [{
+                      "subjects": tls_subjects,
+                      "issuers": [{ "module": "internal" }]
+                  }]
               }
           }
       }
   })
+}
+
+fn route_id_fragment(value: &str) -> String {
+  value
+    .chars()
+    .map(|ch| {
+      if ch.is_ascii_alphanumeric() {
+        ch.to_ascii_lowercase()
+      } else {
+        '_'
+      }
+    })
+    .collect()
 }
 
 fn active_domains(registration: &EntrypointRegistration) -> BTreeSet<String> {
@@ -661,6 +738,35 @@ fn detect_conflicts(registrations: &[EntrypointRegistration]) -> Vec<ConfigDiagn
           .map(|registration| registration.source_config_path.raw.clone())
           .collect(),
       })
+    })
+    .collect()
+}
+
+fn detect_iis_route_conflicts(
+  registrations: &[EntrypointRegistration],
+  iis_routes: &BTreeMap<String, IisProxyRoute>,
+) -> Vec<ConfigDiagnostic> {
+  registrations
+    .iter()
+    .filter(|registration| registration.activation_state.is_enabled())
+    .flat_map(|registration| {
+      registration
+        .registered_domains
+        .iter()
+        .filter(|domain| domain.activation_state.is_enabled())
+        .filter_map(|domain| {
+          iis_routes
+            .get(&domain.name.canonical)
+            .map(|iis_route| ConfigDiagnostic {
+              code: "iis-domain-conflict".to_string(),
+              message: format!(
+                "domain `{}` is already owned by an IIS handoff route",
+                iis_route.domain_key
+              ),
+              domain_key: Some(iis_route.domain_key.clone()),
+              source_config_paths: vec![registration.source_config_path.raw.clone()],
+            })
+        })
     })
     .collect()
 }
@@ -974,5 +1080,89 @@ exit 1
         .len(),
       1
     );
+  }
+
+  #[test]
+  fn compose_config_appends_iis_proxy_routes_after_registration_routes() {
+    let registrations = vec![registration("shim", &["app.localhost"])];
+    let routes_by_registration = BTreeMap::from([(
+      "shim".to_string(),
+      vec![json!({
+          "match": [{ "host": ["app.localhost"] }],
+          "handle": [{ "handler": "static_response", "body": "app" }],
+          "terminal": true
+      })],
+    )]);
+    let iis_routes = BTreeMap::from([(
+      "iis-app.localhost".to_string(),
+      IisProxyRoute {
+        domain_key: "iis-app.localhost".to_string(),
+        route: json!({
+            "match": [{ "host": ["iis-app.localhost"] }],
+            "handle": [{ "handler": "reverse_proxy", "upstreams": [{ "dial": "127.0.0.1:41043" }] }],
+            "terminal": true
+        }),
+      },
+    )]);
+
+    let config = compose_config(&registrations, &routes_by_registration, &iis_routes);
+    let routes = config
+      .pointer("/apps/http/servers/cadder_https/routes")
+      .and_then(Value::as_array)
+      .unwrap();
+    let http_listen = config
+      .pointer("/apps/http/servers/cadder_http/listen")
+      .and_then(Value::as_array)
+      .unwrap();
+    let https_listen = config
+      .pointer("/apps/http/servers/cadder_https/listen")
+      .and_then(Value::as_array)
+      .unwrap();
+    let tls_connection_policies = config
+      .pointer("/apps/http/servers/cadder_https/tls_connection_policies")
+      .and_then(Value::as_array)
+      .unwrap();
+    let tls_subjects = config
+      .pointer("/apps/tls/automation/policies/0/subjects")
+      .and_then(Value::as_array)
+      .unwrap();
+    let tls_issuer = config
+      .pointer("/apps/tls/automation/policies/0/issuers/0/module")
+      .and_then(Value::as_str);
+
+    assert_eq!(http_listen, &[json!(":80")]);
+    assert_eq!(https_listen, &[json!(":443")]);
+    assert_eq!(tls_connection_policies, &[json!({})]);
+    assert_eq!(
+      tls_subjects,
+      &[json!("app.localhost"), json!("iis-app.localhost")]
+    );
+    assert_eq!(tls_issuer, Some("internal"));
+    assert_eq!(routes.len(), 2);
+    assert_eq!(
+      routes[0].pointer("/match/0/host/0").and_then(Value::as_str),
+      Some("app.localhost")
+    );
+    assert_eq!(
+      routes[1].pointer("/match/0/host/0").and_then(Value::as_str),
+      Some("iis-app.localhost")
+    );
+  }
+
+  #[test]
+  fn detects_iis_proxy_route_conflicts_with_active_registration_domains() {
+    let registrations = vec![registration("shim", &["app.localhost"])];
+    let iis_routes = BTreeMap::from([(
+      "app.localhost".to_string(),
+      IisProxyRoute {
+        domain_key: "app.localhost".to_string(),
+        route: json!({ "match": [{ "host": ["app.localhost"] }] }),
+      },
+    )]);
+
+    let diagnostics = detect_iis_route_conflicts(&registrations, &iis_routes);
+
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].code, "iis-domain-conflict");
   }
 }

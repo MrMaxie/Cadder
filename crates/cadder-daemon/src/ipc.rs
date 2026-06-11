@@ -1,9 +1,10 @@
 use crate::{DaemonState, RuntimePaths};
 use anyhow::{Context, Result, anyhow};
 use cadder_protocol::{
-  BasicResponse, HeartbeatEntrypointRequest, IpcEnvelope, QueryLogsRequest, QueryStateRequest,
-  RegisterEntrypointRequest, SetDomainEnabledRequest, SetEntrypointEnabledRequest,
-  ShutdownDaemonRequest, SubscribeStateRequest, UnregisterEntrypointRequest, message_types,
+  BasicResponse, HeartbeatEntrypointRequest, IpcEnvelope, QueryIisBindingsRequest,
+  QueryLogsRequest, QueryStateRequest, RegisterEntrypointRequest, SetDomainEnabledRequest,
+  SetEntrypointEnabledRequest, SetIisHandoffRequest, ShutdownDaemonRequest, SubscribeStateRequest,
+  UnregisterEntrypointRequest, message_types,
 };
 use interprocess::local_socket::{
   GenericNamespaced, ListenerOptions, ToNsName,
@@ -155,6 +156,26 @@ async fn handle_connection(conn: Stream, state: DaemonState) -> Result<()> {
         write_envelope(
           &mut write_half,
           message_types::SET_DOMAIN_ENABLED_RESPONSE,
+          &response,
+        )
+        .await?;
+      }
+      message_types::QUERY_IIS_BINDINGS_REQUEST => {
+        let request: QueryIisBindingsRequest = envelope.decode()?;
+        let response = state.query_iis_bindings(request.request_id).await;
+        write_envelope(
+          &mut write_half,
+          message_types::QUERY_IIS_BINDINGS_RESPONSE,
+          &response,
+        )
+        .await?;
+      }
+      message_types::SET_IIS_HANDOFF_REQUEST => {
+        let request: SetIisHandoffRequest = envelope.decode()?;
+        let response = state.set_iis_handoff(request).await;
+        write_envelope(
+          &mut write_half,
+          message_types::SET_IIS_HANDOFF_RESPONSE,
           &response,
         )
         .await?;

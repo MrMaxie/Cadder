@@ -37,6 +37,8 @@ Supported public messages include:
 - subscribe to state changes;
 - set entrypoint enabled;
 - set domain enabled;
+- query Windows IIS bindings;
+- set Windows IIS handoff enabled or disabled;
 - query Caddy logs;
 - request daemon shutdown.
 
@@ -71,13 +73,25 @@ The adapted JSON is inspected for HTTP host matchers. The adapter resolves real 
 
 Runtime operations start the owned real Caddy process with the generated config and reload it on subsequent config changes. Captured stdout/stderr and control events are stored in a bounded log store with redaction for token-like values.
 
+## Windows IIS Handoff
+
+On Windows, the daemon exposes a small IIS provider behind the `query-iis-bindings` and `set-iis-handoff` IPC messages. The provider is platform-gated: non-Windows builds do not expose the TUI view, and the daemon provider returns an IIS-unavailable issue instead of loading Windows-only dependencies.
+
+IIS discovery is explicit and separate from `query-state`, so the TUI's periodic state refresh does not enumerate IIS bindings while holding daemon state. The Windows provider uses PowerShell `WebAdministration` commands to list, add, remove, and restore bindings. Default automated tests use a fake provider and do not require a local IIS installation or elevated privileges.
+
+Supported handoff shapes are IIS `http` port 80 and `https` port 443 bindings when Cadder can identify one route host. A concrete IIS host header is used directly. A wildcard or empty IIS host header requires an explicit route host from the caller; `cadder-tui` uses the `/` input for this, and full URLs are accepted by extracting only the DNS host. Unsupported protocols, unsupported ports, duplicate host bindings, active Cadder-domain conflicts, and provider privilege errors are returned as typed issues and shown inline by `cadder-tui`.
+
+Cadder remains the front door during IIS handoff. Before removing an IIS-owned public binding, the daemon persists restore metadata in `daemon.json` under the runtime directory. The record includes the original site name, protocol, IP address, port, host header, binding information, route host, and loopback backend binding. Enabling handoff creates a deterministic `127.0.0.1:<port>` HTTP binding on the same IIS site, using a port below the default Windows dynamic TCP range, removes the original public binding, injects a Caddy reverse-proxy route for the route host, and applies Caddy. Persisted IIS proxy routes are hydrated when the daemon starts so restart does not drop an active handoff route. If Cadder cannot apply the proxy route after changing IIS, the daemon attempts to restore the original IIS binding and reports whether rollback succeeded or failed. If rollback fails, restore metadata and the loopback backend binding are kept so the operator can retry recovery. Restoring handoff removes the Caddy IIS proxy route, recreates the original IIS binding from persisted metadata, removes the backend binding, and clears the metadata only after restore succeeds. Restore is rejected while other active Cadder routes still need the front-door port, because IIS would reclaim raw `:80` or `:443`.
+
 ## Domain Logs TUI
 
 `cadder-tui` exposes per-domain logs from the Domains view. Pressing `Enter` or `l` on a domain row opens a log-focused view bound to that domain's `LogStreamIdentity`; the view keeps the selected stream even if registrations change later, so it never silently falls back to an entrypoint or unrelated domain.
 
 The TUI refreshes daemon state snapshots automatically on a short fixed interval while retaining `r` for explicit refreshes. It also loads a bounded log page through `query-logs-request`, stores the returned cursor, and tails by issuing follow-up requests with that cursor. Auto-tail is enabled by default and can be paused with `p`; while paused, the TUI keeps keyboard handling responsive and avoids automatic log refreshes until the user resumes or manually refreshes with `Enter`. Log severity is primarily controlled from the Settings view; applying a new severity resets the cursor before reloading so entries from different filters are not mixed.
 
-Log refresh, state refresh, activation toggles, and shutdown requests are dispatched as short background IPC tasks. The TUI accepts at most one active state refresh and one active log refresh for the current stream, and surfaces IPC failures as a read-error state rather than blocking terminal input.
+On Windows, `cadder-tui` also exposes an IIS Handoff view. The view lists site, protocol, IP address, port, host header, handoff state, and safety details. Pressing `Enter` refreshes IIS discovery; pressing `Space` hands off an available binding or restores a handed-off binding. For wildcard or empty-host IIS rows, press `/`, type the route host or URL, press `Enter` to keep the value, then press `Space`. The view is absent on non-Windows platforms rather than shown as a disabled placeholder.
+
+Log refresh, state refresh, IIS discovery, activation toggles, IIS handoff actions, and shutdown requests are dispatched as short background IPC tasks. The TUI accepts at most one active state refresh and one active log refresh for the current stream, and surfaces IPC failures as a read-error state rather than blocking terminal input.
 
 The log store reports stream status and retention metadata in `query-logs-response`, including active, empty, stale, removed, read-error, gap, more-before, and truncated-by-retention states. Diagnostic exports are timestamped text files in the caller's current working directory and contain only the daemon-redacted `LogEntry.raw_message` content plus stream metadata.
 

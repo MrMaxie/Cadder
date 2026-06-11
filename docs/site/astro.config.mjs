@@ -35,7 +35,13 @@ export default defineConfig({
         {
           label: 'Cookbooks',
           items: [
-            { label: 'Windows', slug: 'guides/windows' },
+            {
+              label: 'Windows',
+              items: [
+                { label: 'Overview', slug: 'guides/windows' },
+                { label: 'IIS handoff', slug: 'cookbooks/windows/iis' },
+              ],
+            },
             { label: 'macOS', slug: 'guides/macos' },
             { label: 'Linux', slug: 'guides/linux' },
           ],

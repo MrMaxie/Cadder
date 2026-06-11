@@ -1,5 +1,6 @@
 mod caddy;
 mod config;
+mod iis;
 mod ipc;
 mod logs;
 mod paths;
@@ -8,6 +9,7 @@ mod state;
 
 pub use caddy::{CaddyConfigAdapter, CaddyConfigCoordinator, RealCaddyResolver};
 pub use config::{CONFIG_FILE_NAME, CadderConfig, CaddyRuntimeConfig};
+pub use iis::{IisBindingRecord, IisMetadataStore, IisProvider};
 pub use ipc::{
   CadderClient, CadderSession, DaemonLaunchOptions, DaemonServer, ensure_daemon_running,
   ensure_daemon_running_with_options,
@@ -36,7 +38,7 @@ pub async fn run_daemon(options: DaemonOptions, shutdown: watch::Receiver<bool>)
   let adapter = CaddyConfigAdapter::new(real_caddy.clone());
   let runtime = ProcessRuntime::new(real_caddy, paths.clone());
   let coordinator = CaddyConfigCoordinator::new(adapter, runtime);
-  let state = DaemonState::new(coordinator);
+  let state = DaemonState::with_runtime_paths(coordinator, paths.clone()).await?;
 
   let server = DaemonServer::new(paths, state);
   server.run_until(shutdown).await

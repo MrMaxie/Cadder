@@ -20,6 +20,10 @@ pub mod message_types {
   pub const SET_ENTRYPOINT_ENABLED_RESPONSE: &str = "set-entrypoint-enabled-response";
   pub const SET_DOMAIN_ENABLED_REQUEST: &str = "set-domain-enabled-request";
   pub const SET_DOMAIN_ENABLED_RESPONSE: &str = "set-domain-enabled-response";
+  pub const QUERY_IIS_BINDINGS_REQUEST: &str = "query-iis-bindings-request";
+  pub const QUERY_IIS_BINDINGS_RESPONSE: &str = "query-iis-bindings-response";
+  pub const SET_IIS_HANDOFF_REQUEST: &str = "set-iis-handoff-request";
+  pub const SET_IIS_HANDOFF_RESPONSE: &str = "set-iis-handoff-response";
   pub const QUERY_LOGS_REQUEST: &str = "query-logs-request";
   pub const QUERY_LOGS_RESPONSE: &str = "query-logs-response";
   pub const SHUTDOWN_DAEMON_REQUEST: &str = "shutdown-daemon-request";
@@ -490,6 +494,118 @@ pub struct SetDomainEnabledRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct IisBindingIdentity {
+  pub binding_id: String,
+  pub site_name: String,
+  pub protocol: String,
+  pub binding_information: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IisHandoffState {
+  Available,
+  HandedOff,
+  Unsupported,
+  Conflict,
+  MissingRoute,
+  Unavailable,
+  Busy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IisIssueKind {
+  IisUnavailable,
+  InsufficientPrivileges,
+  UnsupportedBindingShape,
+  Conflict,
+  MissingBinding,
+  MissingRoute,
+  RollbackSucceeded,
+  RollbackFailed,
+  RestoreFailed,
+  Busy,
+  ProviderError,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IisIssue {
+  pub kind: IisIssueKind,
+  pub message: String,
+}
+
+impl IisIssue {
+  pub fn new(kind: IisIssueKind, message: impl Into<String>) -> Self {
+    Self {
+      kind,
+      message: message.into(),
+    }
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IisRestoreMetadataSummary {
+  pub site_name: String,
+  pub protocol: String,
+  pub ip_address: String,
+  pub port: u16,
+  pub host_header: String,
+  pub binding_information: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IisBinding {
+  pub identity: IisBindingIdentity,
+  pub ip_address: String,
+  pub port: u16,
+  pub host_header: String,
+  pub domain_key: Option<String>,
+  pub handoff_state: IisHandoffState,
+  pub issue: Option<IisIssue>,
+  pub restore_metadata: Option<IisRestoreMetadataSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryIisBindingsRequest {
+  pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryIisBindingsResponse {
+  pub request_id: String,
+  pub accepted: bool,
+  pub message: String,
+  pub bindings: Vec<IisBinding>,
+  pub issue: Option<IisIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SetIisHandoffRequest {
+  pub request_id: String,
+  pub binding_id: String,
+  pub enabled: bool,
+  pub route_host: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SetIisHandoffResponse {
+  pub request_id: String,
+  pub accepted: bool,
+  pub message: String,
+  pub binding: Option<IisBinding>,
+  pub issue: Option<IisIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct QueryLogsRequest {
   pub request_id: String,
   pub stream: LogStreamIdentity,
@@ -548,6 +664,57 @@ mod tests {
     assert!(json.contains("\"requestId\":\"request-1\""));
 
     let decoded: QueryStateRequest = envelope.decode().unwrap();
+    assert_eq!(decoded, request);
+  }
+
+  #[test]
+  fn serializes_iis_handoff_contracts() {
+    let response = QueryIisBindingsResponse {
+      request_id: "iis-1".to_string(),
+      accepted: true,
+      message: "ok".to_string(),
+      bindings: vec![IisBinding {
+        identity: IisBindingIdentity {
+          binding_id: "Default Web Site|http|*:80:app.localhost".to_string(),
+          site_name: "Default Web Site".to_string(),
+          protocol: "http".to_string(),
+          binding_information: "*:80:app.localhost".to_string(),
+        },
+        ip_address: "*".to_string(),
+        port: 80,
+        host_header: "app.localhost".to_string(),
+        domain_key: Some("app.localhost".to_string()),
+        handoff_state: IisHandoffState::Available,
+        issue: Some(IisIssue::new(
+          IisIssueKind::MissingRoute,
+          "Cadder has no route.",
+        )),
+        restore_metadata: None,
+      }],
+      issue: None,
+    };
+
+    let envelope = IpcEnvelope::new(message_types::QUERY_IIS_BINDINGS_RESPONSE, &response).unwrap();
+    let json = serde_json::to_string(&envelope).unwrap();
+    let decoded: QueryIisBindingsResponse = envelope.decode().unwrap();
+
+    assert!(json.contains("\"query-iis-bindings-response\""));
+    assert!(json.contains("\"handoffState\":\"available\""));
+    assert!(json.contains("\"missingRoute\""));
+    assert_eq!(decoded, response);
+
+    let request = SetIisHandoffRequest {
+      request_id: "iis-on".to_string(),
+      binding_id: "Default Web Site|https|*:443:".to_string(),
+      enabled: true,
+      route_host: Some("iis-app.localhost".to_string()),
+    };
+    let envelope = IpcEnvelope::new(message_types::SET_IIS_HANDOFF_REQUEST, &request).unwrap();
+    let json = serde_json::to_string(&envelope).unwrap();
+    let decoded: SetIisHandoffRequest = envelope.decode().unwrap();
+
+    assert!(json.contains("\"set-iis-handoff-request\""));
+    assert!(json.contains("\"routeHost\":\"iis-app.localhost\""));
     assert_eq!(decoded, request);
   }
 

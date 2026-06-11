@@ -1,6 +1,6 @@
 use cadder_protocol::{
-  EntrypointRegistration, GuiStateSnapshot, LogEntry, LogSeverity, LogStreamIdentity,
-  LogStreamStatus, RegisteredDomain,
+  EntrypointRegistration, GuiStateSnapshot, IisBinding, LogEntry, LogSeverity, LogStreamIdentity,
+  LogStreamStatus, QueryIisBindingsResponse, RegisteredDomain,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8,12 +8,26 @@ pub enum View {
   Overview,
   Entrypoints,
   Domains,
+  #[cfg(windows)]
+  IisHandoff,
   Logs,
   Settings,
   Diagnostics,
 }
 
 impl View {
+  #[cfg(windows)]
+  pub const ALL: [Self; 7] = [
+    Self::Overview,
+    Self::Entrypoints,
+    Self::Domains,
+    Self::IisHandoff,
+    Self::Logs,
+    Self::Settings,
+    Self::Diagnostics,
+  ];
+
+  #[cfg(not(windows))]
   pub const ALL: [Self; 6] = [
     Self::Overview,
     Self::Entrypoints,
@@ -28,6 +42,8 @@ impl View {
       Self::Overview => "Overview",
       Self::Entrypoints => "Entrypoints",
       Self::Domains => "Domains",
+      #[cfg(windows)]
+      Self::IisHandoff => "IIS Handoff",
       Self::Logs => "Logs",
       Self::Settings => "Settings",
       Self::Diagnostics => "Diagnostics",
@@ -140,9 +156,75 @@ pub struct TuiModel {
   pub search_mode: bool,
   pub entrypoint_selected: usize,
   pub domain_selected: usize,
+  #[cfg(windows)]
+  pub iis: IisViewModel,
   pub logs: LogViewModel,
   pub settings: SettingsViewModel,
   snapshot: GuiStateSnapshot,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IisViewModel {
+  pub bindings: Vec<IisBinding>,
+  pub selected: usize,
+  pub route_host_input: String,
+  pub route_host_input_mode: bool,
+  pub loading: bool,
+  pub request_in_flight: bool,
+  pub action_in_flight: bool,
+  pub last_error: Option<String>,
+}
+
+#[cfg(windows)]
+impl IisViewModel {
+  pub fn mark_loading(&mut self) {
+    self.loading = true;
+    self.request_in_flight = true;
+    self.last_error = None;
+  }
+
+  pub fn apply_response(&mut self, response: QueryIisBindingsResponse) {
+    self.loading = false;
+    self.request_in_flight = false;
+    self.bindings = response.bindings;
+    self.last_error = response.issue.map(|issue| issue.message);
+    self.clamp();
+  }
+
+  pub fn apply_error(&mut self, message: String) {
+    self.loading = false;
+    self.request_in_flight = false;
+    self.last_error = Some(message);
+  }
+
+  pub fn selected_binding(&self) -> Option<IisBinding> {
+    self.bindings.get(self.selected).cloned()
+  }
+
+  pub fn begin_route_host_input(&mut self) {
+    self.route_host_input_mode = true;
+  }
+
+  pub fn finish_route_host_input(&mut self) {
+    self.route_host_input_mode = false;
+  }
+
+  pub fn push_route_host_char(&mut self, ch: char) {
+    self.route_host_input.push(ch);
+  }
+
+  pub fn pop_route_host_char(&mut self) {
+    self.route_host_input.pop();
+  }
+
+  fn move_selection(&mut self, delta: isize) {
+    move_index(&mut self.selected, self.bindings.len(), delta);
+  }
+
+  fn clamp(&mut self) {
+    clamp_index(&mut self.selected, self.bindings.len());
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +342,8 @@ impl Default for TuiModel {
       search_mode: false,
       entrypoint_selected: 0,
       domain_selected: 0,
+      #[cfg(windows)]
+      iis: IisViewModel::default(),
       logs: LogViewModel::default(),
       settings: SettingsViewModel::default(),
       snapshot: GuiStateSnapshot {
@@ -304,6 +388,8 @@ impl TuiModel {
         let len = self.filtered_domains().len();
         move_index(&mut self.domain_selected, len, delta);
       }
+      #[cfg(windows)]
+      View::IisHandoff => self.iis.move_selection(delta),
       View::Settings => self.settings.move_severity_selection(delta),
       _ => {}
     }
@@ -319,6 +405,8 @@ impl TuiModel {
         let len = self.filtered_domains().len();
         clamp_index(&mut self.domain_selected, len);
       }
+      #[cfg(windows)]
+      View::IisHandoff => self.iis.clamp(),
       View::Settings => self.settings.clamp(),
       _ => {}
     }
@@ -329,6 +417,8 @@ impl TuiModel {
     let domain_len = self.filtered_domains().len();
     clamp_index(&mut self.entrypoint_selected, entrypoint_len);
     clamp_index(&mut self.domain_selected, domain_len);
+    #[cfg(windows)]
+    self.iis.clamp();
     self.settings.clamp();
   }
 
@@ -531,17 +621,27 @@ mod tests {
 
   #[test]
   fn view_titles_indices_and_wrapping_navigation_are_stable() {
-    assert_eq!(
-      View::ALL.map(|view| (view.title(), view.index())),
-      [
-        ("Overview", 0),
-        ("Entrypoints", 1),
-        ("Domains", 2),
-        ("Logs", 3),
-        ("Settings", 4),
-        ("Diagnostics", 5),
-      ]
-    );
+    #[cfg(windows)]
+    let expected = [
+      ("Overview", 0),
+      ("Entrypoints", 1),
+      ("Domains", 2),
+      ("IIS Handoff", 3),
+      ("Logs", 4),
+      ("Settings", 5),
+      ("Diagnostics", 6),
+    ];
+    #[cfg(not(windows))]
+    let expected = [
+      ("Overview", 0),
+      ("Entrypoints", 1),
+      ("Domains", 2),
+      ("Logs", 3),
+      ("Settings", 4),
+      ("Diagnostics", 5),
+    ];
+
+    assert_eq!(View::ALL.map(|view| (view.title(), view.index())), expected);
 
     let mut model = TuiModel::default();
     model.previous_view();
@@ -560,6 +660,69 @@ mod tests {
     assert_eq!(model.domain_selected, 1);
     model.move_selection(-10);
     assert_eq!(model.domain_selected, 0);
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn iis_selection_clamps_to_discovered_bindings() {
+    let mut model = TuiModel {
+      view: View::IisHandoff,
+      ..TuiModel::default()
+    };
+    model.iis.bindings = vec![
+      cadder_protocol::IisBinding {
+        identity: cadder_protocol::IisBindingIdentity {
+          binding_id: "one".to_string(),
+          site_name: "Default Web Site".to_string(),
+          protocol: "http".to_string(),
+          binding_information: "*:80:app.localhost".to_string(),
+        },
+        ip_address: "*".to_string(),
+        port: 80,
+        host_header: "app.localhost".to_string(),
+        domain_key: Some("app.localhost".to_string()),
+        handoff_state: cadder_protocol::IisHandoffState::Available,
+        issue: None,
+        restore_metadata: None,
+      },
+      cadder_protocol::IisBinding {
+        identity: cadder_protocol::IisBindingIdentity {
+          binding_id: "two".to_string(),
+          site_name: "Default Web Site".to_string(),
+          protocol: "https".to_string(),
+          binding_information: "*:443:secure.localhost".to_string(),
+        },
+        ip_address: "*".to_string(),
+        port: 443,
+        host_header: "secure.localhost".to_string(),
+        domain_key: Some("secure.localhost".to_string()),
+        handoff_state: cadder_protocol::IisHandoffState::Unsupported,
+        issue: None,
+        restore_metadata: None,
+      },
+    ];
+
+    model.move_selection(10);
+    assert_eq!(model.iis.selected, 1);
+    model.iis.bindings.pop();
+    model.clamp_current_selection();
+    assert_eq!(model.iis.selected, 0);
+  }
+
+  #[cfg(not(windows))]
+  #[test]
+  fn iis_view_is_absent_on_non_windows() {
+    assert_eq!(
+      View::ALL.map(|view| view.title()),
+      [
+        "Overview",
+        "Entrypoints",
+        "Domains",
+        "Logs",
+        "Settings",
+        "Diagnostics"
+      ]
+    );
   }
 
   #[test]
