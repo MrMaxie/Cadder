@@ -1,4 +1,4 @@
-![Cadder banner](assets/banner.png)
+![Cadder banner](assets/banner.webp)
 
 # Cadder
 
