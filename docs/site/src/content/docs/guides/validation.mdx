@@ -14,6 +14,21 @@ cargo run -p xtask -- check
 
 `cargo run -p xtask -- check` is the single repository validation command. Focused commands are useful while iterating, but full validation should pass before closeout.
 
+## Docker end-to-end checks
+
+The Testcontainers suite is separate from the default Rust validation path. It requires a running Docker daemon, the Docker CLI on `PATH`, and permission to pull the official `caddy:2.10.0-alpine` image. It does not require a host-global Caddy installation.
+
+Build the host Cadder binaries first, then run the ignored Docker-required test target:
+
+```sh
+cargo build -p cadderd -p cadder-shim
+cargo test -p cadder-daemon --features docker-e2e --test testcontainers_e2e -- --ignored --test-threads=1
+```
+
+The suite runs host `cadderd` and the PATH-facing `caddy` shim against real Caddy inside a disposable Testcontainers-managed container. It uses a unique `CADDER_RUNTIME_DIR`, bind-mounted temporary files, dynamic mapped ports, and automatic container cleanup. The existing `ipc_lifecycle` tests remain the fast fake-Caddy lifecycle coverage and continue to run under `cargo test --workspace`.
+
+When Docker is unavailable, the suite stays skipped by default because the test target requires the `docker-e2e` feature and the test itself is ignored. The explicit command above should fail loudly if Docker or the Docker CLI cannot be reached.
+
 ## Documentation checks
 
 Run documentation checks from `docs/site`:

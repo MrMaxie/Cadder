@@ -120,6 +120,19 @@ cargo run -p xtask -- check
 
 Focused tests are appropriate while iterating. Full validation should pass before closeout.
 
+The Docker/Testcontainers end-to-end suite is intentionally separate from the default Cargo test
+path because it requires a running Docker daemon and the Docker CLI. It runs compiled host Cadder
+binaries while real Caddy runs in an official disposable Caddy container:
+
+```sh
+cargo build -p cadderd -p cadder-shim
+cargo test -p cadder-daemon --features docker-e2e --test testcontainers_e2e -- --ignored --test-threads=1
+```
+
+The suite uses a unique `CADDER_RUNTIME_DIR`, Testcontainers-managed container lifecycle, dynamic
+host port mappings, and a wrapper command that delegates Caddy operations into the container. It
+must not require a machine-global Caddy installation.
+
 Cadder uses `cargo-llvm-cov 0.8.7` as the canonical Rust workspace coverage tool. On Windows, the canonical gate uses `stable-x86_64-pc-windows-msvc` because GNU coverage can fail without the profiler runtime. The executable gate is:
 
 ```sh

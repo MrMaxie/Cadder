@@ -9,8 +9,26 @@ permissions:
   contents: read
 
 jobs:
+  docker-e2e:
+    name: Docker E2E preflight
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check Docker
+        run: docker version
+
+      - name: Build Cadder binaries
+        run: cargo build -p cadderd -p cadder-shim
+
+      - name: Run Testcontainers end-to-end suite
+        run: cargo test -p cadder-daemon --features docker-e2e --test testcontainers_e2e -- --ignored --test-threads=1
+
   package:
     name: Package ${{ matrix.platform }}
+    needs: docker-e2e
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

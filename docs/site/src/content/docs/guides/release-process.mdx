@@ -17,6 +17,15 @@ cargo test --workspace
 
 The automated tests use repository fake Caddy fixtures. CI does not install or require a machine-global real Caddy binary.
 
+The workflow also includes a Docker-enabled Ubuntu end-to-end job:
+
+```sh
+cargo build -p cadderd -p cadder-shim
+cargo test -p cadder-daemon --features docker-e2e --test testcontainers_e2e -- --ignored --test-threads=1
+```
+
+That job runs compiled host Cadder binaries against real Caddy inside an official Testcontainers-managed Caddy container. It gates release readiness separately from the cross-platform fake-Caddy matrix so local `cargo test --workspace` remains Docker-free.
+
 The same workflow also runs a dedicated coverage job on `windows-latest` with `stable-x86_64-pc-windows-msvc`. That job installs `cargo-llvm-cov 0.8.7` and runs the project-owned gate:
 
 ```sh
@@ -77,6 +86,8 @@ The release process does not edit `PATH`, install services, write shell profiles
 - `ubuntu-latest` for `x86_64-unknown-linux-gnu`
 - `macos-15-intel` for `x86_64-apple-darwin`
 - `macos-15` for `aarch64-apple-darwin`
+
+Before packaging starts, the release workflow reruns the Docker/Testcontainers end-to-end preflight on Ubuntu. The `package` job depends on that preflight, so tag publishing cannot create portable artifacts unless the real-Caddy container-backed suite passes.
 
 The workflow uploads the archives as workflow artifacts, then publishes the same archive and checksum files to the matching GitHub Release with `gh release`.
 

@@ -325,6 +325,7 @@ pub struct CaddyConfigCoordinator {
   adapter: CaddyConfigAdapter,
   runtime: ProcessRuntime,
   routes: BTreeMap<String, Vec<Value>>,
+  registration_diagnostics: BTreeMap<String, Vec<ConfigDiagnostic>>,
   current: ConfigState,
 }
 
@@ -334,6 +335,7 @@ impl CaddyConfigCoordinator {
       adapter,
       runtime,
       routes: BTreeMap::new(),
+      registration_diagnostics: BTreeMap::new(),
       current: ConfigState::idle(),
     }
   }
@@ -353,26 +355,35 @@ impl CaddyConfigCoordinator {
     let source_path = registration.source_config_path.raw.clone();
     let prepared = self.adapter.prepare(registration).await;
     if prepared.diagnostics.is_empty() {
+      self
+        .registration_diagnostics
+        .remove(&prepared.registration.registration_id);
       self.routes.insert(
         prepared.registration.registration_id.clone(),
         prepared.routes,
       );
     } else {
+      self.routes.remove(&prepared.registration.registration_id);
+      let diagnostics = prepared
+        .diagnostics
+        .into_iter()
+        .map(|mut diagnostic| {
+          if diagnostic.source_config_paths.is_empty() {
+            diagnostic.source_config_paths = vec![source_path.clone()];
+          }
+          diagnostic
+        })
+        .collect::<Vec<_>>();
+      self.registration_diagnostics.insert(
+        prepared.registration.registration_id.clone(),
+        diagnostics.clone(),
+      );
       self.current = ConfigState {
         status: ConfigApplyStatus::Failed,
         last_attempted_at_utc: Some(Utc::now()),
         last_successful_reload_at_utc: self.current.last_successful_reload_at_utc,
         effective_config_hash: self.current.effective_config_hash.clone(),
-        diagnostics: prepared
-          .diagnostics
-          .into_iter()
-          .map(|mut diagnostic| {
-            if diagnostic.source_config_paths.is_empty() {
-              diagnostic.source_config_paths = vec![source_path.clone()];
-            }
-            diagnostic
-          })
-          .collect(),
+        diagnostics,
       };
     }
     prepared.registration
@@ -383,7 +394,29 @@ impl CaddyConfigCoordinator {
     registrations: &[EntrypointRegistration],
     logs: &CaddyLogStore,
   ) -> ConfigState {
-    let diagnostics = detect_conflicts(registrations);
+    let active_registration_ids = registrations
+      .iter()
+      .map(|registration| registration.registration_id.clone())
+      .collect::<BTreeSet<_>>();
+    self
+      .routes
+      .retain(|registration_id, _| active_registration_ids.contains(registration_id));
+    self
+      .registration_diagnostics
+      .retain(|registration_id, _| active_registration_ids.contains(registration_id));
+
+    let enabled_registration_ids = registrations
+      .iter()
+      .filter(|registration| registration.activation_state.is_enabled())
+      .map(|registration| registration.registration_id.clone())
+      .collect::<BTreeSet<_>>();
+    let mut diagnostics = self
+      .registration_diagnostics
+      .iter()
+      .filter(|(registration_id, _)| enabled_registration_ids.contains(*registration_id))
+      .flat_map(|(_, diagnostics)| diagnostics.iter().cloned())
+      .collect::<Vec<_>>();
+    diagnostics.extend(detect_conflicts(registrations));
     let attempted = Utc::now();
     if !diagnostics.is_empty() {
       self.current = ConfigState {

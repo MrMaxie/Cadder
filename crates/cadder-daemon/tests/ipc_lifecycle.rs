@@ -238,6 +238,77 @@ async fn conflict_reporting_includes_domain_and_source_paths() {
 }
 
 #[tokio::test]
+async fn adapt_failure_reports_diagnostic_after_registration_apply() {
+  let fixture = include_str!("fixtures/SmarketingReverseProxy.Caddyfile");
+  let harness = Harness::start(FakeCaddy::new(fixture).fail_adapt()).await;
+  let mut session = CadderSession::connect(&harness.paths).await.unwrap();
+
+  let response = register_on_session(
+    &mut session,
+    registration("shim-1", "nonce-1", &harness.config_path),
+  )
+  .await;
+
+  assert!(response.accepted, "{}", response.message);
+  let snapshot = query_state(&harness.client).await;
+  assert_eq!(snapshot.registrations.len(), 1);
+  assert!(snapshot.registrations[0].registered_domains.is_empty());
+  assert_eq!(snapshot.config.status, ConfigApplyStatus::Failed);
+  assert_eq!(snapshot.config.diagnostics.len(), 1);
+  assert_eq!(snapshot.config.diagnostics[0].code, "adapt-failed");
+  assert_eq!(
+    snapshot.config.diagnostics[0].source_config_paths,
+    vec![harness.config_path.display().to_string()]
+  );
+  harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn disabled_adapt_failure_does_not_block_effective_config() {
+  let fixture = include_str!("fixtures/SmarketingReverseProxy.Caddyfile");
+  let harness = Harness::start(FakeCaddy::new(fixture).fail_adapt()).await;
+  let mut session = CadderSession::connect(&harness.paths).await.unwrap();
+
+  assert!(
+    register_on_session(
+      &mut session,
+      registration("shim-1", "nonce-1", &harness.config_path),
+    )
+    .await
+    .accepted
+  );
+  assert_eq!(
+    query_state(&harness.client).await.config.status,
+    ConfigApplyStatus::Failed
+  );
+
+  let disabled: BasicResponse = harness
+    .client
+    .request(
+      message_types::SET_ENTRYPOINT_ENABLED_REQUEST,
+      message_types::SET_ENTRYPOINT_ENABLED_RESPONSE,
+      &SetEntrypointEnabledRequest {
+        request_id: new_request_id("test-disable-invalid-entrypoint"),
+        registration_id: "shim-1".to_string(),
+        shim_session_nonce: Some("nonce-1".to_string()),
+        enabled: false,
+      },
+    )
+    .await
+    .unwrap();
+  let snapshot = query_state(&harness.client).await;
+
+  assert!(disabled.accepted, "{}", disabled.message);
+  assert_eq!(
+    snapshot.registrations[0].activation_state,
+    ActivationState::Inactive
+  );
+  assert_eq!(snapshot.config.status, ConfigApplyStatus::Idle);
+  assert!(snapshot.config.diagnostics.is_empty());
+  harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn runtime_reload_failure_reports_diagnostic_and_control_log() {
   let fixture = include_str!("fixtures/SmarketingReverseProxy.Caddyfile");
   let harness = Harness::start(FakeCaddy::new(fixture).fail_reload()).await;
@@ -564,6 +635,7 @@ impl Harness {
 #[derive(Debug, Clone, Copy)]
 struct FakeCaddy<'a> {
   caddyfile: &'a str,
+  fail_adapt: bool,
   fail_reload: bool,
 }
 
@@ -571,8 +643,14 @@ impl<'a> FakeCaddy<'a> {
   fn new(caddyfile: &'a str) -> Self {
     Self {
       caddyfile,
+      fail_adapt: false,
       fail_reload: false,
     }
+  }
+
+  fn fail_adapt(mut self) -> Self {
+    self.fail_adapt = true;
+    self
   }
 
   fn fail_reload(mut self) -> Self {
@@ -629,6 +707,11 @@ async fn wait_for_command_log(path: &Path, command: &str) {
 
 fn write_fake_caddy(dir: &Path, command_log_path: &Path, fake_caddy: FakeCaddy<'_>) -> PathBuf {
   const ADAPTED_JSON: &str = r#"{"apps":{"http":{"servers":{"srv0":{"routes":[{"match":[{"host":["api.smarketing.localhost","app.smarketing.localhost","mailbox.smarketing.localhost","storage.smarketing.localhost"]}],"handle":[{"handler":"static_response","body":"ok"}],"terminal":true}]}}}}}"#;
+  let adapt_failure = if fake_caddy.fail_adapt {
+    "adapt failed"
+  } else {
+    ""
+  };
   let reload_failure = if fake_caddy.fail_reload {
     "reload failed"
   } else {
@@ -643,6 +726,10 @@ fn write_fake_caddy(dir: &Path, command_log_path: &Path, fake_caddy: FakeCaddy<'
         r#"@echo off
 echo %*>> "{command_log}"
 if "%1"=="adapt" (
+  if not "{adapt_failure}"=="" (
+    echo {adapt_failure} 1>&2
+    exit 6
+  )
   echo {adapted_json}
   exit 0
 )
@@ -661,6 +748,7 @@ exit 0
 "#,
         command_log = command_log_path.display(),
         adapted_json = ADAPTED_JSON,
+        adapt_failure = adapt_failure,
         reload_failure = reload_failure,
       ),
     )
@@ -678,6 +766,10 @@ exit 0
         r#"#!/usr/bin/env sh
 printf '%s\n' "$*" >> '{command_log}'
 if [ "$1" = "adapt" ]; then
+  if [ -n '{adapt_failure}' ]; then
+    printf '%s\n' '{adapt_failure}' >&2
+    exit 6
+  fi
   printf '%s\n' '{adapted_json}'
   exit 0
 fi
@@ -693,6 +785,7 @@ exit 0
 "#,
         command_log = command_log_path.display(),
         adapted_json = ADAPTED_JSON,
+        adapt_failure = adapt_failure,
         reload_failure = reload_failure,
       ),
     )

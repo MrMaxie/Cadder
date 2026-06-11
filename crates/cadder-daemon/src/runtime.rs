@@ -3,12 +3,13 @@ use anyhow::{Context, Result};
 use cadder_protocol::{
   LogAttributionKind, LogSeverity, LogStreamIdentity, RuntimeState, RuntimeStatus,
 };
-use std::{path::PathBuf, process::Stdio, sync::Arc};
+use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 use tokio::{
   fs,
   io::{AsyncBufReadExt, BufReader},
   process::{Child, Command},
   sync::Mutex,
+  time::timeout,
 };
 
 use crate::caddy::RealCaddyResolver;
@@ -128,11 +129,31 @@ impl ProcessRuntime {
   pub async fn stop(&self) -> Result<()> {
     let mut child = self.child.lock().await;
     if let Some(mut child) = child.take() {
+      if let Ok(binary) = self.resolver.resolve() {
+        let _ = request_graceful_stop(binary).await;
+      }
       let _ = child.kill().await;
       let _ = child.wait().await;
     }
     Ok(())
   }
+}
+
+async fn request_graceful_stop(binary: PathBuf) -> Result<()> {
+  let mut command = Command::new(binary);
+  command
+    .arg("stop")
+    .arg("--address")
+    .arg("localhost:2019")
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .kill_on_drop(true);
+  let mut child = command.spawn().context("start caddy stop")?;
+  if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+  }
+  Ok(())
 }
 
 fn spawn_log_reader<R>(reader: R, logs: CaddyLogStore, channel: &'static str)
