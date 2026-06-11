@@ -370,7 +370,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "cadder-daemon"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "cadder-protocol",
@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "cadder-protocol"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "serde",
@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "cadder-shim"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "cadder-daemon",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "cadder-tui"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "cadder-daemon",
@@ -428,7 +428,7 @@ dependencies = [
 
 [[package]]
 name = "cadderd"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "cadder-daemon",
@@ -4097,7 +4097,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "flate2",

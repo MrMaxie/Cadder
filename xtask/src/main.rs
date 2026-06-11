@@ -14,6 +14,7 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 const COVERAGE_FAIL_UNDER_LINES: &str = "85";
 const DEFAULT_COVERAGE_REPORT_PATH: &str = "target/llvm-cov/coverage-summary.json";
 const WINDOWS_COVERAGE_TOOLCHAIN: &str = "stable-x86_64-pc-windows-msvc";
+const WORKSPACE_MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../Cargo.toml");
 const SAMPLE_CADDER_TOML: &str = r#"# Cadder portable configuration.
 # Uncomment and set this when the real Caddy binary is not the first safe `caddy` on PATH.
 #
@@ -447,11 +448,53 @@ impl PackageOptions {
   fn parse(args: Vec<String>) -> Result<Self> {
     Ok(Self {
       out_dir: required_path_option(&args, "--out")?,
-      version: required_string_option(&args, "--version")?,
+      version: optional_string_option(&args, "--version")?
+        .map_or_else(workspace_package_version, Ok)?,
       platform: required_string_option(&args, "--platform")?,
       target: optional_string_option(&args, "--target")?,
     })
   }
+}
+
+fn workspace_package_version() -> Result<String> {
+  workspace_package_version_from_manifest(Path::new(WORKSPACE_MANIFEST))
+}
+
+fn workspace_package_version_from_manifest(manifest: &Path) -> Result<String> {
+  let contents =
+    fs::read_to_string(manifest).with_context(|| format!("read {}", manifest.display()))?;
+  let mut in_workspace_package = false;
+
+  for line in contents.lines() {
+    let trimmed = line.split('#').next().unwrap_or_default().trim();
+    if trimmed.is_empty() {
+      continue;
+    }
+
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+      in_workspace_package = trimmed == "[workspace.package]";
+      continue;
+    }
+
+    if in_workspace_package
+      && let Some((key, value)) = trimmed.split_once('=')
+      && key.trim() == "version"
+    {
+      let version = value.trim().trim_matches('"');
+      if version.is_empty() {
+        bail!(
+          "workspace package version is empty in {}",
+          manifest.display()
+        );
+      }
+      return Ok(version.to_string());
+    }
+  }
+
+  bail!(
+    "workspace package version not found in {}",
+    manifest.display()
+  )
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -554,6 +597,44 @@ mod tests {
         target: Some("x86_64-unknown-linux-gnu".to_string())
       }
     );
+  }
+
+  #[test]
+  fn package_options_default_to_workspace_package_version() {
+    let options = PackageOptions::parse(vec![
+      "--out".to_string(),
+      "target/artifacts".to_string(),
+      "--platform".to_string(),
+      "linux-x64".to_string(),
+    ])
+    .unwrap();
+
+    assert_eq!(options.version, workspace_package_version().unwrap());
+  }
+
+  #[test]
+  fn workspace_package_version_from_manifest_reads_workspace_package_version() {
+    let dir = unique_temp_dir("workspace-version");
+    let manifest = dir.join("Cargo.toml");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+      &manifest,
+      r#"
+[package]
+name = "sample"
+version = "0.1.0"
+
+[workspace.package]
+version = "1.2.3"
+edition = "2024"
+"#,
+    )
+    .unwrap();
+
+    let version = workspace_package_version_from_manifest(&manifest).unwrap();
+
+    assert_eq!(version, "1.2.3");
+    fs::remove_dir_all(&dir).unwrap();
   }
 
   #[test]

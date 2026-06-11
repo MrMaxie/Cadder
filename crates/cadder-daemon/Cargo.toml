@@ -1,7 +1,9 @@
 [package]
 name = "cadder-daemon"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [features]
 docker-e2e = []
@@ -13,7 +15,7 @@ required-features = ["docker-e2e"]
 
 [dependencies]
 anyhow = "1.0.102"
-cadder-protocol = { version = "0.1.0", path = "../cadder-protocol" }
+cadder-protocol = { version = "0.8.0", path = "../cadder-protocol" }
 chrono = { version = "0.4.45", features = ["serde"] }
 directories = "6.0.0"
 figment = { version = "0.10.19", features = ["toml", "env"] }

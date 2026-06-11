@@ -8,8 +8,8 @@ description = "Cadder terminal UI for daemon state, domains, logs, and diagnosti
 
 [dependencies]
 anyhow = "1.0.102"
-cadder-daemon = { version = "0.1.0", path = "../cadder-daemon" }
-cadder-protocol = { version = "0.1.0", path = "../cadder-protocol" }
+cadder-daemon = { version = "0.8.0", path = "../cadder-daemon" }
+cadder-protocol = { version = "0.8.0", path = "../cadder-protocol" }
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"

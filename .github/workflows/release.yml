@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version string for package-only dry runs.
+        description: Optional version override for package-only dry runs.
         required: false
-        default: 0.0.0-dev
+        default: ''
 
 permissions:
   contents: read
@@ -23,6 +23,9 @@ jobs:
       version: ${{ steps.release.outputs.version }}
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
       - name: Validate version
         id: release
         shell: bash
@@ -30,22 +33,23 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
+          manifest_version="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            version="$INPUT_VERSION"
+            version="${INPUT_VERSION:-$manifest_version}"
             publish="false"
           else
-            version="${GITHUB_REF_NAME#v}"
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [[ "$tag_version" != "$manifest_version" ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match workspace package version $manifest_version."
+              exit 1
+            fi
+            version="$manifest_version"
             publish="true"
           fi
 
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::Release versions must use semantic versions like 1.0.0 or 1.0.0-rc.1."
-            exit 1
-          fi
-
-          major="${version%%.*}"
-          if [[ "$publish" == "true" && "$major" == "0" ]]; then
-            echo "::error::Cadder is pre-1.0. The release workflow will not publish GitHub Releases for v0.* tags."
             exit 1
           fi
 
