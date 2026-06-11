@@ -5,7 +5,7 @@ status: Done
 assignee:
   - Codex
 created_date: '2026-06-11 07:47'
-updated_date: '2026-06-11 14:27'
+updated_date: '2026-06-11 14:43'
 labels:
   - windows
   - iis
@@ -142,6 +142,8 @@ Review follow-up fixed several issues before commit: generated Caddy config now 
 Documentation was moved into a dedicated Windows IIS cookbook page and the general Windows guide now links to it. The architecture notes and TUI smoke checklist describe the proxy model, elevated same-context requirement, route-host input, rollback expectations, and restore constraints.
 
 Validation completed before commit: `cargo fmt --check`, `cargo test -p cadder-protocol`, focused IIS daemon/TUI tests, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p cadder-daemon`, `cargo test -p cadder-tui`, `cargo test --workspace`, `cargo run -p xtask -- check`, `bun run check`, `bun run build`, and `cargo run -p xtask -- coverage`. Coverage remained above the project threshold at 85.49698400209807% lines covered (6520/7626).
+
+CI regression fix: GitHub Actions on Linux/macOS failed after the IIS handoff work because cadder-tui imported IIS-only protocol types unconditionally while using them only behind cfg(windows). Moved the IIS request/response imports in crates/cadder-tui/src/model.rs and crates/cadder-tui/src/main.rs behind cfg(windows). Validation passed locally: cargo fmt --check; cargo clippy --workspace --all-targets -- -D warnings; cargo clippy -p cadder-tui --target x86_64-unknown-linux-gnu --all-targets -- -D warnings; cargo test --workspace; cargo run -p xtask -- check.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

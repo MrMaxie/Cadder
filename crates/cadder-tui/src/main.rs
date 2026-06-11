@@ -6,10 +6,13 @@ use cadder_daemon::{
 };
 use cadder_protocol::{
   ActivationState, BasicResponse, ConfigApplyStatus, GuiStateSnapshot, LogEntry, LogSeverity,
-  LogStreamIdentity, LogStreamStatus, QueryIisBindingsRequest, QueryIisBindingsResponse,
-  QueryLogsRequest, QueryLogsResponse, QueryStateRequest, QueryStateResponse, RuntimeStatus,
-  SetDomainEnabledRequest, SetEntrypointEnabledRequest, SetIisHandoffRequest,
-  SetIisHandoffResponse, ShutdownDaemonRequest, message_types, new_request_id,
+  LogStreamIdentity, LogStreamStatus, QueryLogsRequest, QueryLogsResponse, QueryStateRequest,
+  QueryStateResponse, RuntimeStatus, SetDomainEnabledRequest, SetEntrypointEnabledRequest,
+  ShutdownDaemonRequest, message_types, new_request_id,
+};
+#[cfg(windows)]
+use cadder_protocol::{
+  QueryIisBindingsRequest, QueryIisBindingsResponse, SetIisHandoffRequest, SetIisHandoffResponse,
 };
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};

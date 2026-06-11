@@ -1,7 +1,9 @@
 use cadder_protocol::{
-  EntrypointRegistration, GuiStateSnapshot, IisBinding, LogEntry, LogSeverity, LogStreamIdentity,
-  LogStreamStatus, QueryIisBindingsResponse, RegisteredDomain,
+  EntrypointRegistration, GuiStateSnapshot, LogEntry, LogSeverity, LogStreamIdentity,
+  LogStreamStatus, RegisteredDomain,
 };
+#[cfg(windows)]
+use cadder_protocol::{IisBinding, QueryIisBindingsResponse};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
