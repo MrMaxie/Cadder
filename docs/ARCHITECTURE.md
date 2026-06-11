@@ -90,7 +90,9 @@ The log store reports stream status and retention metadata in `query-logs-respon
 - `caddy`
 - `cadder.toml`
 
-On Windows the binaries include the `.exe` suffix. `cargo run -p xtask -- verify-dist --dir <dir>` checks the expected files and runs `caddy --cadder-shim-info` from the layout. The packaging workflow does not modify PATH, shell profiles, package-manager shims, OS services, or other system state.
+On Windows the binaries include the `.exe` suffix. `cargo run -p xtask -- verify-dist --dir <dir>` checks the expected files and runs `caddy --cadder-shim-info` from the layout. `cargo run -p xtask -- package --out <dir> --version <version> --platform <platform> --target <triple>` builds the target-specific layout, wraps it in a versioned portable archive, and writes a neighboring `.sha256` checksum file. Windows artifacts are `.zip` archives; Linux and macOS artifacts are `.tar.gz` archives.
+
+The packaging workflow does not modify PATH, shell profiles, package-manager shims, OS services, or other system state.
 
 Image assets under `assets/` are documentation and release artwork only. They are not copied into the runtime layout and are not required by the daemon, shim, TUI, or verification commands.
 

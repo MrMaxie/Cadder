@@ -5,3 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
+flate2 = "=1.1.9"
+hex = "=0.4.3"
+sha2 = "=0.11.0"
+tar = "=0.4.46"
+zip = { version = "=6.0.0", default-features = false, features = ["deflate-flate2"] }

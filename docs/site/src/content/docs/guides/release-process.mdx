@@ -1,13 +1,25 @@
 ---
 title: Release process
-description: Portable layout expectations and documentation publishing handoff for CI.
+description: Portable layout, archive naming, and GitHub Actions publishing.
 ---
 
-Cadder releases should publish portable binaries and documentation generated from source.
+Cadder releases publish portable binaries and documentation generated from source. They do not publish OS installers or mutate machine-global state.
+
+## Rust CI
+
+`.github/workflows/ci.yml` runs on pushes to `main`, pull requests, and manual dispatch. It validates the Rust workspace on Windows, Linux, and macOS with:
+
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+The automated tests use repository fake Caddy fixtures. CI does not install or require a machine-global real Caddy binary.
 
 ## Portable artifact
 
-Build the platform layout with:
+Build the current platform layout with:
 
 ```sh
 cargo run -p xtask -- dist --out <output-dir>
@@ -28,18 +40,47 @@ Verify the layout with:
 cargo run -p xtask -- verify-dist --dir <output-dir>
 ```
 
-The release process should not imply that Cadder edits `PATH`, installs services, writes shell profiles, or replaces package-manager shims.
+Build a versioned release archive with:
 
-## Documentation build handoff
+```sh
+cargo run -p xtask -- package \
+  --out artifacts \
+  --version <version> \
+  --platform <platform> \
+  --target <rust-target>
+```
 
-CI for documentation publishing should:
+Release archives are named:
 
-1. Run on `push` to `main`.
-2. Install Bun.
-3. Run `bun install --frozen-lockfile` in `docs/site`.
-4. Run `bun run check`.
-5. Run `bun run build`.
-6. Publish or upload `docs/site/dist`.
-7. Avoid committing generated documentation output back to the repository.
+- `cadder-<version>-windows-x64.zip`
+- `cadder-<version>-linux-x64.tar.gz`
+- `cadder-<version>-macos-x64.tar.gz`
+- `cadder-<version>-macos-arm64.tar.gz`
 
-TASK-1.15 owns the GitHub Actions implementation. This page records the expected contract without claiming that publishing already exists.
+Each archive has a neighboring `.sha256` file.
+
+The release process does not edit `PATH`, install services, write shell profiles, replace package-manager shims, use WinUI, require Windows App SDK, create MSIX packages, use NuGet, or depend on the .NET SDK.
+
+## Release publishing
+
+`.github/workflows/release.yml` runs for tags that match `v*`. It builds native portable archives on these GitHub-hosted runners:
+
+- `windows-latest` for `x86_64-pc-windows-msvc`
+- `ubuntu-latest` for `x86_64-unknown-linux-gnu`
+- `macos-15-intel` for `x86_64-apple-darwin`
+- `macos-15` for `aarch64-apple-darwin`
+
+The workflow uploads the archives as workflow artifacts, then publishes the same archive and checksum files to the matching GitHub Release with `gh release`.
+
+## Documentation publishing
+
+`.github/workflows/docs.yml` runs on pushes to `main` that affect documentation and on manual dispatch. It:
+
+1. Installs Bun.
+2. Runs `bun install --frozen-lockfile` in `docs/site`.
+3. Runs `bun run check`.
+4. Runs `bun run build`.
+5. Uploads `docs/site/dist` as a Pages artifact.
+6. Deploys the artifact to GitHub Pages.
+
+Repository Pages settings must use GitHub Actions as the publishing source. Generated documentation output remains outside git.

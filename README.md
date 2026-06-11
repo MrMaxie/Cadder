@@ -62,6 +62,18 @@ cargo run -p xtask -- verify-dist --dir .local/dist/cadder
 
 `verify-dist` checks the expected files and runs the layout's `caddy --cadder-shim-info` command to confirm that the copied `caddy` executable is the Cadder shim.
 
+Build a versioned portable archive for release automation:
+
+```sh
+cargo run -p xtask -- package \
+  --out artifacts \
+  --version 0.1.0 \
+  --platform linux-x64 \
+  --target x86_64-unknown-linux-gnu
+```
+
+The package command creates `cadder-<version>-<platform>.zip` for Windows and `cadder-<version>-<platform>.tar.gz` for Linux/macOS, plus a matching `.sha256` file.
+
 ## Real Caddy resolution
 
 Cadder never embeds Caddy. It resolves the real Caddy command in this order:
