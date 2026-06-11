@@ -5,9 +5,9 @@ status: Done
 assignee:
   - '@agent'
 created_date: '2026-06-09 18:45'
-updated_date: '2026-06-11 02:51'
+updated_date: '2026-06-11 16:18'
 labels: []
-milestone: m-1
+milestone: v1.0
 dependencies:
   - TASK-1.11
   - TASK-1.16

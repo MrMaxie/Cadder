@@ -211,6 +211,27 @@ enum IisProviderInner {
   Fake(Arc<Mutex<FakeIisProviderState>>),
 }
 
+#[derive(Debug, Clone)]
+pub enum IisMutation {
+  Add(IisBindingRecord),
+  Remove(IisBindingRecord),
+  Restore(IisBindingRecord),
+}
+
+impl IisMutation {
+  pub fn add(binding: IisBindingRecord) -> Self {
+    Self::Add(binding)
+  }
+
+  pub fn remove(binding: IisBindingRecord) -> Self {
+    Self::Remove(binding)
+  }
+
+  pub fn restore(binding: IisBindingRecord) -> Self {
+    Self::Restore(binding)
+  }
+}
+
 impl Default for IisProvider {
   fn default() -> Self {
     Self::system()
@@ -232,6 +253,7 @@ impl IisProvider {
         fail_discovery: None,
         fail_remove: None,
         fail_restore: None,
+        elevation_issue: None,
       }))),
     }
   }
@@ -268,6 +290,18 @@ impl IisProvider {
     }
   }
 
+  pub async fn execute_privileged_batch(
+    &self,
+    reason: &str,
+    mutations: &[IisMutation],
+  ) -> Result<(), IisIssue> {
+    match &self.inner {
+      IisProviderInner::System => system_execute_privileged_batch(reason, mutations).await,
+      #[cfg(test)]
+      IisProviderInner::Fake(state) => state.lock().await.execute_privileged_batch(mutations),
+    }
+  }
+
   #[cfg(test)]
   pub async fn set_fail_remove(&self, issue: IisIssue) {
     if let IisProviderInner::Fake(state) = &self.inner {
@@ -281,6 +315,13 @@ impl IisProvider {
       state.lock().await.fail_restore = Some(issue);
     }
   }
+
+  #[cfg(test)]
+  pub async fn set_elevation_issue(&self, issue: IisIssue) {
+    if let IisProviderInner::Fake(state) = &self.inner {
+      state.lock().await.elevation_issue = Some(issue);
+    }
+  }
 }
 
 #[cfg(test)]
@@ -290,6 +331,7 @@ struct FakeIisProviderState {
   fail_discovery: Option<IisIssue>,
   fail_remove: Option<IisIssue>,
   fail_restore: Option<IisIssue>,
+  elevation_issue: Option<IisIssue>,
 }
 
 #[cfg(test)]
@@ -335,6 +377,20 @@ impl FakeIisProviderState {
     }
     Ok(())
   }
+
+  fn execute_privileged_batch(&mut self, mutations: &[IisMutation]) -> Result<(), IisIssue> {
+    if let Some(issue) = &self.elevation_issue {
+      return Err(issue.clone());
+    }
+    for mutation in mutations {
+      match mutation {
+        IisMutation::Add(binding) => self.add_binding(binding)?,
+        IisMutation::Remove(binding) => self.remove_binding(binding)?,
+        IisMutation::Restore(binding) => self.restore_binding(binding)?,
+      }
+    }
+    Ok(())
+  }
 }
 
 #[cfg(windows)]
@@ -347,7 +403,12 @@ Import-Module WebAdministration -ErrorAction Stop
 Get-WebBinding | ForEach-Object {
   $certificateHash = $null
   if ($_.certificateHash) {
-    $certificateHash = ($_.certificateHash | ForEach-Object { $_.ToString('x2') }) -join ''
+    if ($_.certificateHash -is [byte[]]) {
+      $certificateHashParts = foreach ($byte in $_.certificateHash) { '{0:x2}' -f $byte }
+      $certificateHash = $certificateHashParts -join ''
+    } else {
+      $certificateHash = ([string]$_.certificateHash).Trim()
+    }
   }
   [PSCustomObject]@{
     siteName = ($_.ItemXPath -replace "^.*name='([^']+)'.*$", '$1')
@@ -383,13 +444,17 @@ async fn system_discover() -> Result<Vec<IisBindingRecord>, IisIssue> {
 
 #[cfg(windows)]
 async fn system_remove_binding(binding: &IisBindingRecord) -> Result<(), IisIssue> {
-  let script = format!(
+  run_powershell_mutation(system_remove_binding_script(binding)).await
+}
+
+#[cfg(windows)]
+fn system_remove_binding_script(binding: &IisBindingRecord) -> String {
+  format!(
     "$ErrorActionPreference = 'Stop'; Import-Module WebAdministration -ErrorAction Stop; Remove-WebBinding -Name '{}' -Protocol '{}' -BindingInformation '{}'",
     ps_escape(&binding.site_name),
     ps_escape(&binding.protocol),
     ps_escape(&binding.binding_information)
-  );
-  run_powershell_mutation(script).await
+  )
 }
 
 #[cfg(not(windows))]
@@ -402,6 +467,11 @@ async fn system_remove_binding(_binding: &IisBindingRecord) -> Result<(), IisIss
 
 #[cfg(windows)]
 async fn system_add_binding(binding: &IisBindingRecord) -> Result<(), IisIssue> {
+  run_powershell_mutation(system_add_binding_script(binding)).await
+}
+
+#[cfg(windows)]
+fn system_add_binding_script(binding: &IisBindingRecord) -> String {
   let ssl_flags = binding
     .tls_certificate
     .as_ref()
@@ -433,7 +503,7 @@ $binding.AddSslCertificate('{thumbprint}', '{store_name}')
       )
     })
     .unwrap_or_default();
-  let script = format!(
+  format!(
     r#"
 $ErrorActionPreference = 'Stop'
 Import-Module WebAdministration -ErrorAction Stop
@@ -461,8 +531,7 @@ try {{
     ssl_flags_argument = ssl_flags_argument,
     certificate_script = certificate_script,
     binding_information = ps_escape(&binding.binding_information),
-  );
-  run_powershell_mutation(script).await
+  )
 }
 
 #[cfg(not(windows))]
@@ -478,11 +547,47 @@ async fn system_restore_binding(binding: &IisBindingRecord) -> Result<(), IisIss
   system_add_binding(binding).await
 }
 
+#[cfg(windows)]
+fn system_restore_binding_script(binding: &IisBindingRecord) -> String {
+  system_add_binding_script(binding)
+}
+
 #[cfg(not(windows))]
 async fn system_restore_binding(_binding: &IisBindingRecord) -> Result<(), IisIssue> {
   Err(IisIssue::new(
     IisIssueKind::IisUnavailable,
     "IIS handoff is only available on Windows.",
+  ))
+}
+
+#[cfg(windows)]
+async fn system_execute_privileged_batch(
+  reason: &str,
+  mutations: &[IisMutation],
+) -> Result<(), IisIssue> {
+  if mutations.is_empty() {
+    return Ok(());
+  }
+  let scripts = mutations
+    .iter()
+    .map(|mutation| match mutation {
+      IisMutation::Add(binding) => system_add_binding_script(binding),
+      IisMutation::Remove(binding) => system_remove_binding_script(binding),
+      IisMutation::Restore(binding) => system_restore_binding_script(binding),
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
+  run_elevated_powershell_batch(reason, scripts).await
+}
+
+#[cfg(not(windows))]
+async fn system_execute_privileged_batch(
+  _reason: &str,
+  _mutations: &[IisMutation],
+) -> Result<(), IisIssue> {
+  Err(IisIssue::new(
+    IisIssueKind::ElevationUnsupported,
+    "IIS elevation prompts are only available on Windows.",
   ))
 }
 
@@ -502,6 +607,95 @@ async fn run_powershell_mutation(script: String) -> Result<(), IisIssue> {
     Ok(())
   } else {
     Err(classify_powershell_error(&output.stderr))
+  }
+}
+
+#[cfg(windows)]
+async fn run_elevated_powershell_batch(reason: &str, script: String) -> Result<(), IisIssue> {
+  use tokio::process::Command;
+
+  let stamp = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|duration| duration.as_nanos())
+    .unwrap_or(0);
+  let base = format!("cadder-iis-elevated-{}-{stamp}", std::process::id());
+  let temp_dir = std::env::temp_dir();
+  let script_path = temp_dir.join(format!("{base}.ps1"));
+  let status_path = temp_dir.join(format!("{base}.status"));
+  let error_path = temp_dir.join(format!("{base}.error"));
+  let elevated_script = format!(
+    r#"
+$ErrorActionPreference = 'Stop'
+try {{
+  # Cadder reason: {reason}
+  {script}
+  Set-Content -LiteralPath '{status_path}' -Value '0'
+  exit 0
+}} catch {{
+  Set-Content -LiteralPath '{error_path}' -Value $_.Exception.Message
+  Set-Content -LiteralPath '{status_path}' -Value '1'
+  exit 1
+}}
+"#,
+    reason = reason.replace('\n', " "),
+    script = script,
+    status_path = ps_escape(&status_path.display().to_string()),
+    error_path = ps_escape(&error_path.display().to_string()),
+  );
+  tokio::fs::write(&script_path, elevated_script)
+    .await
+    .map_err(provider_error)?;
+
+  let command = format!(
+    "$ErrorActionPreference = 'Stop'; $p = Start-Process -FilePath 'powershell' -Verb RunAs -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','{}'); exit $p.ExitCode",
+    ps_escape(&script_path.display().to_string())
+  );
+  let output = Command::new("powershell")
+    .arg("-NoProfile")
+    .arg("-NonInteractive")
+    .arg("-Command")
+    .arg(command)
+    .output()
+    .await
+    .map_err(provider_error)?;
+
+  let error_text = tokio::fs::read_to_string(&error_path).await.ok();
+  let _ = tokio::fs::remove_file(&script_path).await;
+  let _ = tokio::fs::remove_file(&status_path).await;
+  let _ = tokio::fs::remove_file(&error_path).await;
+
+  if output.status.success() {
+    return Ok(());
+  }
+
+  let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+  let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+  let message = error_text
+    .filter(|message| !message.trim().is_empty())
+    .unwrap_or_else(|| {
+      [stderr, stdout]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+    });
+  let lower_message = message.to_ascii_lowercase();
+  if lower_message.contains("canceled by the user")
+    || lower_message.contains("cancelled by the user")
+    || lower_message.contains("operation canceled")
+  {
+    return Err(IisIssue::new(
+      IisIssueKind::ElevationDenied,
+      "Administrator approval was denied.",
+    ));
+  }
+  if message.is_empty() {
+    Err(IisIssue::new(
+      IisIssueKind::ProviderError,
+      "Elevated IIS mutation failed without diagnostic output.",
+    ))
+  } else {
+    Err(classify_powershell_error(message.as_bytes()))
   }
 }
 
@@ -877,6 +1071,19 @@ mod tests {
       parse_powershell_bindings(b"{bad-json").unwrap_err().kind,
       IisIssueKind::ProviderError
     );
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn parses_powershell_binding_tls_metadata() {
+    let raw = br#"{"siteName":"Default Web Site","protocol":"https","bindingInformation":"*:443:secure.localhost","certificateHash":"aabbcc","certificateStoreName":"WebHosting","sslFlags":1}"#;
+
+    let bindings = parse_powershell_bindings(raw).unwrap();
+    let tls = bindings[0].tls_certificate.as_ref().unwrap();
+
+    assert_eq!(tls.thumbprint, "aabbcc");
+    assert_eq!(tls.store_name, "WebHosting");
+    assert_eq!(tls.ssl_flags, Some(1));
   }
 
   #[cfg(windows)]

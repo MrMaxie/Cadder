@@ -4,9 +4,9 @@ title: Support detached backend mode with multiple dashboards
 status: To Do
 assignee: []
 created_date: '2026-06-10 12:04'
-updated_date: '2026-06-10 14:47'
+updated_date: '2026-06-11 16:45'
 labels: []
-milestone: m-0
+milestone: m-4
 dependencies:
   - TASK-1.11
   - TASK-1.12

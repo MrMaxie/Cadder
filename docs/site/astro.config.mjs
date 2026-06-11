@@ -20,16 +20,16 @@ export default defineConfig({
           label: 'Quick Start',
           items: [
             { label: 'Overview', slug: 'index' },
-            { label: 'Getting started', slug: 'guides/getting-started' },
+            { label: 'Getting started', slug: 'quick-start/getting-started' },
           ],
         },
         {
           label: 'User guide',
           items: [
-            { label: 'How to use', slug: 'guides/how-to-use' },
-            { label: 'cadder.toml', slug: 'guides/cadder-toml' },
-            { label: 'PATH and shim strategy', slug: 'guides/path-and-shim' },
-            { label: 'TUI and diagnostics', slug: 'guides/tui-diagnostics' },
+            { label: 'How to use', slug: 'user-guide/how-to-use' },
+            { label: 'cadder.toml', slug: 'user-guide/cadder-toml' },
+            { label: 'PATH and shim strategy', slug: 'user-guide/path-and-shim' },
+            { label: 'TUI and diagnostics', slug: 'user-guide/tui-diagnostics' },
           ],
         },
         {
@@ -38,12 +38,12 @@ export default defineConfig({
             {
               label: 'Windows',
               items: [
-                { label: 'Overview', slug: 'guides/windows' },
+                { label: 'Overview', slug: 'cookbooks/windows/overview' },
                 { label: 'IIS handoff', slug: 'cookbooks/windows/iis' },
               ],
             },
-            { label: 'macOS', slug: 'guides/macos' },
-            { label: 'Linux', slug: 'guides/linux' },
+            { label: 'macOS', slug: 'cookbooks/macos' },
+            { label: 'Linux', slug: 'cookbooks/linux' },
           ],
         },
         {

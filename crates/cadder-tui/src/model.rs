@@ -4,6 +4,8 @@ use cadder_protocol::{
 };
 #[cfg(windows)]
 use cadder_protocol::{IisBinding, QueryIisBindingsResponse};
+#[cfg(windows)]
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -113,6 +115,110 @@ impl SeverityFilter {
   }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonUnavailableKind {
+  NotRunning,
+  ConnectionFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonConnectionState {
+  Connected,
+  NotRunning { message: String },
+  ConnectionFailed { message: String },
+  Starting { message: String },
+  StartFailed { message: String },
+}
+
+impl DaemonConnectionState {
+  pub fn label(&self) -> &'static str {
+    match self {
+      Self::Connected => "Connected",
+      Self::NotRunning { .. } => "Not running",
+      Self::ConnectionFailed { .. } => "Connection failed",
+      Self::Starting { .. } => "Starting",
+      Self::StartFailed { .. } => "Start failed",
+    }
+  }
+
+  pub fn detail(&self) -> &str {
+    match self {
+      Self::Connected => "Daemon state is live.",
+      Self::NotRunning { message }
+      | Self::ConnectionFailed { message }
+      | Self::Starting { message }
+      | Self::StartFailed { message } => message,
+    }
+  }
+
+  pub fn guidance(&self) -> &'static str {
+    match self {
+      Self::Connected => "Use r to refresh state or d to request daemon shutdown.",
+      Self::Starting { .. } => "Starting cadderd; controls stay responsive.",
+      Self::NotRunning { .. } => "Press s to start cadderd, r to retry connection, or q to quit.",
+      Self::ConnectionFailed { .. } => {
+        "Press s to start/reconnect, r to retry connection, or q to quit."
+      }
+      Self::StartFailed { .. } => "Fix the start error, then press s to retry or q to quit.",
+    }
+  }
+
+  pub fn is_connected(&self) -> bool {
+    matches!(self, Self::Connected)
+  }
+
+  pub fn is_starting(&self) -> bool {
+    matches!(self, Self::Starting { .. })
+  }
+
+  pub fn can_start(&self) -> bool {
+    !self.is_starting()
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonViewModel {
+  pub state: DaemonConnectionState,
+}
+
+impl Default for DaemonViewModel {
+  fn default() -> Self {
+    Self {
+      state: DaemonConnectionState::NotRunning {
+        message: "Daemon connection has not been checked yet.".to_string(),
+      },
+    }
+  }
+}
+
+impl DaemonViewModel {
+  pub fn mark_connected(&mut self) {
+    self.state = DaemonConnectionState::Connected;
+  }
+
+  pub fn mark_unavailable(&mut self, kind: DaemonUnavailableKind, message: impl Into<String>) {
+    let message = message.into();
+    self.state = match kind {
+      DaemonUnavailableKind::NotRunning => DaemonConnectionState::NotRunning { message },
+      DaemonUnavailableKind::ConnectionFailed => {
+        DaemonConnectionState::ConnectionFailed { message }
+      }
+    };
+  }
+
+  pub fn mark_starting(&mut self, message: impl Into<String>) {
+    self.state = DaemonConnectionState::Starting {
+      message: message.into(),
+    };
+  }
+
+  pub fn mark_start_failed(&mut self, message: impl Into<String>) {
+    self.state = DaemonConnectionState::StartFailed {
+      message: message.into(),
+    };
+  }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsViewModel {
   pub selected_severity: usize,
@@ -154,6 +260,7 @@ impl SettingsViewModel {
 #[derive(Debug, Clone)]
 pub struct TuiModel {
   pub view: View,
+  pub daemon: DaemonViewModel,
   pub search: String,
   pub search_mode: bool,
   pub entrypoint_selected: usize,
@@ -171,6 +278,8 @@ pub struct IisViewModel {
   pub bindings: Vec<IisBinding>,
   pub selected: usize,
   pub route_host_input: String,
+  pub route_host_input_binding_id: Option<String>,
+  pub route_host_inputs: BTreeMap<String, String>,
   pub route_host_input_mode: bool,
   pub loading: bool,
   pub request_in_flight: bool,
@@ -190,6 +299,26 @@ impl IisViewModel {
     self.loading = false;
     self.request_in_flight = false;
     self.bindings = response.bindings;
+    self.route_host_inputs.retain(|binding_id, _| {
+      self
+        .bindings
+        .iter()
+        .any(|binding| binding.identity.binding_id == *binding_id)
+    });
+    if self
+      .route_host_input_binding_id
+      .as_ref()
+      .is_some_and(|binding_id| {
+        !self
+          .bindings
+          .iter()
+          .any(|binding| binding.identity.binding_id == *binding_id)
+      })
+    {
+      self.route_host_input_mode = false;
+      self.route_host_input.clear();
+      self.route_host_input_binding_id = None;
+    }
     self.last_error = response.issue.map(|issue| issue.message);
     self.clamp();
   }
@@ -204,12 +333,37 @@ impl IisViewModel {
     self.bindings.get(self.selected).cloned()
   }
 
-  pub fn begin_route_host_input(&mut self) {
+  pub fn begin_route_host_input(&mut self, binding_id: String) {
+    self.route_host_input = self
+      .route_host_inputs
+      .get(&binding_id)
+      .cloned()
+      .unwrap_or_default();
+    self.route_host_input_binding_id = Some(binding_id);
     self.route_host_input_mode = true;
   }
 
   pub fn finish_route_host_input(&mut self) {
+    if let Some(binding_id) = self.route_host_input_binding_id.as_ref() {
+      let route_host = self.route_host_input.trim();
+      if route_host.is_empty() {
+        self.route_host_inputs.remove(binding_id);
+      } else {
+        self
+          .route_host_inputs
+          .insert(binding_id.clone(), route_host.to_string());
+        self.route_host_input = route_host.to_string();
+      }
+    }
     self.route_host_input_mode = false;
+  }
+
+  pub fn route_host_for_binding(&self, binding_id: &str) -> Option<&str> {
+    self
+      .route_host_inputs
+      .get(binding_id)
+      .map(String::as_str)
+      .filter(|host| !host.trim().is_empty())
   }
 
   pub fn push_route_host_char(&mut self, ch: char) {
@@ -340,6 +494,7 @@ impl Default for TuiModel {
   fn default() -> Self {
     Self {
       view: View::Overview,
+      daemon: DaemonViewModel::default(),
       search: String::new(),
       search_mode: false,
       entrypoint_selected: 0,
@@ -362,6 +517,34 @@ impl TuiModel {
   pub fn set_snapshot(&mut self, snapshot: GuiStateSnapshot) {
     self.snapshot = snapshot;
     self.clamp_selections();
+  }
+
+  pub fn mark_daemon_connected(&mut self) {
+    self.daemon.mark_connected();
+  }
+
+  pub fn mark_daemon_unavailable(
+    &mut self,
+    kind: DaemonUnavailableKind,
+    message: impl Into<String>,
+  ) {
+    self.daemon.mark_unavailable(kind, message);
+  }
+
+  pub fn mark_daemon_starting(&mut self, message: impl Into<String>) {
+    self.daemon.mark_starting(message);
+  }
+
+  pub fn mark_daemon_start_failed(&mut self, message: impl Into<String>) {
+    self.daemon.mark_start_failed(message);
+  }
+
+  pub fn can_use_daemon(&self) -> bool {
+    self.daemon.state.is_connected()
+  }
+
+  pub fn can_start_daemon(&self) -> bool {
+    self.daemon.state.can_start()
   }
 
   pub fn snapshot(&self) -> &GuiStateSnapshot {
@@ -619,6 +802,38 @@ mod tests {
     assert_eq!(summary.entrypoints, 1);
     assert_eq!(summary.domains, 2);
     assert_eq!(summary.active_domains, 1);
+  }
+
+  #[test]
+  fn daemon_connectivity_state_transitions_are_explicit() {
+    let mut model = TuiModel::default();
+
+    assert!(matches!(
+      model.daemon.state,
+      DaemonConnectionState::NotRunning { .. }
+    ));
+    assert!(!model.can_use_daemon());
+    assert!(model.can_start_daemon());
+
+    model.mark_daemon_starting("starting cadderd");
+    assert_eq!(model.daemon.state.label(), "Starting");
+    assert!(!model.can_use_daemon());
+    assert!(!model.can_start_daemon());
+
+    model.mark_daemon_unavailable(DaemonUnavailableKind::ConnectionFailed, "permission denied");
+    assert!(matches!(
+      model.daemon.state,
+      DaemonConnectionState::ConnectionFailed { .. }
+    ));
+    assert!(model.can_start_daemon());
+
+    model.mark_daemon_start_failed("could not find cadderd");
+    assert_eq!(model.daemon.state.label(), "Start failed");
+    assert!(model.daemon.state.guidance().contains("retry"));
+
+    model.mark_daemon_connected();
+    assert!(model.can_use_daemon());
+    assert_eq!(model.daemon.state.label(), "Connected");
   }
 
   #[test]

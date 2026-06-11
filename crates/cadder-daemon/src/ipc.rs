@@ -6,12 +6,20 @@ use cadder_protocol::{
   SetEntrypointEnabledRequest, SetIisHandoffRequest, ShutdownDaemonRequest, SubscribeStateRequest,
   UnregisterEntrypointRequest, message_types,
 };
+use fs4::{FileExt, TryLockError};
 use interprocess::local_socket::{
   GenericNamespaced, ListenerOptions, ToNsName,
   tokio::{Stream, prelude::*},
 };
 use serde::{Serialize, de::DeserializeOwned};
-use std::{env, io, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+  env,
+  fs::{File, OpenOptions, create_dir_all},
+  io,
+  path::PathBuf,
+  process::Stdio,
+  time::Duration,
+};
 use tokio::{
   io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
   process::Command,
@@ -372,6 +380,17 @@ pub async fn ensure_daemon_running_with_options(
     return Ok(());
   }
 
+  let Some(_launch_lock) = DaemonLaunchLock::try_acquire(paths)? else {
+    wait_for_daemon_ready(paths)
+      .await
+      .context("wait for concurrent cadderd launch")?;
+    return Ok(());
+  };
+
+  if can_connect(paths).await {
+    return Ok(());
+  }
+
   let daemon = options
     .explicit_daemon
     .or_else(|| sibling_binary("cadderd"))
@@ -395,6 +414,10 @@ pub async fn ensure_daemon_running_with_options(
   }
   command.spawn().context("start cadderd")?;
 
+  wait_for_daemon_ready(paths).await
+}
+
+async fn wait_for_daemon_ready(paths: &RuntimePaths) -> Result<()> {
   for _ in 0..50 {
     if can_connect(paths).await {
       return Ok(());
@@ -403,6 +426,36 @@ pub async fn ensure_daemon_running_with_options(
   }
 
   Err(anyhow!("cadderd did not become ready before timeout"))
+}
+
+#[derive(Debug)]
+struct DaemonLaunchLock {
+  _file: File,
+}
+
+impl DaemonLaunchLock {
+  fn try_acquire(paths: &RuntimePaths) -> Result<Option<Self>> {
+    let path = paths.runtime_dir().join("cadder-launch.lock");
+    if let Some(parent) = path.parent() {
+      create_dir_all(parent)
+        .with_context(|| format!("create launch lock directory {}", parent.display()))?;
+    }
+
+    let file = OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .truncate(false)
+      .open(&path)
+      .with_context(|| format!("open daemon launch lock {}", path.display()))?;
+    match FileExt::try_lock(&file) {
+      Ok(()) => Ok(Some(Self { _file: file })),
+      Err(TryLockError::WouldBlock) => Ok(None),
+      Err(TryLockError::Error(error)) => {
+        Err(error).with_context(|| format!("acquire daemon launch lock {}", path.display()))
+      }
+    }
+  }
 }
 
 async fn can_connect(paths: &RuntimePaths) -> bool {
@@ -480,5 +533,19 @@ mod tests {
     assert!(rendered.ends_with('\n'));
     assert_eq!(envelope.message_type, message_types::QUERY_STATE_REQUEST);
     assert_eq!(decoded.request_id, "state-1");
+  }
+
+  #[test]
+  fn daemon_launch_lock_serializes_start_attempts() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::resolve(Some(temp.path().join("runtime"))).unwrap();
+
+    let first = DaemonLaunchLock::try_acquire(&paths).unwrap();
+    assert!(first.is_some());
+    assert!(DaemonLaunchLock::try_acquire(&paths).unwrap().is_none());
+
+    drop(first);
+
+    assert!(DaemonLaunchLock::try_acquire(&paths).unwrap().is_some());
   }
 }

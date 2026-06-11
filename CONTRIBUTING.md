@@ -40,3 +40,25 @@ Automated tests should not depend on a globally installed real Caddy binary. Use
 ## Releases
 
 Cadder does not publish GitHub Releases before 1.0.0. The release workflow rejects `v0.*` tags before publishing.
+
+To build a local release layout, run:
+
+```sh
+cargo run -p xtask -- dist --out target/cadder-dist
+```
+
+The layout contains `cadderd`, `cadder-tui`, the `caddy` shim, and `cadder.toml`. On Windows the binaries use the `.exe` suffix.
+
+Verify an existing layout with:
+
+```sh
+cargo run -p xtask -- verify-dist --dir target/cadder-dist
+```
+
+Build a versioned portable archive and checksum with:
+
+```sh
+cargo run -p xtask -- package --out target/cadder-packages --version 1.0.0 --platform windows-x64 --target x86_64-pc-windows-msvc
+```
+
+The package command writes a platform archive next to a `.sha256` checksum file. Windows packages are `.zip`; Linux and macOS packages are `.tar.gz`.

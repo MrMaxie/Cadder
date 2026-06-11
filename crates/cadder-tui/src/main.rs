@@ -16,7 +16,7 @@ use cadder_protocol::{
 };
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use model::{SeverityFilter, TuiModel, View};
+use model::{DaemonUnavailableKind, SeverityFilter, TuiModel, View};
 use ratatui::{
   DefaultTerminal, Frame,
   layout::{Constraint, Layout},
@@ -25,6 +25,7 @@ use ratatui::{
   widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, TableState, Tabs, Wrap},
 };
 use std::{
+  io,
   path::PathBuf,
   time::{Duration, Instant},
 };
@@ -32,6 +33,7 @@ use tokio::sync::mpsc;
 
 const STATE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const LOG_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+const DAEMON_START_MESSAGE: &str = "Starting cadderd and reconnecting.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -68,37 +70,18 @@ async fn main() -> Result<()> {
   tracing_subscriber::fmt::init();
   let args = Args::parse();
   let paths = RuntimePaths::resolve(args.runtime_dir)?;
-  if !args.no_start {
-    ensure_daemon_running_with_options(
-      &paths,
-      DaemonLaunchOptions {
-        explicit_daemon: args.daemon_path,
-        real_caddy_command: args.real_caddy_command,
-        shim_path: None,
-      },
-    )
-    .await?;
-  }
-  let client = CadderClient::new(paths);
-  let (responses_tx, responses_rx) = mpsc::unbounded_channel();
-  let mut app = TuiApp {
-    client,
-    model: TuiModel::default(),
-    message: String::new(),
-    responses_tx,
-    responses_rx,
-    state_request_in_flight: false,
-    state_refresh_pending: false,
-    toggle_request_in_flight: false,
-    shutdown_request_in_flight: false,
-    last_state_refresh: Instant::now(),
-    last_log_refresh: Instant::now(),
-    log_refresh_pending: false,
-    log_request_serial: 0,
+  let no_start = args.no_start;
+  let launch_options = DaemonLaunchOptions {
+    explicit_daemon: args.daemon_path,
+    real_caddy_command: args.real_caddy_command,
+    shim_path: None,
   };
-  app.refresh().await?;
-  #[cfg(windows)]
-  app.refresh_iis().await;
+  let mut app = TuiApp::new(paths, launch_options);
+  if no_start {
+    app.start_state_refresh();
+  } else {
+    app.start_daemon();
+  }
 
   let terminal = ratatui::init();
   let result = app.run(terminal).await;
@@ -107,6 +90,8 @@ async fn main() -> Result<()> {
 }
 
 struct TuiApp {
+  paths: RuntimePaths,
+  launch_options: DaemonLaunchOptions,
   client: CadderClient,
   model: TuiModel,
   message: String,
@@ -114,6 +99,8 @@ struct TuiApp {
   responses_rx: mpsc::UnboundedReceiver<AppResponse>,
   state_request_in_flight: bool,
   state_refresh_pending: bool,
+  state_request_serial: u64,
+  daemon_start_in_flight: bool,
   toggle_request_in_flight: bool,
   shutdown_request_in_flight: bool,
   last_state_refresh: Instant,
@@ -124,7 +111,11 @@ struct TuiApp {
 
 #[derive(Debug)]
 enum AppResponse {
-  State(Result<QueryStateResponse, String>),
+  State {
+    serial: u64,
+    result: Result<QueryStateResponse, DaemonConnectionIssue>,
+  },
+  DaemonStart(Result<QueryStateResponse, String>),
   Toggle(Result<BasicResponse, String>),
   #[cfg(windows)]
   IisBindings(Result<QueryIisBindingsResponse, String>),
@@ -139,7 +130,37 @@ enum AppResponse {
   Shutdown(Result<BasicResponse, String>),
 }
 
+#[derive(Debug, Clone)]
+struct DaemonConnectionIssue {
+  kind: DaemonUnavailableKind,
+  message: String,
+}
+
 impl TuiApp {
+  fn new(paths: RuntimePaths, launch_options: DaemonLaunchOptions) -> Self {
+    let client = CadderClient::new(paths.clone());
+    let (responses_tx, responses_rx) = mpsc::unbounded_channel();
+    Self {
+      paths,
+      launch_options,
+      client,
+      model: TuiModel::default(),
+      message: String::new(),
+      responses_tx,
+      responses_rx,
+      state_request_in_flight: false,
+      state_refresh_pending: false,
+      state_request_serial: 0,
+      daemon_start_in_flight: false,
+      toggle_request_in_flight: false,
+      shutdown_request_in_flight: false,
+      last_state_refresh: Instant::now(),
+      last_log_refresh: Instant::now(),
+      log_refresh_pending: false,
+      log_request_serial: 0,
+    }
+  }
+
   async fn run(&mut self, mut terminal: DefaultTerminal) -> Result<()> {
     loop {
       self.drain_responses();
@@ -193,6 +214,7 @@ impl TuiApp {
 
     match code {
       KeyCode::Char('q') => return Ok(true),
+      KeyCode::Char('s') => self.start_daemon(),
       KeyCode::Char('r') => {
         self.start_state_refresh();
         #[cfg(windows)]
@@ -206,9 +228,16 @@ impl TuiApp {
       KeyCode::Up => self.model.move_selection(-1),
       #[cfg(windows)]
       KeyCode::Char('/') if self.model.view == View::IisHandoff => {
-        self.model.iis.begin_route_host_input();
+        if let Some(binding) = self.model.iis.selected_binding() {
+          self
+            .model
+            .iis
+            .begin_route_host_input(binding.identity.binding_id);
+        } else {
+          self.message = "No IIS binding selected.".to_string();
+        }
       }
-      KeyCode::Char('/') => self.model.search_mode = true,
+      KeyCode::Char('f') => self.model.search_mode = true,
       KeyCode::Char(' ') if self.model.view == View::Settings => self.apply_settings_log_severity(),
       #[cfg(windows)]
       KeyCode::Char(' ') if self.model.view == View::IisHandoff => self.start_iis_handoff_toggle(),
@@ -250,12 +279,35 @@ impl TuiApp {
   fn drain_responses(&mut self) {
     while let Ok(response) = self.responses_rx.try_recv() {
       match response {
-        AppResponse::State(result) => {
+        AppResponse::State { serial, result } => {
+          if serial != self.state_request_serial {
+            continue;
+          }
           self.state_request_in_flight = false;
           self.last_state_refresh = Instant::now();
           match result {
             Ok(response) => self.apply_state_response(response),
-            Err(error) => self.message = format!("State refresh failed: {error}"),
+            Err(issue) => {
+              if !self.daemon_start_in_flight {
+                self.apply_daemon_issue("Daemon unavailable", issue);
+              }
+            }
+          }
+          self.start_pending_state_refresh();
+        }
+        AppResponse::DaemonStart(result) => {
+          self.daemon_start_in_flight = false;
+          match result {
+            Ok(response) => {
+              self.apply_state_response(response);
+              if self.model.can_use_daemon() {
+                self.message = "cadderd started and connected.".to_string();
+              }
+            }
+            Err(error) => {
+              self.model.mark_daemon_start_failed(error.clone());
+              self.message = format!("Daemon start failed: {error}");
+            }
           }
           self.start_pending_state_refresh();
         }
@@ -266,7 +318,7 @@ impl TuiApp {
               self.message = response.message;
               self.start_state_refresh();
             }
-            Err(error) => self.message = format!("Toggle failed: {error}"),
+            Err(error) => self.apply_daemon_request_error("Toggle failed", error),
           }
         }
         #[cfg(windows)]
@@ -284,7 +336,7 @@ impl TuiApp {
             }
             Err(error) => {
               self.model.iis.apply_error(error.clone());
-              self.message = format!("IIS discovery failed: {error}");
+              self.apply_daemon_request_error("IIS discovery failed", error);
             }
           }
         }
@@ -293,11 +345,11 @@ impl TuiApp {
           self.model.iis.action_in_flight = false;
           match result {
             Ok(response) => {
-              self.message = response.message;
+              self.message = iis_handoff_message(&response);
               self.start_iis_refresh();
               self.start_state_refresh();
             }
-            Err(error) => self.message = format!("IIS handoff failed: {error}"),
+            Err(error) => self.apply_daemon_request_error("IIS handoff failed", error),
           }
         }
         AppResponse::Logs {
@@ -326,8 +378,8 @@ impl TuiApp {
               self.model.logs.apply_response(response);
             }
             Err(error) => {
-              self.message = format!("Log refresh failed: {error}");
-              self.model.logs.apply_read_error(error);
+              self.model.logs.apply_read_error(error.clone());
+              self.apply_daemon_request_error("Log refresh failed", error);
             }
           }
           self.start_pending_log_refresh();
@@ -335,8 +387,14 @@ impl TuiApp {
         AppResponse::Shutdown(result) => {
           self.shutdown_request_in_flight = false;
           match result {
-            Ok(response) => self.message = response.message,
-            Err(error) => self.message = format!("Shutdown failed: {error}"),
+            Ok(response) => {
+              self.model.mark_daemon_unavailable(
+                DaemonUnavailableKind::NotRunning,
+                "Daemon shutdown was requested.",
+              );
+              self.message = response.message;
+            }
+            Err(error) => self.apply_daemon_request_error("Shutdown failed", error),
           }
         }
       }
@@ -345,6 +403,7 @@ impl TuiApp {
 
   fn maybe_tail_logs(&mut self) {
     if self.model.view != View::Logs
+      || !self.model.can_use_daemon()
       || self.model.logs.paused
       || self.model.logs.request_in_flight
       || self.model.logs.target.is_none()
@@ -356,7 +415,14 @@ impl TuiApp {
   }
 
   fn maybe_refresh_state(&mut self) {
-    if self.state_request_in_flight || self.last_state_refresh.elapsed() < STATE_REFRESH_INTERVAL {
+    if self.daemon_start_in_flight
+      || self.state_request_in_flight
+      || matches!(
+        self.model.daemon.state,
+        model::DaemonConnectionState::StartFailed { .. }
+      )
+      || self.last_state_refresh.elapsed() < STATE_REFRESH_INTERVAL
+    {
       return;
     }
     self.start_state_refresh();
@@ -364,49 +430,29 @@ impl TuiApp {
 
   fn apply_state_response(&mut self, response: QueryStateResponse) {
     if let Some(snapshot) = response.snapshot {
+      #[cfg(windows)]
+      let was_connected = self.model.can_use_daemon();
       self.model.set_snapshot(snapshot);
+      self.model.mark_daemon_connected();
       self.message = response.message;
+      #[cfg(windows)]
+      if !was_connected {
+        self.start_iis_refresh();
+      }
     } else {
-      self.message = "Daemon returned no state snapshot.".to_string();
-    }
-  }
-
-  async fn refresh(&mut self) -> Result<()> {
-    let response: QueryStateResponse = self
-      .client
-      .request(
-        message_types::QUERY_STATE_REQUEST,
-        message_types::QUERY_STATE_RESPONSE,
-        &QueryStateRequest {
-          request_id: new_request_id("tui-state"),
-        },
-      )
-      .await?;
-    self.apply_state_response(response);
-    self.last_state_refresh = Instant::now();
-    Ok(())
-  }
-
-  #[cfg(windows)]
-  async fn refresh_iis(&mut self) {
-    match self
-      .client
-      .request(
-        message_types::QUERY_IIS_BINDINGS_REQUEST,
-        message_types::QUERY_IIS_BINDINGS_RESPONSE,
-        &QueryIisBindingsRequest {
-          request_id: new_request_id("tui-iis"),
-        },
-      )
-      .await
-      .map_err(|error| error.to_string())
-    {
-      Ok(response) => self.model.iis.apply_response(response),
-      Err(error) => self.model.iis.apply_error(error),
+      let message = "Daemon returned no state snapshot.";
+      self
+        .model
+        .mark_daemon_unavailable(DaemonUnavailableKind::ConnectionFailed, message);
+      self.message = message.to_string();
     }
   }
 
   fn start_state_refresh(&mut self) {
+    if self.daemon_start_in_flight {
+      self.message = "Daemon start is already in progress.".to_string();
+      return;
+    }
     if self.state_request_in_flight {
       self.state_refresh_pending = true;
       return;
@@ -414,6 +460,8 @@ impl TuiApp {
     self.state_request_in_flight = true;
     self.state_refresh_pending = false;
     self.last_state_refresh = Instant::now();
+    self.state_request_serial += 1;
+    let serial = self.state_request_serial;
     let client = self.client.clone();
     let responses = self.responses_tx.clone();
     tokio::spawn(async move {
@@ -426,8 +474,8 @@ impl TuiApp {
           },
         )
         .await
-        .map_err(|error| error.to_string());
-      let _ = responses.send(AppResponse::State(result));
+        .map_err(classify_daemon_error);
+      let _ = responses.send(AppResponse::State { serial, result });
     });
   }
 
@@ -439,8 +487,49 @@ impl TuiApp {
     self.start_state_refresh();
   }
 
+  fn start_daemon(&mut self) {
+    if !self.model.can_start_daemon() || self.daemon_start_in_flight {
+      self.message = "Daemon start is already in progress.".to_string();
+      return;
+    }
+    self.daemon_start_in_flight = true;
+    self.state_refresh_pending = false;
+    self.state_request_in_flight = false;
+    self.state_request_serial += 1;
+    self.model.mark_daemon_starting(DAEMON_START_MESSAGE);
+    self.message = DAEMON_START_MESSAGE.to_string();
+    let paths = self.paths.clone();
+    let launch_options = self.launch_options.clone();
+    let client = self.client.clone();
+    let responses = self.responses_tx.clone();
+    tokio::spawn(async move {
+      let result = async {
+        ensure_daemon_running_with_options(&paths, launch_options)
+          .await
+          .context("start cadderd")?;
+        client
+          .request(
+            message_types::QUERY_STATE_REQUEST,
+            message_types::QUERY_STATE_RESPONSE,
+            &QueryStateRequest {
+              request_id: new_request_id("tui-state"),
+            },
+          )
+          .await
+          .context("refresh daemon state after start")
+      }
+      .await
+      .map_err(|error| format_error_chain(&error));
+      let _ = responses.send(AppResponse::DaemonStart(result));
+    });
+  }
+
   #[cfg(windows)]
   fn start_iis_refresh(&mut self) {
+    if !self.model.can_use_daemon() {
+      self.message = daemon_action_unavailable("IIS discovery");
+      return;
+    }
     if self.model.iis.request_in_flight {
       return;
     }
@@ -464,6 +553,10 @@ impl TuiApp {
 
   #[cfg(windows)]
   fn start_iis_handoff_toggle(&mut self) {
+    if !self.model.can_use_daemon() {
+      self.message = daemon_action_unavailable("IIS handoff");
+      return;
+    }
     if self.model.iis.action_in_flight {
       return;
     }
@@ -473,8 +566,11 @@ impl TuiApp {
     };
     let enabled = binding.handoff_state != cadder_protocol::IisHandoffState::HandedOff;
     let route_host = if enabled && binding.domain_key.is_none() {
-      let host = self.model.iis.route_host_input.trim();
-      (!host.is_empty()).then(|| host.to_string())
+      self
+        .model
+        .iis
+        .route_host_for_binding(&binding.identity.binding_id)
+        .map(str::to_string)
     } else {
       None
     };
@@ -501,6 +597,17 @@ impl TuiApp {
       });
       return;
     }
+    self.message = if enabled {
+      format!(
+        "Administrator approval may be requested to create the IIS loopback binding and remove `{}` from the public front door.",
+        binding.identity.binding_information
+      )
+    } else {
+      format!(
+        "Administrator approval may be requested to restore `{}` to IIS and remove the loopback binding.",
+        binding.identity.binding_information
+      )
+    };
     self.model.iis.action_in_flight = true;
     let client = self.client.clone();
     let responses = self.responses_tx.clone();
@@ -523,6 +630,10 @@ impl TuiApp {
   }
 
   fn start_toggle_selected(&mut self) {
+    if !self.model.can_use_daemon() {
+      self.message = daemon_action_unavailable("Activation changes");
+      return;
+    }
     if self.toggle_request_in_flight {
       return;
     }
@@ -613,6 +724,10 @@ impl TuiApp {
   }
 
   fn start_log_refresh(&mut self) {
+    if !self.model.can_use_daemon() {
+      self.message = daemon_action_unavailable("Log refresh");
+      return;
+    }
     if self.model.logs.request_in_flight {
       self.log_refresh_pending = true;
       return;
@@ -659,6 +774,10 @@ impl TuiApp {
     if !self.log_refresh_pending {
       return;
     }
+    if !self.model.can_use_daemon() {
+      self.log_refresh_pending = false;
+      return;
+    }
     self.log_refresh_pending = false;
     self.start_log_refresh();
   }
@@ -672,6 +791,10 @@ impl TuiApp {
   }
 
   fn start_shutdown_daemon(&mut self) {
+    if !self.model.can_use_daemon() {
+      self.message = daemon_action_unavailable("Daemon shutdown");
+      return;
+    }
     if self.shutdown_request_in_flight {
       return;
     }
@@ -691,6 +814,23 @@ impl TuiApp {
         .map_err(|error| error.to_string());
       let _ = responses.send(AppResponse::Shutdown(result));
     });
+  }
+
+  fn apply_daemon_issue(&mut self, prefix: &str, issue: DaemonConnectionIssue) {
+    self
+      .model
+      .mark_daemon_unavailable(issue.kind, issue.message.clone());
+    self.message = format!("{prefix}: {}. Press s to start/reconnect.", issue.message);
+  }
+
+  fn apply_daemon_request_error(&mut self, prefix: &str, error: String) {
+    self.apply_daemon_issue(
+      prefix,
+      DaemonConnectionIssue {
+        kind: DaemonUnavailableKind::ConnectionFailed,
+        message: error,
+      },
+    );
   }
 
   fn export_logs(&mut self) -> Result<()> {
@@ -723,6 +863,94 @@ impl TuiApp {
 enum ToggleRequest {
   Entrypoint(SetEntrypointEnabledRequest),
   Domain(SetDomainEnabledRequest),
+}
+
+fn daemon_action_unavailable(action: &str) -> String {
+  format!(
+    "{action} requires a connected daemon. Press s to start/reconnect, r to retry, or q to quit."
+  )
+}
+
+#[cfg(windows)]
+fn iis_handoff_message(response: &SetIisHandoffResponse) -> String {
+  let succeeded = response
+    .steps
+    .iter()
+    .filter(|step| {
+      step.status == cadder_protocol::IisOperationStepStatus::Succeeded
+        || step.status == cadder_protocol::IisOperationStepStatus::Approved
+    })
+    .count();
+  let denied = response
+    .steps
+    .iter()
+    .filter(|step| step.status == cadder_protocol::IisOperationStepStatus::Denied)
+    .count();
+  let failed = response
+    .steps
+    .iter()
+    .filter(|step| step.status == cadder_protocol::IisOperationStepStatus::Failed)
+    .count();
+  let approved_admin = response
+    .steps
+    .iter()
+    .filter(|step| step.approval == cadder_protocol::IisElevationApproval::Approved)
+    .count();
+
+  if response.steps.is_empty() {
+    return response.message.clone();
+  }
+
+  let mut parts = vec![format!(
+    "{} Steps: {succeeded}/{} succeeded",
+    response.message,
+    response.steps.len()
+  )];
+  if approved_admin > 0 {
+    parts.push(format!("{approved_admin} admin-approved"));
+  }
+  if denied > 0 {
+    parts.push(format!("{denied} admin-denied"));
+  }
+  if failed > 0 {
+    parts.push(format!("{failed} failed"));
+  }
+  if !response.follow_up_actions.is_empty() {
+    let actions = response
+      .follow_up_actions
+      .iter()
+      .map(|action| format!("{action:?}"))
+      .collect::<Vec<_>>()
+      .join(", ");
+    parts.push(format!("follow-up: {actions}"));
+  }
+  parts.join("; ")
+}
+
+fn classify_daemon_error(error: anyhow::Error) -> DaemonConnectionIssue {
+  let kind = if error.chain().any(|cause| {
+    cause.downcast_ref::<io::Error>().is_some_and(|error| {
+      matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+      )
+    })
+  }) {
+    DaemonUnavailableKind::NotRunning
+  } else {
+    DaemonUnavailableKind::ConnectionFailed
+  };
+
+  DaemonConnectionIssue {
+    kind,
+    message: format_error_chain(&error),
+  }
+}
+
+fn format_error_chain(error: &anyhow::Error) -> String {
+  let mut messages = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+  messages.dedup();
+  messages.join(": ")
 }
 
 fn describe_log_severity(severity: Option<LogSeverity>) -> &'static str {
@@ -865,6 +1093,16 @@ fn config_status_style(status: ConfigApplyStatus) -> Style {
   }
 }
 
+fn daemon_state_style(state: &model::DaemonConnectionState) -> Style {
+  match state {
+    model::DaemonConnectionState::Connected => UiStyles::active(),
+    model::DaemonConnectionState::Starting { .. } => UiStyles::info(),
+    model::DaemonConnectionState::NotRunning { .. } => UiStyles::warning(),
+    model::DaemonConnectionState::ConnectionFailed { .. }
+    | model::DaemonConnectionState::StartFailed { .. } => UiStyles::error(),
+  }
+}
+
 fn severity_style(severity: LogSeverity) -> Style {
   match severity {
     LogSeverity::Warn => UiStyles::warning(),
@@ -928,10 +1166,20 @@ impl TuiApp {
     let iis_route_host = if self.model.view == View::IisHandoff {
       if self.model.iis.route_host_input_mode {
         format!(" IIS route host: {}", self.model.iis.route_host_input)
-      } else if self.model.iis.route_host_input.is_empty() {
-        String::new()
       } else {
-        format!(" IIS route host set: {}", self.model.iis.route_host_input)
+        self
+          .model
+          .iis
+          .selected_binding()
+          .and_then(|binding| {
+            self
+              .model
+              .iis
+              .route_host_for_binding(&binding.identity.binding_id)
+              .map(str::to_string)
+          })
+          .map(|host| format!(" IIS route host set: {host}"))
+          .unwrap_or_default()
       }
     } else {
       String::new()
@@ -946,13 +1194,15 @@ impl TuiApp {
       format!(" filter: {}", self.model.search)
     };
     let status_context = format!(
-      "{}{}{}  severity: {}",
+      "{}  daemon: {}{}{}  severity: {}",
       self.message,
+      self.model.daemon.state.label(),
       search,
       iis_route_host,
       describe_log_severity(self.model.logs.minimum_severity)
     );
-    let navigation_help = "Tab/Shift+Tab/Left/Right views  r refresh  / search  Space toggle/apply";
+    let navigation_help =
+      "Tab/Shift+Tab/Left/Right views  r refresh  s start/reconnect  f search  Space toggle/apply";
     #[cfg(windows)]
     let action_help = "IIS: / route host Enter refresh Space handoff/restore  Settings: Up/Down severity Enter apply  Logs: p pause Enter refresh x export  d shutdown  q quit";
     #[cfg(not(windows))]
@@ -971,7 +1221,15 @@ impl TuiApp {
   fn draw_overview(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
     let summary = self.model.summary();
     let snapshot = self.model.snapshot();
+    let daemon = &self.model.daemon.state;
     let lines = vec![
+      Line::from(vec![
+        Span::styled("Daemon: ", UiStyles::header()),
+        Span::styled(daemon.label(), daemon_state_style(daemon)),
+      ]),
+      Line::styled(daemon.detail().to_string(), UiStyles::muted()),
+      Line::styled(daemon.guidance(), UiStyles::info()),
+      Line::from(""),
       Line::from(vec![
         Span::styled("Runtime: ", UiStyles::header()),
         Span::styled(
@@ -1067,6 +1325,7 @@ impl TuiApp {
   #[cfg(windows)]
   fn draw_iis_handoff(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
     let rows = self.model.iis.bindings.iter().map(|binding| {
+      let host = iis_host_display(binding, &self.model.iis);
       let issue = binding
         .issue
         .as_ref()
@@ -1083,7 +1342,7 @@ impl TuiApp {
         Cell::from(binding.identity.protocol.clone()),
         Cell::from(binding.ip_address.clone()),
         Cell::from(binding.port.to_string()),
-        Cell::from(binding.host_header.clone()),
+        Cell::from(host),
         Cell::from(format!("{:?}", binding.handoff_state)),
         Cell::from(issue),
       ])
@@ -1260,6 +1519,21 @@ impl TuiApp {
   }
 }
 
+#[cfg(windows)]
+fn iis_host_display(binding: &cadder_protocol::IisBinding, model: &model::IisViewModel) -> String {
+  let host_header = binding.host_header.trim();
+  if !host_header.is_empty() && host_header != "*" {
+    return binding.host_header.clone();
+  }
+  if let Some(domain_key) = binding.domain_key.as_ref() {
+    return domain_key.clone();
+  }
+  model
+    .route_host_for_binding(&binding.identity.binding_id)
+    .map(str::to_string)
+    .unwrap_or_else(|| binding.host_header.clone())
+}
+
 #[allow(dead_code)]
 fn _assert_snapshot_send_sync(_: &GuiStateSnapshot) {}
 
@@ -1275,29 +1549,21 @@ mod tests {
   use clap::CommandFactory;
   use ratatui::{Terminal, backend::TestBackend};
 
-  fn test_app() -> TuiApp {
-    let paths = RuntimePaths::resolve(Some(
-      std::env::temp_dir().join(format!("cadder-tui-test-{}", std::process::id())),
+  fn test_runtime_paths(label: &str) -> RuntimePaths {
+    RuntimePaths::resolve(Some(
+      std::env::temp_dir().join(format!("cadder-tui-{label}-{}", std::process::id())),
     ))
-    .unwrap();
-    let (responses_tx, responses_rx) = mpsc::unbounded_channel();
+    .unwrap()
+  }
+
+  fn test_app() -> TuiApp {
     let mut model = TuiModel::default();
     model.set_snapshot(snapshot());
-    TuiApp {
-      client: CadderClient::new(paths),
-      model,
-      message: "ready".to_string(),
-      responses_tx,
-      responses_rx,
-      state_request_in_flight: false,
-      state_refresh_pending: false,
-      toggle_request_in_flight: false,
-      shutdown_request_in_flight: false,
-      last_state_refresh: Instant::now(),
-      last_log_refresh: Instant::now(),
-      log_refresh_pending: false,
-      log_request_serial: 0,
-    }
+    model.mark_daemon_connected();
+    let mut app = TuiApp::new(test_runtime_paths("test"), DaemonLaunchOptions::default());
+    app.model = model;
+    app.message = "ready".to_string();
+    app
   }
 
   fn snapshot() -> GuiStateSnapshot {
@@ -1549,9 +1815,28 @@ mod tests {
     assert!(text.contains("search: api"));
     assert!(text.contains("severity: Errors only"));
     assert!(text.contains("Left/Right"));
+    assert!(text.contains("f search"));
+    assert!(!text.contains("/ search"));
+    #[cfg(windows)]
+    assert!(text.contains("IIS: / route host"));
     assert!(text.contains("Settings: Up/Down severity Enter apply"));
     assert!(!text.contains("i/w/e/0"));
     assert!(text.contains("no domain selected"));
+  }
+
+  #[test]
+  fn draw_overview_shows_no_daemon_recovery_state() {
+    let app = TuiApp::new(
+      test_runtime_paths("no-daemon"),
+      DaemonLaunchOptions::default(),
+    );
+
+    let text = render(&app);
+
+    assert!(text.contains("Daemon"));
+    assert!(text.contains("Not running"));
+    assert!(text.contains("Press s to start"));
+    assert!(text.contains("s start/reconnect"));
   }
 
   #[test]
@@ -1684,6 +1969,20 @@ mod tests {
   }
 
   #[test]
+  fn search_shortcut_uses_f_not_slash() {
+    let mut app = test_app();
+
+    app.handle_key_code(KeyCode::Char('/')).unwrap();
+
+    assert!(!app.model.search_mode);
+    assert!(app.model.search.is_empty());
+
+    app.handle_key_code(KeyCode::Char('f')).unwrap();
+
+    assert!(app.model.search_mode);
+  }
+
+  #[test]
   fn settings_keyboard_applies_selected_log_severity() {
     let mut app = test_app();
     app.model.view = View::Settings;
@@ -1808,7 +2107,7 @@ mod tests {
     assert_eq!(app.model.logs.entries[0].raw_message, "current");
     assert_eq!(app.model.logs.next_cursor.as_deref(), Some("seq:2"));
     assert!(app.model.logs.has_gap);
-    assert_eq!(app.message, "Shutdown failed: denied");
+    assert!(app.message.starts_with("Shutdown failed: denied"));
     assert!(!app.shutdown_request_in_flight);
   }
 
@@ -1823,12 +2122,15 @@ mod tests {
 
     app
       .responses_tx
-      .send(AppResponse::State(Ok(QueryStateResponse {
-        request_id: "state".to_string(),
-        accepted: true,
-        message: "no snapshot".to_string(),
-        snapshot: None,
-      })))
+      .send(AppResponse::State {
+        serial: app.state_request_serial,
+        result: Ok(QueryStateResponse {
+          request_id: "state".to_string(),
+          accepted: true,
+          message: "no snapshot".to_string(),
+          snapshot: None,
+        }),
+      })
       .unwrap();
     app
       .responses_tx
@@ -1846,9 +2148,13 @@ mod tests {
 
     app.drain_responses();
 
-    assert_eq!(app.message, "Log refresh failed: read failed");
+    assert!(app.message.starts_with("Log refresh failed: read failed"));
     assert_eq!(app.model.logs.status, LogStreamStatus::ReadError);
     assert_eq!(app.model.logs.read_error.as_deref(), Some("read failed"));
+    assert!(matches!(
+      app.model.daemon.state,
+      model::DaemonConnectionState::ConnectionFailed { .. }
+    ));
     assert!(!app.state_request_in_flight);
     assert!(!app.toggle_request_in_flight);
   }
@@ -1884,6 +2190,15 @@ mod tests {
         message: "IIS binding `app.localhost` handed off to Cadder.".to_string(),
         binding: None,
         issue: None,
+        steps: vec![cadder_protocol::IisOperationStep {
+          step_id: "iis-remove-public-binding".to_string(),
+          label: "Remove public binding.".to_string(),
+          privilege_level: cadder_protocol::IisPrivilegeLevel::Administrator,
+          status: cadder_protocol::IisOperationStepStatus::Succeeded,
+          approval: cadder_protocol::IisElevationApproval::Approved,
+          issue: None,
+        }],
+        follow_up_actions: Vec::new(),
       })))
       .unwrap();
 
@@ -1892,10 +2207,12 @@ mod tests {
     assert_eq!(app.model.iis.bindings.len(), 1);
     assert!(app.model.iis.request_in_flight);
     assert!(!app.model.iis.action_in_flight);
-    assert_eq!(
-      app.message,
-      "IIS binding `app.localhost` handed off to Cadder."
+    assert!(
+      app
+        .message
+        .starts_with("IIS binding `app.localhost` handed off to Cadder.")
     );
+    assert!(app.message.contains("admin-approved"));
   }
 
   #[cfg(windows)]
@@ -1927,16 +2244,120 @@ mod tests {
     assert_eq!(app.message, "Wildcard IIS bindings need a route host.");
 
     app.handle_key_code(KeyCode::Char('/')).unwrap();
+    assert!(app.model.iis.route_host_input_mode);
+    assert!(!app.model.search_mode);
     for ch in "iis-app.localhost".chars() {
       app.handle_key_code(KeyCode::Char(ch)).unwrap();
     }
     app.handle_key_code(KeyCode::Enter).unwrap();
     app.handle_key_code(KeyCode::Char(' ')).unwrap();
 
-    assert!(app.model.search.is_empty());
     assert_eq!(app.model.iis.route_host_input, "iis-app.localhost");
+    assert_eq!(
+      app
+        .model
+        .iis
+        .route_host_for_binding("Default Web Site|https|*:443:"),
+      Some("iis-app.localhost")
+    );
+    assert!(app.model.search.is_empty());
     assert!(!app.model.iis.route_host_input_mode);
     assert!(app.model.iis.action_in_flight);
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn iis_route_host_input_is_scoped_to_selected_binding() {
+    let mut app = test_app();
+    app.model.view = View::IisHandoff;
+    app.model.iis.bindings = vec![
+      cadder_protocol::IisBinding {
+        identity: cadder_protocol::IisBindingIdentity {
+          binding_id: "Default Web Site|https|*:443:".to_string(),
+          site_name: "Default Web Site".to_string(),
+          protocol: "https".to_string(),
+          binding_information: "*:443:".to_string(),
+        },
+        ip_address: "*".to_string(),
+        port: 443,
+        host_header: String::new(),
+        domain_key: None,
+        handoff_state: cadder_protocol::IisHandoffState::MissingRoute,
+        issue: None,
+        restore_metadata: None,
+      },
+      cadder_protocol::IisBinding {
+        identity: cadder_protocol::IisBindingIdentity {
+          binding_id: "Default Web Site|http|*:80:".to_string(),
+          site_name: "Default Web Site".to_string(),
+          protocol: "http".to_string(),
+          binding_information: "*:80:".to_string(),
+        },
+        ip_address: "*".to_string(),
+        port: 80,
+        host_header: String::new(),
+        domain_key: None,
+        handoff_state: cadder_protocol::IisHandoffState::MissingRoute,
+        issue: None,
+        restore_metadata: None,
+      },
+    ];
+
+    app.handle_key_code(KeyCode::Char('/')).unwrap();
+    for ch in "default.local-dev.thinksmart.com".chars() {
+      app.handle_key_code(KeyCode::Char(ch)).unwrap();
+    }
+    app.handle_key_code(KeyCode::Enter).unwrap();
+
+    assert_eq!(
+      app
+        .model
+        .iis
+        .route_host_for_binding("Default Web Site|https|*:443:"),
+      Some("default.local-dev.thinksmart.com")
+    );
+    assert_eq!(
+      app
+        .model
+        .iis
+        .route_host_for_binding("Default Web Site|http|*:80:"),
+      None
+    );
+
+    let text = render(&app);
+    assert!(text.contains("default.local-dev.thinksmart.com"));
+    assert!(text.contains("IIS route host set: default.local-dev.thinksmart.com"));
+
+    app.handle_key_code(KeyCode::Down).unwrap();
+    let text = render(&app);
+
+    assert!(!text.contains("IIS route host set: default.local-dev.thinksmart.com"));
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn iis_host_display_uses_domain_key_when_original_host_is_empty() {
+    let model = model::IisViewModel::default();
+    let binding = cadder_protocol::IisBinding {
+      identity: cadder_protocol::IisBindingIdentity {
+        binding_id: "Default Web Site|https|*:443:".to_string(),
+        site_name: "Default Web Site".to_string(),
+        protocol: "https".to_string(),
+        binding_information: "*:443:".to_string(),
+      },
+      ip_address: "*".to_string(),
+      port: 443,
+      host_header: String::new(),
+      domain_key: Some("default.local-dev.thinksmart.com".to_string()),
+      handoff_state: cadder_protocol::IisHandoffState::HandedOff,
+      issue: None,
+      restore_metadata: None,
+    };
+
+    assert_eq!(
+      iis_host_display(&binding, &model),
+      "default.local-dev.thinksmart.com"
+    );
   }
 
   #[tokio::test]
@@ -1954,12 +2375,15 @@ mod tests {
       .unwrap();
     app
       .responses_tx
-      .send(AppResponse::State(Ok(QueryStateResponse {
-        request_id: "state".to_string(),
-        accepted: true,
-        message: "old snapshot".to_string(),
-        snapshot: Some(snapshot()),
-      })))
+      .send(AppResponse::State {
+        serial: app.state_request_serial,
+        result: Ok(QueryStateResponse {
+          request_id: "state".to_string(),
+          accepted: true,
+          message: "old snapshot".to_string(),
+          snapshot: Some(snapshot()),
+        }),
+      })
       .unwrap();
 
     app.drain_responses();
@@ -1967,7 +2391,65 @@ mod tests {
     assert!(app.state_request_in_flight);
     assert!(!app.state_refresh_pending);
     drain_until(&mut app, |app| !app.state_request_in_flight).await;
-    assert!(app.message.starts_with("State refresh failed:"));
+    assert!(app.message.starts_with("Daemon unavailable:"));
+  }
+
+  #[tokio::test]
+  async fn daemon_start_response_marks_connected_after_valid_snapshot() {
+    let mut app = test_app();
+    app.daemon_start_in_flight = true;
+    app.model.mark_daemon_starting(DAEMON_START_MESSAGE);
+    app
+      .responses_tx
+      .send(AppResponse::DaemonStart(Ok(QueryStateResponse {
+        request_id: "state".to_string(),
+        accepted: true,
+        message: "connected".to_string(),
+        snapshot: Some(snapshot()),
+      })))
+      .unwrap();
+
+    app.drain_responses();
+
+    assert!(!app.daemon_start_in_flight);
+    assert!(app.model.can_use_daemon());
+    assert_eq!(app.model.daemon.state.label(), "Connected");
+    assert_eq!(app.message, "cadderd started and connected.");
+  }
+
+  #[tokio::test]
+  async fn daemon_start_failure_stays_usable_and_prevents_overlap() {
+    let paths = test_runtime_paths("start-fail");
+    let missing_daemon = paths.runtime_dir().join("missing-cadderd");
+    let mut app = TuiApp::new(
+      paths,
+      DaemonLaunchOptions {
+        explicit_daemon: Some(missing_daemon),
+        ..DaemonLaunchOptions::default()
+      },
+    );
+    app.state_request_in_flight = true;
+    app.state_request_serial = 7;
+
+    app.start_daemon();
+    assert!(app.daemon_start_in_flight);
+    assert!(!app.state_request_in_flight);
+    assert_eq!(app.state_request_serial, 8);
+    assert_eq!(app.model.daemon.state.label(), "Starting");
+
+    app.start_daemon();
+    assert_eq!(app.message, "Daemon start is already in progress.");
+
+    drain_until(&mut app, |app| !app.daemon_start_in_flight).await;
+
+    assert_eq!(app.model.daemon.state.label(), "Start failed");
+    assert!(app.message.starts_with("Daemon start failed:"));
+    assert!(app.model.can_start_daemon());
+
+    app.last_state_refresh = Instant::now() - STATE_REFRESH_INTERVAL - Duration::from_millis(10);
+    app.maybe_refresh_state();
+    assert!(!app.state_request_in_flight);
+    assert_eq!(app.model.daemon.state.label(), "Start failed");
   }
 
   #[tokio::test]
@@ -1980,7 +2462,8 @@ mod tests {
 
     drain_until(&mut app, |app| !app.state_request_in_flight).await;
 
-    assert!(app.message.starts_with("State refresh failed:"));
+    assert!(app.message.starts_with("Daemon unavailable:"));
+    assert!(!app.model.can_use_daemon());
   }
 
   #[tokio::test]
@@ -2002,7 +2485,27 @@ mod tests {
     assert_eq!(app.last_state_refresh, dispatched_at);
 
     drain_until(&mut app, |app| !app.state_request_in_flight).await;
-    assert!(app.message.starts_with("State refresh failed:"));
+    assert!(app.message.starts_with("Daemon unavailable:"));
+  }
+
+  #[cfg(windows)]
+  #[tokio::test]
+  async fn first_successful_state_snapshot_starts_iis_discovery() {
+    let mut app = TuiApp::new(
+      test_runtime_paths("initial-iis"),
+      DaemonLaunchOptions::default(),
+    );
+
+    app.apply_state_response(QueryStateResponse {
+      request_id: "state".to_string(),
+      accepted: true,
+      message: "connected".to_string(),
+      snapshot: Some(snapshot()),
+    });
+
+    assert!(app.model.can_use_daemon());
+    assert!(app.model.iis.request_in_flight);
+    assert!(app.model.iis.loading);
   }
 
   #[tokio::test]
@@ -2029,6 +2532,34 @@ mod tests {
     drain_until(&mut app, |app| !app.toggle_request_in_flight).await;
 
     assert!(app.message.starts_with("Toggle failed:"));
+  }
+
+  #[test]
+  fn daemon_dependent_actions_are_guarded_while_unavailable() {
+    let mut app = test_app();
+    app.model.mark_daemon_unavailable(
+      DaemonUnavailableKind::NotRunning,
+      "Daemon socket was not found.",
+    );
+
+    app.model.view = View::Entrypoints;
+    app.start_toggle_selected();
+    assert!(!app.toggle_request_in_flight);
+    assert!(app.message.starts_with("Activation changes requires"));
+
+    app.model.view = View::Domains;
+    app.open_selected_domain_logs();
+    assert_eq!(app.model.view, View::Logs);
+    assert!(!app.model.logs.request_in_flight);
+    assert!(app.message.starts_with("Log refresh requires"));
+
+    app.last_log_refresh = Instant::now() - LOG_REFRESH_INTERVAL - Duration::from_millis(10);
+    app.maybe_tail_logs();
+    assert!(!app.model.logs.request_in_flight);
+
+    app.start_shutdown_daemon();
+    assert!(!app.shutdown_request_in_flight);
+    assert!(app.message.starts_with("Daemon shutdown requires"));
   }
 
   #[tokio::test]
@@ -2176,6 +2707,7 @@ mod tests {
     });
     assert_eq!(app.message, "updated");
     assert_eq!(app.model.summary().entrypoints, 2);
+    assert!(app.model.can_use_daemon());
 
     app.apply_state_response(QueryStateResponse {
       request_id: "state".to_string(),
@@ -2184,6 +2716,10 @@ mod tests {
       snapshot: None,
     });
     assert_eq!(app.message, "Daemon returned no state snapshot.");
+    assert!(matches!(
+      app.model.daemon.state,
+      model::DaemonConnectionState::ConnectionFailed { .. }
+    ));
   }
 
   #[test]

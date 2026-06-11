@@ -5,9 +5,9 @@ status: Done
 assignee:
   - '@agent'
 created_date: '2026-06-10 11:29'
-updated_date: '2026-06-10 15:27'
+updated_date: '2026-06-11 16:18'
 labels: []
-milestone: m-1
+milestone: v1.0
 dependencies: []
 references:
   - AGENTS.md

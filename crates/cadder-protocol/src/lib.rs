@@ -518,6 +518,9 @@ pub enum IisHandoffState {
 pub enum IisIssueKind {
   IisUnavailable,
   InsufficientPrivileges,
+  ElevationRequired,
+  ElevationDenied,
+  ElevationUnsupported,
   UnsupportedBindingShape,
   Conflict,
   MissingBinding,
@@ -554,6 +557,82 @@ pub struct IisRestoreMetadataSummary {
   pub port: u16,
   pub host_header: String,
   pub binding_information: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IisPrivilegeLevel {
+  User,
+  Administrator,
+  Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IisOperationStepStatus {
+  Pending,
+  Succeeded,
+  RequiresElevation,
+  Approved,
+  Denied,
+  Failed,
+  Skipped,
+  Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IisElevationApproval {
+  NotRequired,
+  Required,
+  Approved,
+  Denied,
+  Unsupported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IisOperationStep {
+  pub step_id: String,
+  pub label: String,
+  pub privilege_level: IisPrivilegeLevel,
+  pub status: IisOperationStepStatus,
+  pub approval: IisElevationApproval,
+  pub issue: Option<IisIssue>,
+}
+
+impl IisOperationStep {
+  pub fn user(step_id: impl Into<String>, label: impl Into<String>) -> Self {
+    Self {
+      step_id: step_id.into(),
+      label: label.into(),
+      privilege_level: IisPrivilegeLevel::User,
+      status: IisOperationStepStatus::Pending,
+      approval: IisElevationApproval::NotRequired,
+      issue: None,
+    }
+  }
+
+  pub fn administrator(step_id: impl Into<String>, label: impl Into<String>) -> Self {
+    Self {
+      step_id: step_id.into(),
+      label: label.into(),
+      privilege_level: IisPrivilegeLevel::Administrator,
+      status: IisOperationStepStatus::RequiresElevation,
+      approval: IisElevationApproval::Required,
+      issue: None,
+    }
+  }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IisFollowUpAction {
+  RetryElevation,
+  RollbackHandoff,
+  RetryRestore,
+  RemoveLoopbackBinding,
+  ClearRestoreMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -602,6 +681,8 @@ pub struct SetIisHandoffResponse {
   pub message: String,
   pub binding: Option<IisBinding>,
   pub issue: Option<IisIssue>,
+  pub steps: Vec<IisOperationStep>,
+  pub follow_up_actions: Vec<IisFollowUpAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -702,6 +783,35 @@ mod tests {
     assert!(json.contains("\"handoffState\":\"available\""));
     assert!(json.contains("\"missingRoute\""));
     assert_eq!(decoded, response);
+
+    let handoff_response = SetIisHandoffResponse {
+      request_id: "iis-on".to_string(),
+      accepted: false,
+      message: "Administrator approval was denied.".to_string(),
+      binding: None,
+      issue: Some(IisIssue::new(
+        IisIssueKind::ElevationDenied,
+        "Administrator approval was denied.",
+      )),
+      steps: vec![IisOperationStep {
+        step_id: "iis-remove-public-binding".to_string(),
+        label: "Remove IIS public binding.".to_string(),
+        privilege_level: IisPrivilegeLevel::Administrator,
+        status: IisOperationStepStatus::Denied,
+        approval: IisElevationApproval::Denied,
+        issue: None,
+      }],
+      follow_up_actions: vec![IisFollowUpAction::RetryElevation],
+    };
+    let envelope =
+      IpcEnvelope::new(message_types::SET_IIS_HANDOFF_RESPONSE, &handoff_response).unwrap();
+    let json = serde_json::to_string(&envelope).unwrap();
+    let decoded: SetIisHandoffResponse = envelope.decode().unwrap();
+
+    assert!(json.contains("\"privilegeLevel\":\"administrator\""));
+    assert!(json.contains("\"approval\":\"denied\""));
+    assert!(json.contains("\"retryElevation\""));
+    assert_eq!(decoded, handoff_response);
 
     let request = SetIisHandoffRequest {
       request_id: "iis-on".to_string(),

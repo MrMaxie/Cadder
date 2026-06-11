@@ -1,8 +1,8 @@
 use crate::{
   CaddyConfigCoordinator,
   iis::{
-    IisBindingRecord, IisMetadataStore, IisProvider, IisRestoreRecord, binding_to_view,
-    unsupported_binding_issue,
+    IisBindingRecord, IisMetadataStore, IisMutation, IisProvider, IisRestoreRecord,
+    binding_to_view, unsupported_binding_issue,
   },
   logs::{CaddyLogStore, LogQuery},
   paths::RuntimePaths,
@@ -10,11 +10,12 @@ use crate::{
 use anyhow::Result;
 use cadder_protocol::{
   ActivationState, BasicResponse, ConfigApplyStatus, ConfigState, EntrypointRegistration,
-  GuiStateSnapshot, HeartbeatEntrypointRequest, IisBinding, IisHandoffState, IisIssue,
-  IisIssueKind, LogStreamIdentity, QueryIisBindingsResponse, QueryLogsResponse, QueryStateResponse,
-  RegisterEntrypointResponse, RuntimeState, SetDomainEnabledRequest, SetEntrypointEnabledRequest,
-  SetIisHandoffRequest, SetIisHandoffResponse, StateChangeKind, StateChangedEvent,
-  canonicalize_domain,
+  GuiStateSnapshot, HeartbeatEntrypointRequest, IisBinding, IisElevationApproval,
+  IisFollowUpAction, IisHandoffState, IisIssue, IisIssueKind, IisOperationStep,
+  IisOperationStepStatus, LogStreamIdentity, QueryIisBindingsResponse, QueryLogsResponse,
+  QueryStateResponse, RegisterEntrypointResponse, RuntimeState, SetDomainEnabledRequest,
+  SetEntrypointEnabledRequest, SetIisHandoffRequest, SetIisHandoffResponse, StateChangeKind,
+  StateChangedEvent, canonicalize_domain,
 };
 use chrono::Utc;
 use std::{
@@ -467,38 +468,46 @@ impl DaemonState {
         IisIssue::new(IisIssueKind::MissingBinding, "IIS binding was not found."),
       );
     };
+    let mut steps = enable_iis_steps();
+    mark_step_succeeded(&mut steps, "iis-discover-bindings");
 
     if let Some(issue) = unsupported_binding_issue(&binding) {
+      mark_step_issue(&mut steps, "iis-classify-binding", &issue);
       let view = binding_to_view(
         &binding,
         IisHandoffState::Unsupported,
         Some(issue.clone()),
         None,
       );
-      return iis_response(
+      return iis_response_with_steps(
         request.request_id,
         false,
         issue.message.clone(),
         Some(view),
-        issue,
+        issue.clone(),
+        steps,
+        Vec::new(),
       );
     }
 
     let domain_key = match route_host_for_binding(&binding, request.route_host.as_deref()) {
       Ok(domain_key) => domain_key,
       Err(issue) => {
+        mark_step_issue(&mut steps, "iis-classify-binding", &issue);
         let view = binding_to_view(
           &binding,
           IisHandoffState::MissingRoute,
           Some(issue.clone()),
           None,
         );
-        return iis_response(
+        return iis_response_with_steps(
           request.request_id,
           false,
           issue.message.clone(),
           Some(view),
-          issue,
+          issue.clone(),
+          steps,
+          Vec::new(),
         );
       }
     };
@@ -507,18 +516,21 @@ impl DaemonState {
         IisIssueKind::Conflict,
         format!("IIS host `{domain_key}` appears on multiple bindings."),
       );
+      mark_step_issue(&mut steps, "iis-classify-binding", &issue);
       let view = binding_to_view(
         &binding,
         IisHandoffState::Conflict,
         Some(issue.clone()),
         None,
       );
-      return iis_response(
+      return iis_response_with_steps(
         request.request_id,
         false,
         issue.message.clone(),
         Some(view),
-        issue,
+        issue.clone(),
+        steps,
+        Vec::new(),
       );
     }
 
@@ -527,20 +539,24 @@ impl DaemonState {
       active_registration_conflict(&inner.registrations, &domain_key)
     };
     if let Some(issue) = registration_conflict {
+      mark_step_issue(&mut steps, "iis-classify-binding", &issue);
       let view = binding_to_view(
         &binding,
         IisHandoffState::Conflict,
         Some(issue.clone()),
         None,
       );
-      return iis_response(
+      return iis_response_with_steps(
         request.request_id,
         false,
         issue.message.clone(),
         Some(view),
-        issue,
+        issue.clone(),
+        steps,
+        Vec::new(),
       );
     }
+    mark_step_succeeded(&mut steps, "iis-classify-binding");
 
     let backend_binding =
       binding.backend_http_binding(backend_port_for_binding(&binding), &domain_key);
@@ -559,49 +575,58 @@ impl DaemonState {
         IisIssueKind::ProviderError,
         format!("Could not persist IIS restore metadata: {error}"),
       );
-      return iis_response(
+      mark_step_issue(&mut steps, "iis-write-restore-metadata", &issue);
+      return iis_response_with_steps(
         request.request_id,
         false,
         issue.message.clone(),
         None,
-        issue,
+        issue.clone(),
+        steps,
+        Vec::new(),
       );
     }
+    mark_step_succeeded(&mut steps, "iis-write-restore-metadata");
 
-    if let Err(issue) = self.iis_provider.add_binding(&backend_binding).await {
+    let privileged_step_ids = ["iis-create-loopback-binding", "iis-remove-public-binding"];
+    let privileged_reason = format!(
+      "Cadder needs administrator approval to hand IIS host `{domain_key}` to Caddy by creating the loopback backend binding and removing the original public IIS binding."
+    );
+    if let Err(issue) = self
+      .iis_provider
+      .execute_privileged_batch(
+        &privileged_reason,
+        &[
+          IisMutation::add(backend_binding.clone()),
+          IisMutation::remove(binding.clone()),
+        ],
+      )
+      .await
+    {
       let _ = self.iis_store.remove(&binding.binding_id()).await;
+      mark_privileged_batch_issue(&mut steps, &privileged_step_ids, &issue);
+      mark_step_skipped(&mut steps, "caddy-apply-proxy-route");
       let view = binding_to_view(
         &binding,
         IisHandoffState::Available,
         Some(issue.clone()),
         None,
       );
-      return iis_response(
+      let mut follow_up_actions = follow_up_actions_for_issue(&issue);
+      if matches!(issue.kind, IisIssueKind::ProviderError) {
+        follow_up_actions.push(IisFollowUpAction::RemoveLoopbackBinding);
+      }
+      return iis_response_with_steps(
         request.request_id,
         false,
         issue.message.clone(),
         Some(view),
-        issue,
+        issue.clone(),
+        steps,
+        follow_up_actions,
       );
     }
-
-    if let Err(issue) = self.iis_provider.remove_binding(&binding).await {
-      let _ = self.iis_provider.remove_binding(&backend_binding).await;
-      let _ = self.iis_store.remove(&binding.binding_id()).await;
-      let view = binding_to_view(
-        &binding,
-        IisHandoffState::Available,
-        Some(issue.clone()),
-        None,
-      );
-      return iis_response(
-        request.request_id,
-        false,
-        issue.message.clone(),
-        Some(view),
-        issue,
-      );
-    }
+    mark_privileged_batch_approved(&mut steps, &privileged_step_ids);
 
     let apply_state = {
       let mut inner = self.inner.lock().await;
@@ -619,6 +644,11 @@ impl DaemonState {
     };
 
     if apply_state.status == ConfigApplyStatus::Failed {
+      let apply_issue = IisIssue::new(
+        IisIssueKind::ProviderError,
+        "Cadder could not apply the IIS proxy route.",
+      );
+      mark_step_issue(&mut steps, "caddy-apply-proxy-route", &apply_issue);
       {
         let mut inner = self.inner.lock().await;
         inner.coordinator.remove_iis_proxy_route(&domain_key);
@@ -628,15 +658,36 @@ impl DaemonState {
           .publish_locked(&mut inner, StateChangeKind::RegistrationsChanged, None)
           .await;
       }
-      let rollback = self.iis_provider.restore_binding(&binding).await;
+      steps.push(IisOperationStep::administrator(
+        "iis-rollback-public-binding",
+        "Restore original IIS binding after Caddy apply failure.",
+      ));
+      steps.push(IisOperationStep::administrator(
+        "iis-rollback-loopback-binding",
+        "Remove loopback IIS binding after Caddy apply failure.",
+      ));
+      let rollback_step_ids = [
+        "iis-rollback-public-binding",
+        "iis-rollback-loopback-binding",
+      ];
+      let rollback = self
+        .iis_provider
+        .execute_privileged_batch(
+          "Cadder needs administrator approval to roll IIS back after Caddy route apply failed.",
+          &[
+            IisMutation::restore(binding.clone()),
+            IisMutation::remove(backend_binding.clone()),
+          ],
+        )
+        .await;
       let (issue, view) = match rollback {
         Ok(()) => {
-          let _ = self.iis_provider.remove_binding(&backend_binding).await;
           let _ = self.iis_store.remove(&binding.binding_id()).await;
           let issue = IisIssue::new(
             IisIssueKind::RollbackSucceeded,
             "Cadder could not apply the IIS proxy route; original IIS binding was restored.",
           );
+          mark_privileged_batch_approved(&mut steps, &rollback_step_ids);
           let view = binding_to_view(
             &binding,
             IisHandoffState::Available,
@@ -653,18 +704,23 @@ impl DaemonState {
               error.message
             ),
           );
+          mark_privileged_batch_issue(&mut steps, &rollback_step_ids, &issue);
           let view = handoff_binding_to_view(&binding, Some(issue.clone()), &restore);
           (issue, view)
         }
       };
-      return iis_response(
+      let follow_up_actions = follow_up_actions_for_issue(&issue);
+      return iis_response_with_steps(
         request.request_id,
         false,
         issue.message.clone(),
         Some(view),
-        issue,
+        issue.clone(),
+        steps,
+        follow_up_actions,
       );
     }
+    mark_step_succeeded(&mut steps, "caddy-apply-proxy-route");
 
     let view = binding_to_view(
       &binding,
@@ -683,23 +739,31 @@ impl DaemonState {
       ),
       binding: Some(view),
       issue: None,
+      steps,
+      follow_up_actions: Vec::new(),
     }
   }
 
   async fn disable_iis_handoff(&self, request: SetIisHandoffRequest) -> SetIisHandoffResponse {
+    let mut steps = disable_iis_steps();
     let handoffs = self.iis_store.snapshot().await;
     let Some(restore) = handoffs.get(&request.binding_id).cloned() else {
-      return iis_response(
+      let issue = IisIssue::new(
+        IisIssueKind::MissingBinding,
+        "IIS handoff restore metadata was not found.",
+      );
+      mark_step_issue(&mut steps, "iis-read-restore-metadata", &issue);
+      return iis_response_with_steps(
         request.request_id,
         false,
         "IIS handoff restore metadata was not found.",
         None,
-        IisIssue::new(
-          IisIssueKind::MissingBinding,
-          "IIS handoff restore metadata was not found.",
-        ),
+        issue.clone(),
+        steps,
+        Vec::new(),
       );
     };
+    mark_step_succeeded(&mut steps, "iis-read-restore-metadata");
     let backend_binding = restore.backend_binding.clone().unwrap_or_else(|| {
       restore.binding.backend_http_binding(
         backend_port_for_binding(&restore.binding),
@@ -727,12 +791,15 @@ impl DaemonState {
           Some(issue.clone()),
           Some(restore.binding.restore_summary()),
         );
-        return iis_response(
+        mark_step_issue(&mut steps, "caddy-remove-proxy-route", &issue);
+        return iis_response_with_steps(
           request.request_id,
           false,
           issue.message.clone(),
           Some(view),
-          issue,
+          issue.clone(),
+          steps,
+          Vec::new(),
         );
       }
     }
@@ -748,8 +815,20 @@ impl DaemonState {
         .publish_locked(&mut inner, StateChangeKind::RegistrationsChanged, None)
         .await;
     }
+    mark_step_succeeded(&mut steps, "caddy-remove-proxy-route");
 
-    if let Err(issue) = self.iis_provider.restore_binding(&restore.binding).await {
+    let privileged_step_ids = ["iis-restore-public-binding", "iis-remove-loopback-binding"];
+    if let Err(issue) = self
+      .iis_provider
+      .execute_privileged_batch(
+        "Cadder needs administrator approval to restore the original IIS binding and remove the loopback backend binding.",
+        &[
+          IisMutation::restore(restore.binding.clone()),
+          IisMutation::remove(backend_binding.clone()),
+        ],
+      )
+      .await
+    {
       let mut inner = self.inner.lock().await;
       inner.coordinator.set_iis_proxy_route(
         request.binding_id.clone(),
@@ -761,58 +840,44 @@ impl DaemonState {
       self
         .publish_locked(&mut inner, StateChangeKind::RegistrationsChanged, None)
         .await;
-      let view = binding_to_view(
-        &restore.binding,
-        IisHandoffState::HandedOff,
-        Some(issue.clone()),
-        Some(restore.binding.restore_summary()),
-      );
       let issue = IisIssue::new(
         IisIssueKind::RestoreFailed,
         format!(
-          "Cadder disabled the route but could not restore IIS binding: {}",
+          "Cadder restored the proxy route because the privileged IIS restore batch failed: {}",
           issue.message
         ),
       );
-      return iis_response(
-        request.request_id,
-        false,
-        issue.message.clone(),
-        Some(view),
-        issue,
-      );
-    }
-
-    if let Err(issue) = self.iis_provider.remove_binding(&backend_binding).await {
-      let issue = IisIssue::new(
-        IisIssueKind::RestoreFailed,
-        format!(
-          "IIS binding was restored but loopback backend binding could not be removed: {}",
-          issue.message
-        ),
-      );
+      mark_privileged_batch_issue(&mut steps, &privileged_step_ids, &issue);
+      mark_step_skipped(&mut steps, "iis-clear-restore-metadata");
       let view = handoff_binding_to_view(&restore.binding, Some(issue.clone()), &restore);
-      return iis_response(
+      return iis_response_with_steps(
         request.request_id,
         false,
         issue.message.clone(),
         Some(view),
-        issue,
+        issue.clone(),
+        steps,
+        follow_up_actions_for_issue(&issue),
       );
     }
+    mark_privileged_batch_approved(&mut steps, &privileged_step_ids);
     if let Err(error) = self.iis_store.remove(&request.binding_id).await {
       let issue = IisIssue::new(
         IisIssueKind::ProviderError,
         format!("IIS binding was restored but restore metadata could not be cleared: {error}"),
       );
-      return iis_response(
+      mark_step_issue(&mut steps, "iis-clear-restore-metadata", &issue);
+      return iis_response_with_steps(
         request.request_id,
         false,
         issue.message.clone(),
         None,
-        issue,
+        issue.clone(),
+        steps,
+        vec![IisFollowUpAction::ClearRestoreMetadata],
       );
     }
+    mark_step_succeeded(&mut steps, "iis-clear-restore-metadata");
 
     let view = binding_to_view(&restore.binding, IisHandoffState::Available, None, None);
     SetIisHandoffResponse {
@@ -821,6 +886,8 @@ impl DaemonState {
       message: format!("IIS binding `{}` restored to IIS.", restore.domain_key),
       binding: Some(view),
       issue: None,
+      steps,
+      follow_up_actions: Vec::new(),
     }
   }
 
@@ -1030,6 +1097,122 @@ fn caddy_front_door_needed(
     })
 }
 
+fn enable_iis_steps() -> Vec<IisOperationStep> {
+  vec![
+    IisOperationStep::user("iis-discover-bindings", "Discover IIS bindings."),
+    IisOperationStep::user("iis-classify-binding", "Classify selected IIS binding."),
+    IisOperationStep::user(
+      "iis-write-restore-metadata",
+      "Write IIS restore metadata before mutation.",
+    ),
+    IisOperationStep::administrator(
+      "iis-create-loopback-binding",
+      "Create loopback IIS binding for Cadder proxying.",
+    ),
+    IisOperationStep::administrator(
+      "iis-remove-public-binding",
+      "Remove original public IIS binding.",
+    ),
+    IisOperationStep::user("caddy-apply-proxy-route", "Apply Caddy IIS proxy route."),
+  ]
+}
+
+fn disable_iis_steps() -> Vec<IisOperationStep> {
+  vec![
+    IisOperationStep::user("iis-read-restore-metadata", "Read IIS restore metadata."),
+    IisOperationStep::user("caddy-remove-proxy-route", "Remove Caddy IIS proxy route."),
+    IisOperationStep::administrator(
+      "iis-restore-public-binding",
+      "Restore original public IIS binding.",
+    ),
+    IisOperationStep::administrator(
+      "iis-remove-loopback-binding",
+      "Remove loopback IIS backend binding.",
+    ),
+    IisOperationStep::user("iis-clear-restore-metadata", "Clear IIS restore metadata."),
+  ]
+}
+
+fn mark_step_succeeded(steps: &mut [IisOperationStep], step_id: &str) {
+  if let Some(step) = steps.iter_mut().find(|step| step.step_id == step_id) {
+    step.status = IisOperationStepStatus::Succeeded;
+    step.approval = IisElevationApproval::NotRequired;
+  }
+}
+
+fn mark_step_issue(steps: &mut [IisOperationStep], step_id: &str, issue: &IisIssue) {
+  if let Some(step) = steps.iter_mut().find(|step| step.step_id == step_id) {
+    step.status = match issue.kind {
+      IisIssueKind::ElevationDenied => IisOperationStepStatus::Denied,
+      IisIssueKind::ElevationUnsupported | IisIssueKind::IisUnavailable => {
+        IisOperationStepStatus::Unsupported
+      }
+      _ => IisOperationStepStatus::Failed,
+    };
+    step.issue = Some(issue.clone());
+  }
+}
+
+fn mark_privileged_batch_approved(steps: &mut [IisOperationStep], step_ids: &[&str]) {
+  for step_id in step_ids {
+    if let Some(step) = steps.iter_mut().find(|step| step.step_id == *step_id) {
+      step.status = IisOperationStepStatus::Succeeded;
+      step.approval = IisElevationApproval::Approved;
+    }
+  }
+}
+
+fn mark_privileged_batch_issue(
+  steps: &mut [IisOperationStep],
+  step_ids: &[&str],
+  issue: &IisIssue,
+) {
+  for step_id in step_ids {
+    if let Some(step) = steps.iter_mut().find(|step| step.step_id == *step_id) {
+      step.status = match issue.kind {
+        IisIssueKind::ElevationDenied => IisOperationStepStatus::Denied,
+        IisIssueKind::ElevationUnsupported | IisIssueKind::IisUnavailable => {
+          IisOperationStepStatus::Unsupported
+        }
+        _ => IisOperationStepStatus::Failed,
+      };
+      step.approval = match issue.kind {
+        IisIssueKind::ElevationDenied => IisElevationApproval::Denied,
+        IisIssueKind::ElevationUnsupported | IisIssueKind::IisUnavailable => {
+          IisElevationApproval::Unsupported
+        }
+        _ => IisElevationApproval::Approved,
+      };
+      step.issue = Some(issue.clone());
+    }
+  }
+}
+
+fn mark_step_skipped(steps: &mut [IisOperationStep], step_id: &str) {
+  if let Some(step) = steps.iter_mut().find(|step| step.step_id == step_id) {
+    step.status = IisOperationStepStatus::Skipped;
+  }
+}
+
+fn follow_up_actions_for_issue(issue: &IisIssue) -> Vec<IisFollowUpAction> {
+  match issue.kind {
+    IisIssueKind::ElevationDenied
+    | IisIssueKind::ElevationRequired
+    | IisIssueKind::InsufficientPrivileges => vec![IisFollowUpAction::RetryElevation],
+    IisIssueKind::ElevationUnsupported => Vec::new(),
+    IisIssueKind::RollbackFailed => vec![
+      IisFollowUpAction::RollbackHandoff,
+      IisFollowUpAction::RetryElevation,
+    ],
+    IisIssueKind::RestoreFailed => vec![
+      IisFollowUpAction::RetryRestore,
+      IisFollowUpAction::RetryElevation,
+    ],
+    IisIssueKind::ProviderError => vec![IisFollowUpAction::RetryElevation],
+    _ => Vec::new(),
+  }
+}
+
 fn iis_response(
   request_id: String,
   accepted: bool,
@@ -1037,12 +1220,34 @@ fn iis_response(
   binding: Option<IisBinding>,
   issue: IisIssue,
 ) -> SetIisHandoffResponse {
+  iis_response_with_steps(
+    request_id,
+    accepted,
+    message,
+    binding,
+    issue,
+    Vec::new(),
+    Vec::new(),
+  )
+}
+
+fn iis_response_with_steps(
+  request_id: String,
+  accepted: bool,
+  message: impl Into<String>,
+  binding: Option<IisBinding>,
+  issue: IisIssue,
+  steps: Vec<IisOperationStep>,
+  follow_up_actions: Vec<IisFollowUpAction>,
+) -> SetIisHandoffResponse {
   SetIisHandoffResponse {
     request_id,
     accepted,
     message: message.into(),
     binding,
     issue: Some(issue),
+    steps,
+    follow_up_actions,
   }
 }
 
@@ -1550,12 +1755,102 @@ exit 1
         .map(|binding| binding.handoff_state),
       Some(IisHandoffState::HandedOff)
     );
+    assert!(enabled.steps.iter().any(|step| {
+      step.step_id == "iis-remove-public-binding"
+        && step.approval == IisElevationApproval::Approved
+        && step.status == IisOperationStepStatus::Succeeded
+    }));
     assert_eq!(handed_off.bindings.len(), 1);
     assert_eq!(
       handed_off.bindings[0].handoff_state,
       IisHandoffState::HandedOff
     );
     assert!(restored.accepted, "{restored:?}");
+    assert_eq!(rediscovered.bindings.len(), 1);
+    assert_eq!(
+      rediscovered.bindings[0].handoff_state,
+      IisHandoffState::Available
+    );
+  }
+
+  #[tokio::test]
+  async fn iis_handoff_denied_by_elevation_keeps_user_level_state_usable() {
+    let binding = iis_binding("Default Web Site", "http", "*:80:app.localhost");
+    let provider = IisProvider::fake(vec![binding.clone()]);
+    provider
+      .set_elevation_issue(IisIssue::new(
+        IisIssueKind::ElevationDenied,
+        "Administrator approval was denied.",
+      ))
+      .await;
+    let state = state_with_iis(provider);
+
+    let response = state
+      .set_iis_handoff(SetIisHandoffRequest {
+        request_id: "iis-on".to_string(),
+        binding_id: binding.binding_id(),
+        enabled: true,
+        route_host: None,
+      })
+      .await;
+    let rediscovered = state.query_iis_bindings("iis".to_string()).await;
+
+    assert!(!response.accepted);
+    assert_eq!(
+      response.issue.as_ref().map(|issue| issue.kind),
+      Some(IisIssueKind::ElevationDenied)
+    );
+    assert!(response.steps.iter().any(|step| {
+      step.step_id == "iis-remove-public-binding"
+        && step.approval == IisElevationApproval::Denied
+        && step.status == IisOperationStepStatus::Denied
+    }));
+    assert_eq!(
+      response.follow_up_actions,
+      vec![IisFollowUpAction::RetryElevation]
+    );
+    assert!(state.iis_store.snapshot().await.is_empty());
+    assert_eq!(rediscovered.bindings.len(), 1);
+    assert_eq!(
+      rediscovered.bindings[0].handoff_state,
+      IisHandoffState::Available
+    );
+  }
+
+  #[tokio::test]
+  async fn iis_handoff_reports_unsupported_elevation_without_mutating_iis() {
+    let binding = iis_binding("Default Web Site", "https", "*:443:secure.localhost");
+    let provider = IisProvider::fake(vec![binding.clone()]);
+    provider
+      .set_elevation_issue(IisIssue::new(
+        IisIssueKind::ElevationUnsupported,
+        "IIS elevation prompts are only available on Windows.",
+      ))
+      .await;
+    let state = state_with_iis(provider);
+
+    let response = state
+      .set_iis_handoff(SetIisHandoffRequest {
+        request_id: "iis-on".to_string(),
+        binding_id: binding.binding_id(),
+        enabled: true,
+        route_host: None,
+      })
+      .await;
+    let rediscovered = state.query_iis_bindings("iis".to_string()).await;
+
+    assert!(!response.accepted);
+    assert_eq!(
+      response.issue.as_ref().map(|issue| issue.kind),
+      Some(IisIssueKind::ElevationUnsupported)
+    );
+    assert!(response.follow_up_actions.is_empty());
+    assert!(response.steps.iter().any(|step| {
+      step.step_id == "iis-create-loopback-binding"
+        && step.approval == IisElevationApproval::Unsupported
+        && step.status == IisOperationStepStatus::Unsupported
+    }));
+    assert!(state.iis_store.snapshot().await.is_empty());
     assert_eq!(rediscovered.bindings.len(), 1);
     assert_eq!(
       rediscovered.bindings[0].handoff_state,

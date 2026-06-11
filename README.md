@@ -25,9 +25,9 @@ Each executable supports `--help` and `--version`.
 
 Full setup docs:
 
-- [Getting started](docs/site/src/content/docs/guides/getting-started.mdx)
-- [cadder.toml](docs/site/src/content/docs/guides/cadder-toml.mdx)
-- [How to use](docs/site/src/content/docs/guides/how-to-use.mdx)
+- [Getting started](docs/site/src/content/docs/quick-start/getting-started.mdx)
+- [cadder.toml](docs/site/src/content/docs/user-guide/cadder-toml.mdx)
+- [How to use](docs/site/src/content/docs/user-guide/how-to-use.mdx)
 - [Real Caddy resolution](docs/site/src/content/docs/reference/real-caddy-resolution.mdx)
 
 ## Commands
