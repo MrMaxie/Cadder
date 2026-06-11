@@ -1,40 +1,42 @@
 ---
 title: Windows
-description: Windows usage guidance for portable Cadder binaries and user-managed shim setup.
+description: Windows cookbook for Cadder binaries, user PATH setup, cadder.toml, and diagnostics.
 ---
 
-Cadder's Windows binaries use the normal `.exe` suffix: `cadderd.exe`, `cadder-tui.exe`, and `caddy.exe`.
+## Direct use
 
-## Direct portable use
+From the directory that contains Cadder:
 
 ```powershell
-.\.local\dist\cadder\caddy.exe run
-.\.local\dist\cadder\cadder-tui.exe
+.\caddy run
+.\cadder-tui
 ```
 
-Run these from the repository root or adjust the path to the portable directory.
+From any project directory where Cadder is on `PATH`:
+
+```powershell
+caddy run
+cadder-tui
+```
+
+## cadder.toml
+
+Point Cadder at the real Caddy executable in [cadder.toml](../cadder-toml/). On Windows, literal TOML strings let you write normal backslashes.
 
 ## Optional user PATH setup
 
-This example copies only the Cadder shim into a user-owned directory and updates the current PowerShell session:
+If you want `caddy run` to go through Cadder everywhere, put Cadder's shim before real Caddy on your user `PATH`. Keep the real Caddy binary somewhere else and reference it from `cadder.toml`.
+
+## TUI diagnostics
 
 ```powershell
-$cadder = "$HOME\bin\cadder"
-New-Item -ItemType Directory -Force $cadder
-Copy-Item .local\dist\cadder\caddy.exe "$cadder\caddy.exe"
-$env:Path = "$cadder;$env:Path"
-caddy run
+cadder-tui
 ```
 
-This does not persist `PATH` and does not change system settings. To make the setup permanent, edit your own user environment through your preferred Windows workflow.
+Use the dashboard for daemon state, domains, logs, diagnostics, and activation toggles.
 
-## Configure real Caddy
+## Recover from common failures
 
-If the shim shadows the real `caddy.exe`, put the real command in `cadder.toml`:
-
-```toml
-[caddy]
-real_command = "C:\\Tools\\Caddy\\caddy.exe"
-```
-
-Use a path outside the Cadder shim directory.
+- If Cadder cannot find real Caddy, check [cadder.toml](../cadder-toml/) first.
+- If `caddy run` starts real Caddy instead of Cadder, your shell is finding real Caddy before the Cadder shim.
+- If one project needs a different real Caddy binary, put a project-local `cadder.toml` in that project directory.

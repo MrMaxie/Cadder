@@ -1,0 +1,38 @@
+---
+title: cadder.toml
+description: Configure the real Caddy binary Cadder should run.
+---
+
+Cadder needs to know which executable is the real Caddy server. The usual place to put that is `cadder.toml` next to the Cadder binaries.
+
+```toml
+[caddy]
+real_command = "/absolute/path/to/caddy"
+```
+
+For Windows paths, use a literal TOML string if you want to write backslashes naturally:
+
+```toml
+[caddy]
+real_command = 'C:\Program Files\Caddy\caddy.exe'
+```
+
+## Recommended order
+
+1. Put `cadder.toml` next to the Cadder binaries for the default machine setup.
+2. Add a project-local `cadder.toml` only when one project needs a different real Caddy binary.
+3. Use CLI flags, environment variables, or `PATH` fallback for scripts and temporary overrides.
+
+The runtime resolver has a stricter precedence order so explicit command-line and project-level overrides can win. See [Real Caddy resolution](../../reference/real-caddy-resolution/) for every supported source.
+
+## Find the real Caddy path
+
+Use whichever command matches how Caddy is installed on your machine:
+
+```text
+which caddy
+where caddy
+caddy version
+```
+
+The configured command can be an absolute path, a relative path with a path separator, or a plain command resolved through `PATH`. Absolute paths are the least surprising option.

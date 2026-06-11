@@ -1,65 +1,40 @@
 ---
 title: Getting started
-description: Build Cadder, choose a real Caddy command, run a project through the shim, and inspect it in the TUI.
+description: Download Cadder, configure real Caddy, run a project through the shim, and inspect it in the TUI.
 ---
 
-## Prerequisites
+## What you need
 
-- Rust and Cargo for building Cadder.
-- A real Caddy binary available either on `PATH` or through Cadder configuration.
-- Bun only when working on this documentation site.
+- A real Caddy binary installed somewhere on your machine.
+- A Cadder release for your OS from [GitHub Releases](https://github.com/MrMaxie/Cadder/releases/latest).
+- A project with a `Caddyfile`.
 
-## Build and validate the workspace
+## Configure real Caddy
 
-From the repository root:
+Create `cadder.toml` next to the Cadder binaries and set the real Caddy command there. See [cadder.toml](../cadder-toml/) for Windows path syntax, project overrides, environment aliases, and the full set of supported command forms.
 
-```sh
-cargo run -p xtask -- check
-```
+## Choose how commands are found
 
-`xtask check` runs:
+The cleanest setup is to keep real Caddy out of the `PATH` slot used for day-to-day `caddy run`, point Cadder at real Caddy in `cadder.toml`, and expose Cadder's shim as the `caddy` command.
 
-```sh
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-```
-
-## Create a portable layout
-
-```sh
-cargo run -p xtask -- dist --out .local/dist/cadder
-```
-
-The layout contains `cadderd`, `cadder-tui`, `caddy`, and `cadder.toml`. On Windows the executables use `.exe`.
-
-Cadder does not edit system state during this step. The command builds release binaries, copies them into the output directory, writes a sample `cadder.toml`, and verifies the copied shim with `caddy --cadder-shim-info`.
-
-## Configure real Caddy when needed
-
-If the first safe `caddy` on `PATH` is not the real Caddy binary, set it explicitly:
-
-```toml
-[caddy]
-real_command = "/absolute/path/to/caddy"
-```
-
-Place that file in the project working directory for project-specific behavior, or next to the Cadder executable for portable-layout defaults.
+You can also run Cadder by direct path. That is useful for testing or for setups where you do not want to change shell lookup order.
 
 ## Run a project
 
-From a project directory with a `Caddyfile`:
-
 ```sh
-.local/dist/cadder/caddy run
+caddy run
 ```
 
-The shim starts or connects to `cadderd`, registers the project's config, and keeps the registration alive until the shim exits.
-
-## Inspect the daemon
+The shim starts or connects to `cadderd`, registers the project Caddyfile, and keeps that registration alive while the command is running.
 
 ```sh
-.local/dist/cadder/cadder-tui
+cadder-tui
 ```
 
-Use the TUI to inspect runtime state, registered entrypoints, domains, logs, diagnostics, activation toggles, and daemon shutdown.
+Use the TUI to inspect current state, domains, logs, diagnostics, and toggles.
+
+## OS cookbooks
+
+- [Windows](windows/)
+- [macOS](macos/)
+- [Linux](linux/)

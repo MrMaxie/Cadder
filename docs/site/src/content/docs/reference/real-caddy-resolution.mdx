@@ -3,13 +3,19 @@ title: Real Caddy resolution
 description: Exact precedence used when Cadder finds the real Caddy binary.
 ---
 
-Cadder never embeds Caddy. It resolves the external real Caddy command in this order:
+Cadder never embeds Caddy. For normal use, configure `[caddy].real_command` in `cadder.toml` next to the Cadder binaries. Use a project-local `cadder.toml` when a project needs its own real Caddy path. Use CLI flags, environment variables, and PATH fallback as advanced or temporary overrides.
+
+## Actual resolver precedence
+
+The resolver uses this exact order:
 
 1. CLI override: `--real-caddy-command` for `cadderd` and `cadder-tui` daemon launch, or `--cadder-real-caddy-command` for the shim.
 2. `[caddy].real_command` in `cadder.toml` in the current working directory.
 3. `[caddy].real_command` in `cadder.toml` next to the executable.
-4. Environment variables, including `CADDER_CADDY_REAL_COMMAND`.
+4. Environment variables, including `CADDER_CADDY_REAL_COMMAND` and `CADDER_CADDY__REAL_COMMAND`.
 5. A safe real `caddy` executable on `PATH`.
+
+This differs from the recommended setup order because explicit per-command and per-project overrides must win at runtime.
 
 ## TOML schema
 
@@ -25,6 +31,17 @@ The configured command can be:
 - a plain command, such as `caddy`, resolved through `PATH`.
 
 `caddy-real` is not a built-in default. It works only when you configure it explicitly through CLI, `cadder.toml`, or an environment variable.
+
+## Environment aliases
+
+Both environment variable names set the same value:
+
+```sh
+CADDER_CADDY_REAL_COMMAND=/absolute/path/to/caddy
+CADDER_CADDY__REAL_COMMAND=/absolute/path/to/caddy
+```
+
+If both are present, `CADDER_CADDY_REAL_COMMAND` has precedence. Prefer `cadder.toml` for stable user setups and reserve environment variables for scripts or temporary overrides.
 
 ## Recursion safety
 

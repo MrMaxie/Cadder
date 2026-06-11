@@ -3,19 +3,19 @@ title: TUI and diagnostics
 description: Inspect daemon state, domains, per-domain logs, and diagnostics through cadder-tui.
 ---
 
-`cadder-tui` opens a Ratatui/Crossterm interface for the Cadder daemon. It starts `cadderd` by default, unless `--no-start` is passed.
+`cadder-tui` opens the Cadder dashboard. It starts `cadderd` by default unless `--no-start` is passed.
 
 ```sh
 cadder-tui
 cadder-tui --no-start
-cadder-tui --runtime-dir .local/run/cadder
+cadder-tui --runtime-dir <runtime-dir>
 ```
 
 ## Views
 
 - Overview shows runtime status, config status, entrypoint count, domain count, and active domain count.
 - Entrypoints lists active shim registrations with source paths and domain counts.
-- Domains groups domains with their source entrypoint and activation state. Active domains use `[x]`; disabled domains use `[ ]` and a lower-contrast disabled style.
+- Domains groups domains with their source entrypoint and activation state.
 - Logs opens a domain-specific log stream. Press `Enter` or `l` on a domain row to open that exact domain.
 - Settings controls the minimum log severity shown in Logs.
 - Diagnostics shows config and runtime diagnostics, including domain conflicts and runtime apply failures.
@@ -34,5 +34,3 @@ The TUI refreshes daemon state automatically on a short interval. Press `r` when
 - `x` exports visible logs from the current stream.
 - `d` asks the daemon to shut down.
 - `q` exits the TUI.
-
-The manual smoke checklist lives in the repository file `docs/verification/tui-smoke.md`.
