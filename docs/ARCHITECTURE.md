@@ -119,3 +119,13 @@ cargo run -p xtask -- check
 ```
 
 Focused tests are appropriate while iterating. Full validation should pass before closeout.
+
+Cadder uses `cargo-llvm-cov 0.8.7` as the canonical Rust workspace coverage tool. On Windows, the canonical gate uses `stable-x86_64-pc-windows-msvc` because GNU coverage can fail without the profiler runtime. The executable gate is:
+
+```sh
+cargo run -p xtask -- coverage
+```
+
+`xtask coverage` runs `cargo +stable-x86_64-pc-windows-msvc llvm-cov --workspace --json --summary-only --fail-under-lines 85 --output-path target/llvm-cov/coverage-summary.json` on Windows and `cargo llvm-cov --workspace --json --summary-only --fail-under-lines 85 --output-path target/llvm-cov/coverage-summary.json` elsewhere. The command fails when total line coverage is below 85% or when coverage cannot be measured. It does not require a machine-global real Caddy installation; tests use repository fixtures.
+
+No project-specific coverage exclusions are currently configured. Future exclusions must be limited to generated, platform-gated, or intentionally untestable code and documented next to the `xtask coverage` command definition.

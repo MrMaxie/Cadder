@@ -11,6 +11,9 @@ use std::{
 use tar::Builder;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
+const COVERAGE_FAIL_UNDER_LINES: &str = "85";
+const DEFAULT_COVERAGE_REPORT_PATH: &str = "target/llvm-cov/coverage-summary.json";
+const WINDOWS_COVERAGE_TOOLCHAIN: &str = "stable-x86_64-pc-windows-msvc";
 const SAMPLE_CADDER_TOML: &str = r#"# Cadder portable configuration.
 # Uncomment and set this when the real Caddy binary is not the first safe `caddy` on PATH.
 #
@@ -23,6 +26,7 @@ fn main() -> Result<()> {
   let command = args.next().unwrap_or_else(|| "check".to_string());
   match command.as_str() {
     "check" => check(),
+    "coverage" => coverage(CoverageOptions::parse(args.collect())?),
     "dist" => dist(DistOptions::parse(args.collect())?),
     "verify-dist" => verify_dist(&VerifyDistOptions::parse(args.collect())?),
     "package" => package(PackageOptions::parse(args.collect())?),
@@ -45,6 +49,13 @@ fn check() -> Result<()> {
   )?;
   run("cargo", &["test", "--workspace"])?;
   Ok(())
+}
+
+fn coverage(options: CoverageOptions) -> Result<()> {
+  ensure_parent_dir(&options.output_path)?;
+  let args = coverage_command_args(&options.output_path)?;
+  let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+  run("cargo", &arg_refs)
 }
 
 fn dist(options: DistOptions) -> Result<()> {
@@ -197,6 +208,43 @@ fn build_release_binaries(target: Option<&str>) -> Result<()> {
   run("cargo", &args)
 }
 
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+  if let Some(parent) = path
+    .parent()
+    .filter(|parent| !parent.as_os_str().is_empty())
+  {
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+  }
+  Ok(())
+}
+
+fn coverage_command_args(output_path: &Path) -> Result<Vec<String>> {
+  let output_path = output_path.to_str().with_context(|| {
+    format!(
+      "coverage output path is not UTF-8: {}",
+      output_path.display()
+    )
+  })?;
+
+  // No project-specific coverage exclusions are applied here. Future exclusions must be limited
+  // to generated, platform-gated, or intentionally untestable code and documented beside this gate.
+  let mut args = Vec::new();
+  if cfg!(windows) {
+    args.push(format!("+{WINDOWS_COVERAGE_TOOLCHAIN}"));
+  }
+  args.extend([
+    "llvm-cov".to_string(),
+    "--workspace".to_string(),
+    "--json".to_string(),
+    "--summary-only".to_string(),
+    "--fail-under-lines".to_string(),
+    COVERAGE_FAIL_UNDER_LINES.to_string(),
+    "--output-path".to_string(),
+    output_path.to_string(),
+  ]);
+  Ok(args)
+}
+
 fn archive_kind(platform: &str) -> ArchiveKind {
   if platform.starts_with("windows") {
     ArchiveKind::Zip
@@ -344,6 +392,20 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+struct CoverageOptions {
+  output_path: PathBuf,
+}
+
+impl CoverageOptions {
+  fn parse(args: Vec<String>) -> Result<Self> {
+    Ok(Self {
+      output_path: optional_path_option(&args, "--output")?
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_COVERAGE_REPORT_PATH)),
+    })
+  }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct DistOptions {
   out_dir: PathBuf,
   target: Option<String>,
@@ -400,6 +462,10 @@ enum ArchiveKind {
 
 fn required_path_option(args: &[String], option: &str) -> Result<PathBuf> {
   required_string_option(args, option).map(PathBuf::from)
+}
+
+fn optional_path_option(args: &[String], option: &str) -> Result<Option<PathBuf>> {
+  optional_string_option(args, option).map(|value| value.map(PathBuf::from))
 }
 
 fn required_string_option(args: &[String], option: &str) -> Result<String> {
@@ -488,6 +554,67 @@ mod tests {
         target: Some("x86_64-unknown-linux-gnu".to_string())
       }
     );
+  }
+
+  #[test]
+  fn coverage_options_uses_default_report_path() {
+    let options = CoverageOptions::parse(Vec::new()).unwrap();
+
+    assert_eq!(
+      options,
+      CoverageOptions {
+        output_path: PathBuf::from(DEFAULT_COVERAGE_REPORT_PATH)
+      }
+    );
+  }
+
+  #[test]
+  fn coverage_options_parse_output_path() {
+    let options = CoverageOptions::parse(vec![
+      "--output".to_string(),
+      "target/custom/summary.json".to_string(),
+    ])
+    .unwrap();
+
+    assert_eq!(
+      options,
+      CoverageOptions {
+        output_path: PathBuf::from("target/custom/summary.json")
+      }
+    );
+  }
+
+  #[test]
+  fn coverage_command_args_enforce_workspace_line_threshold() {
+    let args = coverage_command_args(Path::new("target/custom/summary.json")).unwrap();
+
+    let mut expected = Vec::new();
+    if cfg!(windows) {
+      expected.push(format!("+{WINDOWS_COVERAGE_TOOLCHAIN}"));
+    }
+    expected.extend([
+      "llvm-cov".to_string(),
+      "--workspace".to_string(),
+      "--json".to_string(),
+      "--summary-only".to_string(),
+      "--fail-under-lines".to_string(),
+      "85".to_string(),
+      "--output-path".to_string(),
+      "target/custom/summary.json".to_string(),
+    ]);
+
+    assert_eq!(args, expected);
+  }
+
+  #[test]
+  fn ensure_parent_dir_creates_report_directory() {
+    let dir = unique_temp_dir("coverage-report-parent");
+    let report_path = dir.join("nested").join("summary.json");
+
+    ensure_parent_dir(&report_path).unwrap();
+
+    assert!(dir.join("nested").is_dir());
+    fs::remove_dir_all(&dir).unwrap();
   }
 
   #[test]

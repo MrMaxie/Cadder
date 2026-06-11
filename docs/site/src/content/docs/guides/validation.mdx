@@ -32,4 +32,28 @@ Use the repository file `docs/verification/tui-smoke.md` after lifecycle or TUI-
 
 ## Coverage
 
-The project target is at least 85% coverage. TASK-1.17 tracks defining and enforcing the coverage gate. Until that gate exists, record whether coverage was measured and avoid claiming the threshold was verified when only format, clippy, tests, or docs builds were run.
+Cadder uses `cargo-llvm-cov 0.8.7` for Rust workspace coverage. On Windows, install the MSVC toolchain because GNU coverage can fail without the profiler runtime:
+
+```sh
+rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --component llvm-tools-preview
+cargo install cargo-llvm-cov --version 0.8.7 --locked
+```
+
+On Linux and macOS, install the active toolchain component and the same cargo subcommand:
+
+```sh
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --version 0.8.7 --locked
+```
+
+Run the project coverage gate from the repository root:
+
+```sh
+cargo run -p xtask -- coverage
+```
+
+On Windows, the command runs `cargo +stable-x86_64-pc-windows-msvc llvm-cov --workspace --json --summary-only --fail-under-lines 85 --output-path target/llvm-cov/coverage-summary.json`. On other platforms, it runs `cargo llvm-cov --workspace --json --summary-only --fail-under-lines 85 --output-path target/llvm-cov/coverage-summary.json`. It fails when total line coverage is below 85% or when coverage cannot be measured, including when `cargo-llvm-cov` or the Windows MSVC toolchain is missing.
+
+Use `cargo run -p xtask -- coverage --output <path>` to write the JSON summary to another path.
+
+No project-specific coverage exclusions are configured. Future exclusions must be limited to generated, platform-gated, or intentionally untestable code and documented beside the `xtask coverage` command definition.

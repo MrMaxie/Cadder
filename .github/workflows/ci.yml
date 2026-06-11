@@ -34,3 +34,20 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+  coverage:
+    name: Coverage (Windows MSVC)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --component llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        run: cargo +stable-x86_64-pc-windows-msvc install cargo-llvm-cov --version 0.8.7 --locked
+
+      - name: Run coverage gate
+        run: cargo +stable-x86_64-pc-windows-msvc run -p xtask -- coverage

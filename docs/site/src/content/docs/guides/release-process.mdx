@@ -17,6 +17,14 @@ cargo test --workspace
 
 The automated tests use repository fake Caddy fixtures. CI does not install or require a machine-global real Caddy binary.
 
+The same workflow also runs a dedicated coverage job on `windows-latest` with `stable-x86_64-pc-windows-msvc`. That job installs `cargo-llvm-cov 0.8.7` and runs the project-owned gate:
+
+```sh
+cargo run -p xtask -- coverage
+```
+
+The coverage gate writes `target/llvm-cov/coverage-summary.json` and fails if total line coverage is below 85% or coverage cannot be measured.
+
 ## Portable artifact
 
 Build the current platform layout with:

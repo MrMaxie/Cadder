@@ -35,6 +35,44 @@ cargo run -p xtask -- check
 
 `cargo run -p xtask -- check` runs the format, clippy, and workspace test checks above. Focused Cargo commands are useful while iterating, but `xtask check` is the single repository validation command for this workspace.
 
+## Coverage
+
+Cadder uses `cargo-llvm-cov 0.8.7` for Rust workspace coverage. On Windows, the canonical gate uses the MSVC toolchain because GNU coverage can fail without the profiler runtime:
+
+```sh
+rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --component llvm-tools-preview
+cargo install cargo-llvm-cov --version 0.8.7 --locked
+```
+
+On Linux and macOS, install the active toolchain component and the same cargo subcommand:
+
+```sh
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --version 0.8.7 --locked
+```
+
+Run the coverage gate from the repository root:
+
+```sh
+cargo run -p xtask -- coverage
+```
+
+On Windows, the command runs:
+
+```sh
+cargo +stable-x86_64-pc-windows-msvc llvm-cov --workspace --json --summary-only --fail-under-lines 85 --output-path target/llvm-cov/coverage-summary.json
+```
+
+On other platforms, it runs:
+
+```sh
+cargo llvm-cov --workspace --json --summary-only --fail-under-lines 85 --output-path target/llvm-cov/coverage-summary.json
+```
+
+The gate fails when total line coverage is below 85% or when coverage cannot be measured, including when `cargo-llvm-cov` or the Windows MSVC toolchain is not installed. Use `cargo run -p xtask -- coverage --output <path>` to write the JSON summary somewhere other than `target/llvm-cov/coverage-summary.json`.
+
+No project-specific coverage exclusions are configured. Future exclusions must be limited to generated, platform-gated, or intentionally untestable code and documented beside the `xtask coverage` command definition.
+
 ## Portable distribution
 
 Build a portable layout for the current platform:
